@@ -40,7 +40,7 @@ const S = {
   recs: new Map(),
   sort: { key: 'rank', dir: 1 },
   filters: new Set(),
-  tab: 'm1',
+  tab: 'm0',
   field: null,
   disposers: { record: [], position: [] },
 };
@@ -58,10 +58,13 @@ const empty = (html) => `<p class="empty">${html}</p>`;
 /** One honest sentence about how the #1 has fared historically (model.json walk-forward). */
 function backtestLine(which) {
   const oos = (S.model && S.model.oos) || {};
-  const m = oos[which === 'm1' ? 'm1' : 'm0'] || oos.m0;
-  if (!m || !isNum(m.top1_hit)) return '';
-  const sq = isNum(m.top1_squeeze_rate) ? ` and spiked 20%+ above the open ${Math.round(m.top1_squeeze_rate * 100)}% of the time` : '';
-  return ` In the out-of-sample backtest the daily #1 fell 5%+ open→close on ${Math.round(m.top1_hit * 100)}% of sessions${sq} — it is a tilt in the odds, not a sure thing.`;
+  const m = oos.m0;  // the morning #1 is chosen on close-only features; M1 only re-scores
+  if (!m) return '';
+  const hit = isNum(m.pub1_hit) ? m.pub1_hit : m.top1_hit;
+  const sqr = isNum(m.pub1_squeeze_rate) ? m.pub1_squeeze_rate : m.top1_squeeze_rate;
+  const avg = isNum(m.pub1_mean_oc) ? m.pub1_mean_oc : m.top1_mean_oc;
+  if (!isNum(hit)) return '';
+  return ` Backtest of this exact rule (no Rule-201 names, ≥$300K daily volume): the #1 fell 5%+ open→close on ${Math.round(hit * 100)}% of sessions${isNum(sqr) ? `, spiked 20%+ above the open on ${Math.round(sqr * 100)}%` : ''}${isNum(avg) ? `, averaging ${pct(avg, 1, true)} open→close` : ''} — a tilt in the odds, never a sure thing.`;
 }
 
 function host(u) {
@@ -309,6 +312,7 @@ function renderBanners() {
     msgs.push(`<b>Today's feed could not be loaded</b> (${esc(S.errors['today.json'] || 'unknown error')}). Sections show what is available.`);
   } else {
     if (t.late) msgs.push('<b>Published after the open</b> — not counted in the track record.');
+    if (t.withheld && t.withheld.reason && (!t.generated_at || String(t.withheld.at) > String(t.generated_at))) msgs.push(`<b>The latest run was withheld</b> (${esc(t.withheld.reason)}) — this is the last page that passed the data checks.`);
     const nowEt = etDate();
     if (!S.sample && t.session_date && t.session_date < nowEt) {
       msgs.push(`<b>This radar is for ${esc(fmtDay(t.session_date))}.</b> Today's run has not published yet — treat every number here as stale.`);
@@ -346,7 +350,7 @@ function renderHero() {
   if (S.field) { S.field.destroy(); S.field = null; }
   $$('.hero-guide, .replay', art).forEach((n) => n.remove());
 
-  if (eyebrow) eyebrow.textContent = t && t.session_date ? `Today's #1 · ${fmtDay(t.session_date)}` : "Today's #1";
+  if (eyebrow) eyebrow.textContent = (t && t.session_date ? `Today's #1 · ${fmtDay(t.session_date)}` : "Today's #1") + (t && t.top && isNum(t.top.rank) && t.top.rank > 1 ? ` · board rank ${t.top.rank}` : '');
 
   if (!top) {
     let why = "Today's feed could not be loaded. The raw file is at data/today.json.";
@@ -364,6 +368,8 @@ function renderHero() {
   const sym = esc(top.symbol);
   const base = S.base;
   const probN = isNum(top.prob_dump) ? Math.round(top.prob_dump * 100) : null;
+  const capV = obj(obj(t.model).prob_cap)[top.model_used === 'm1' ? 'm1' : 'm0'];
+  const atCap = isNum(capV) && isNum(top.prob_dump) && top.prob_dump >= capV - 1e-4;
   const where = [top.exchange, top.country].filter(Boolean).map(esc).join(' · ');
   const lede = isNum(base)
     ? `The model's odds of a <b>5%+ drop from open to close</b> this session — <b>${esc(liftTxt(top.lift))}</b> the ${esc(pct(base, 1))} base rate for an average eligible name.`
@@ -374,7 +380,7 @@ function renderHero() {
       <p class="hero-name">${txt(top.name)}${where ? ` <span class="mono">· ${where}</span>` : ''}</p>
     </div>
     <div class="hero-prob">
-      <p class="hero-prob__num">${probN == null ? DASH : `${probN}<sup>%</sup>`}</p>
+      <p class="hero-prob__num">${probN == null ? DASH : `${atCap ? '≥' : ''}${probN}<sup>%</sup>`}</p>
       <p class="hero-prob__lede">${lede}</p>
     </div>`);
 
@@ -438,14 +444,14 @@ function renderHero() {
 
   setHTML(body, `
     <dl class="hstats reveal">
-      ${stat('Expected open→close', esc(pct(top.exp_oc, 1, true)), 'Model average for setups like this')}
+      ${stat('Squeeze odds', esc(pct(top.prob_squeeze, 0)), esc(isNum(obj(obj(S.model).base_rate).squeeze) ? `P(+20% above the open) · ${fixed(top.prob_squeeze / S.model.base_rate.squeeze, 1)}× normal — dump odds and squeeze odds rise together` : 'P(+20% above the open), same session'))}
       ${stat('Pre-market gap', esc(gap), preNote)}
       ${stat('Borrow', esc(sh.status === 'NONE' ? 'None' : sh.status === 'ETB' || sh.status === 'HTB' ? sh.status : DASH), shNote)}
       ${stat('Squeeze danger', squeezeMeter(top.squeeze_danger, { large: true }), esc(sqNote))}
     </dl>
     <div class="hero-cols">
       <div class="reveal">
-        <p class="eyebrow" style="margin-bottom:16px">Why it ranks #1 — strongest reasons</p>
+        <p class="eyebrow" style="margin-bottom:16px">What stands out — rule-based context, not the model's own reasoning</p>
         ${reasonsList(topReasons(top.reasons))}
         <div class="hero-actions">
           <button class="btn" type="button" data-open="${sym}">Open the full dossier</button>
@@ -457,7 +463,7 @@ function renderHero() {
         <div class="side-block"><p class="eyebrow">Research ${sym} elsewhere</p>${linksRow(top)}</div>
         <div class="side-block">
           <p class="eyebrow">About this reading</p>
-          <p class="note">${esc(modelLine)}. Features as of the close on ${esc(fmtDay(t.features_asof, { year: true }))}.${isNum(top.score) ? (top.score >= 100 ? ` The highest odds of the ${esc(int(scored))} names scored today.` : ` Higher odds than ${esc(top.score)}% of the ${esc(int(scored))} names scored today.`) : ''}${isNum(top.inhd_similarity) ? ` ${esc(pct(top.inhd_similarity))} similar to INHD.` : ''}${backtestLine(top.model_used)}</p>
+          <p class="note">${esc(modelLine)}. Features as of the close on ${esc(fmtDay(t.features_asof, { year: true }))}.${isNum(top.score) ? (top.score >= 100 ? (t.top_tie_count > 1 ? ` Tied with ${esc(int(t.top_tie_count - 1))} other name${t.top_tie_count > 2 ? 's' : ''} for the highest odds of the ${esc(int(scored))} scored — ties are ordered by the model's raw score.` : ` The highest odds of the ${esc(int(scored))} names scored today.`) : ` Higher odds than ${esc(top.score)}% of the ${esc(int(scored))} names scored today.`) : ''}${isNum(top.inhd_similarity) ? ` ${esc(pct(top.inhd_similarity))} similar to INHD.` : ''}${backtestLine(top.model_used)}${isNum(top.rank) && top.rank > 1 ? ` The ${top.rank - 1} higher-ranked board name${top.rank > 2 ? 's are' : ' is'} skipped because ${top.rank > 2 ? 'they are' : 'it is'} under the Rule 201 short-sale restriction today or trade under $300K a day — the rule the backtest measured.` : ''}</p>
         </div>
       </aside>
     </div>`);
@@ -899,7 +905,7 @@ function liveBlock(sc) {
   return `<div>${head}
     <dl class="tiles">
       ${stat('Sessions', esc(int(live.n_days)), first ? `since ${esc(fmtDay(first, { weekday: false }))}` : '')}
-      ${stat('#1 dumped', esc(pct(live.top_dump_rate)), esc(`of ${int(live.top_n)} graded · all names ${pct(live.universe_dump_rate)}`))}
+      ${stat('#1 dumped', esc(pct(live.top_dump_rate)), esc(`of ${int(live.top_n)} graded${live.top_halted ? ` (+${int(live.top_halted)} halted, not tradable)` : ''} · all names ${pct(live.universe_dump_rate)}`))}
       ${stat('#1 avg o→c', esc(pct(live.top_mean_oc, 1, true)), esc(`all names ${pct(live.universe_mean_oc, 1, true)}`))}
       ${stat('#1 squeezed', esc(pct(live.top_squeeze_rate)), 'rose 20%+ from the open')}
     </dl>
@@ -908,7 +914,7 @@ function liveBlock(sc) {
       { label: 'Whole board', v: live.board_dump_rate, hot: true },
       { label: 'All eligible names', v: live.universe_dump_rate },
     ])}
-    <p class="note" style="margin-top:8px">Share of sessions that fell 5%+ from open to close. ${live.n_days < 60 ? 'Small sample: these rates will move a lot as days accumulate.' : ''}</p>
+    <p class="note" style="margin-top:8px">Share of sessions that fell 5%+ from open to close.${live.top_squeeze_rate != null ? ` The #1 spiked 20%+ above the open on ${pct(live.top_squeeze_rate)} of graded sessions.` : ''}${live.n_unverified ? ` ${int(live.n_unverified)} session(s) excluded because the pick could not be confirmed public before the open.` : ''} ${live.n_days < 60 ? 'Small sample: these rates will move a lot as days accumulate.' : ''}</p>
   </div>`;
 }
 
@@ -920,20 +926,20 @@ function backtestBlock(m) {
   const oos = obj(obj(m.oos)[tab]);
   const base = obj(m.base_rate).dump;
   const cost = isNum(sim.cost_assumption) ? sim.cost_assumption : null;
-  const tabs = ['m1', 'm0'].filter((k) => obj(m.sim)[k] || obj(m.oos)[k]);
-  const tabHTML = tabs.map((k) => `<button type="button" role="tab" id="tab-${k}" aria-controls="bt-panel" aria-selected="${k === tab}" tabindex="${k === tab ? 0 : -1}" data-tab="${k}">${k === 'm1' ? 'M1 · with pre-market' : 'M0 · close only'}</button>`).join('');
+  const tabs = ['m0', 'm1'].filter((k) => obj(m.sim)[k] || obj(m.oos)[k]);
+  const tabHTML = tabs.map((k) => `<button type="button" role="tab" id="tab-${k}" aria-controls="bt-panel" aria-selected="${k === tab}" tabindex="${k === tab ? 0 : -1}" data-tab="${k}">${k === 'm1' ? 'M1 · knows the real open (live uses a pre-market proxy)' : 'M0 · close only — what the morning run can do'}</button>`).join('');
   const nDays = arr(sim.daily).length;
   return `<div>${head}
-    <p class="note">Walk-forward, out of sample${m.trained_through ? ` through ${esc(fmtDay(m.trained_through, { weekday: false, year: true }))}` : ''}. Short the #1 at the open, cover at the close${isNum(cost) ? `, ${esc(pct(cost, 0))} round-trip cost` : ''}. Assumes borrow was always available — often it isn't.</p>
+    <p class="note">Walk-forward, out of sample${m.trained_through ? ` through ${esc(fmtDay(m.trained_through, { weekday: false, year: true }))}` : ''}. Short the #1 at the open, cover at the close${isNum(cost) ? `, ${esc(pct(cost, 0))} round-trip cost` : ''}. The published rule skips names under the Rule 201 short-sale restriction and names trading under $300K a day; it still assumes borrow was always available — often it isn't.${m.publication_rule ? ` <span class="sr-only">${esc(m.publication_rule.text || '')}</span>` : ''}</p>
     <div class="tabs" role="tablist" aria-label="Model version">${tabHTML}</div>
     <div id="bt-panel" role="tabpanel" aria-labelledby="tab-${tab}">
       <dl class="tiles">
-        ${stat('#1 dumped', esc(pct(oos.top1_hit)), esc(`base rate ${pct(base, 1)}`))}
-        ${stat('Win rate', esc(pct(sim.win_rate)), 'days the short made money, before cost')}
-        ${stat('Net total', esc(pct(sim.net_total, 0, true)), 'sum of daily returns after cost')}
-        ${stat('Max drawdown', esc(pct(sim.max_drawdown, 0, true)), 'worst peak-to-trough, net')}
+        ${stat('Published #1 dumped', esc(pct(isNum(oos.pub1_hit) ? oos.pub1_hit : oos.top1_hit)), esc(`raw #1 ${pct(oos.top1_hit)} · average name ${pct(base, 1)}`))}
+        ${stat('…and spiked 20%+', esc(pct(isNum(oos.pub1_squeeze_rate) ? oos.pub1_squeeze_rate : oos.top1_squeeze_rate)), 'above the open, same session — the move that stops shorts out')}
+        ${stat('Win rate', esc(pct(isNum(sim.pub_win_rate) ? sim.pub_win_rate : sim.win_rate)), esc(`days the short made money, after ${pct(cost, 0)} cost`))}
+        ${stat('Risking 10% a day', esc(isNum(obj(sim.compounded_pub).final_multiple) ? `${fixed(sim.compounded_pub.final_multiple, 2)}×` : DASH), esc(isNum(obj(sim.compounded_pub).max_drawdown_pct) ? `compounded; worst drawdown −${pct(sim.compounded_pub.max_drawdown_pct, 0)}; worst day ${pct(sim.pub_worst_day, 0, true)}` : 'compounded equity multiple'))}
       </dl>
-      ${nDays ? '<div class="chart" id="eq-chart"></div><div class="legend"><span><i></i>Net of cost</span><span><i class="g"></i>Gross</span></div>' : empty('No simulated days in this report.')}
+      ${nDays ? '<div class="chart" id="eq-chart"></div><div class="legend"><span><i></i>Published rule, net</span><span><i class="g"></i>Raw #1 (incl. Rule 201 names), net</span></div>' : empty('No simulated days in this report.')}
     </div>
   </div>`;
 }
@@ -952,12 +958,18 @@ function modelDetail(m) {
     ['Top decile dumped', 'top_decile_hit', (v) => pct(v, 1)],
     ['#1 avg open→close', 'top1_mean_oc', (v) => pct(v, 1, true)],
     ['Top 10 avg open→close', 'top10_mean_oc', (v) => pct(v, 1, true)],
+    ['Published-rule #1 dumped', 'pub1_hit', (v) => pct(v, 1)],
+    ['Published-rule #1 avg open→close', 'pub1_mean_oc', (v) => pct(v, 1, true)],
+    ['Raw #1 under Rule 201 next day', 'top1_ssr_rate', (v) => pct(v, 0)],
+    ['Same score ranks +5% UP days (AUC)', '@pump_auc', (v) => fixed(v, 3)],
+    ['Dump vs pump among big moves (0.5 = no direction)', '@dump_vs_pump_auc', (v) => fixed(v, 3)],
     ['Test sessions', 'days', int],
   ];
+  const getv = (c, k) => (k[0] === '@' ? obj(obj(m.directional)[c])[k.slice(1)] : obj(oos[c])[k]);
   const cols = ['m0', 'm1'].filter((k) => oos[k]);
-  const mt = cols.length ? `<div class="table-scroll"><table class="mtable"><caption class="sr-only">Out-of-sample metrics by model</caption><thead><tr><th scope="col">Metric</th>${cols.map((k) => `<th scope="col">${k.toUpperCase()}</th>`).join('')}</tr></thead><tbody>${rowsDef.map(([l, k, f]) => `<tr><th scope="row">${esc(l)}</th>${cols.map((c) => `<td>${esc(f(obj(oos[c])[k]))}</td>`).join('')}</tr>`).join('')}</tbody></table></div>` : '';
+  const mt = cols.length ? `<div class="table-scroll"><table class="mtable"><caption class="sr-only">Out-of-sample metrics by model</caption><thead><tr><th scope="col">Metric</th>${cols.map((k) => `<th scope="col">${k.toUpperCase()}</th>`).join('')}</tr></thead><tbody>${rowsDef.map(([l, k, f]) => `<tr><th scope="row">${esc(l)}</th>${cols.map((c) => `<td>${esc(f(getv(c, k)))}</td>`).join('')}</tr>`).join('')}</tbody></table></div>` : '';
   const fam = {};
-  arr(m.importance).forEach((r) => { if (r && isNum(r.importance)) fam[r.family] = (fam[r.family] || 0) + r.importance; });
+  arr(tab === 'm1' && arr(m.importance_m1).length ? m.importance_m1 : m.importance).forEach((r) => { if (r && isNum(r.importance)) fam[r.family] = (fam[r.family] || 0) + r.importance; });
   const famItems = Object.entries(fam).sort((a, b) => b[1] - a[1]).map(([k, v]) => ({ label: FAMILY_LABEL[k] || humanize(k), v, fmt: (x) => fixed(x * 1000, 1) }));
   const trainMeta = [
     isNum(m.n_rows) ? `${int(m.n_rows)} name-days` : null,
@@ -1046,14 +1058,16 @@ function mountRecordCharts() {
     const gross = [];
     const net = [];
     daily.forEach((r) => {
-      if (isNum(r[1])) { g += -r[1]; n += -r[1] - cost; }
+      if (isNum(r[1])) g += -r[1] - cost;               // raw #1, net
+      if (isNum(r[4])) n += -r[4] - cost;               // published rule, net
+      else if (r.length < 5 && isNum(r[1])) n += -r[1] - cost;
       gross.push(g);
       net.push(n);
     });
     S.disposers.record.push(equityChart(eq, daily.map((r) => r[0]), [
-      { name: 'Gross', cls: 'l-gross', values: gross },
-      { name: 'Net', cls: 'l-net', values: net },
-    ], { label: `Cumulative return of shorting the ${S.tab.toUpperCase()} #1 each session, gross and net of cost` }));
+      { name: 'Raw #1, net', cls: 'l-gross', values: gross },
+      { name: 'Published rule, net', cls: 'l-net', values: net },
+    ], { label: `Cumulative sum of daily short returns, ${S.tab.toUpperCase()}: the published rule versus the raw #1, both net of cost` }));
   }
   const cal = $('#cal-chart');
   if (cal) {
@@ -1092,6 +1106,8 @@ function renderEvidence() {
           <span><b>${esc(pct(s.pct_dump, 1))}</b>dumped next session</span>
           <span><b>${esc(isBase ? '1.0×' : liftTxt(s.lift_dump))}</b>vs all names</span>
           <span><b>${esc(pct(s.median_oc, 1, true))}</b>median open→close</span>
+          ${isNum(s.pct_up5) ? `<span><b>${esc(pct(s.pct_up5, 1))}</b>ran UP 5%+ instead</span>` : ''}
+          ${!isBase && s.skew ? `<span><b>${esc(s.skew === 'down' ? 'Down' : s.skew === 'up' ? 'Up' : 'Both ways')}</b>which way it tilts</span>` : ''}
         </div>
       </article>`;
     }).join('')}</div>`;

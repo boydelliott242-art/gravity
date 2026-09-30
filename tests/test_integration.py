@@ -163,3 +163,16 @@ def test_grade_waits_for_bars(pick_log, monkeypatch):
     scorecard.log_picks(_today())
     assert scorecard.grade({}, []) == 0  # no bars yet → stays ungraded
     assert json.loads((pick_log / "2026-10-01.json").read_text())["outcome"] is None
+
+
+# ── coverage gate ────────────────────────────────────────────────────────
+def test_coverage_gate():
+    from gravity.cli import healthy
+    good = {"universe": {"scored": 2850, "eligible": 2850}, "session_date": "2026-10-01",
+            "features_asof": "2026-09-30", "board": [{"symbol": "A"}]}
+    assert healthy(good)[0]
+    assert not healthy({**good, "universe": {"scored": 900, "eligible": 2850}})[0]
+    assert not healthy({**good, "universe": {"scored": 1600, "eligible": 2850}})[0]   # < 60% traded
+    assert not healthy({**good, "features_asof": "2026-09-28"})[0]                    # stale
+    assert healthy({**good, "session_date": "2026-10-05", "features_asof": "2026-10-02"})[0]  # Mon uses Fri
+    assert not healthy({**good, "board": []})[0]

@@ -244,10 +244,11 @@ def build_reasons(
         add("exhaustion", f"RSI(14) {rsi:.0f} — stretched", 1)
     if r1 is not None and r1 <= -0.15:
         add("decay", f"Fell {pct(-r1, signed=False)} last session", 2 if r1 <= -0.25 else 1)
-    vol, vol_pct = _f(m.get("vol20")), _f(m.get("vol20_pct"))
-    if vol is not None and vol_pct is not None and vol_pct >= 0.85:
-        add("decay", f"Typical daily swing ±{vol * 100:.0f}% (20-day volatility) — wilder than "
-                         f"{vol_pct * 100:.0f}% of the universe; the model's strongest single driver", 2)
+    rng, rng_pct = _f(m.get("range14")), _f(m.get("range14_pct"))
+    if rng is not None and rng_pct is not None and rng_pct >= 0.85:
+        add("decay", f"Average daily high–low range {rng * 100:.0f}% over 14 sessions — wider than "
+                     f"{rng_pct * 100:.0f}% of the universe (volatility is the model's largest input; "
+                     f"it raises the odds of big moves both ways)", 2)
     d50 = _f(m.get("dist_ma50"))
     if d50 is not None and d50 <= -0.30:
         add("decay", f"Trading {pct(-d50, signed=False)} below its 50-day average", 1)
@@ -305,6 +306,15 @@ def build_reasons(
     if sr is not None and sr >= 0.55:
         add("flow", f"{pct(sr, signed=False)} of the last 5 sessions' reported volume was short sales (FINRA)", 1)
 
+    if m.get("ssr"):
+        drop = None
+        lo, cl, r1_ = _f(m.get("low")), _f(m.get("close")), _f(m.get("r1"))
+        if lo and cl and r1_ is not None and r1_ > -1:
+            drop = lo / (cl / (1 + r1_)) - 1
+        add("flow", "SEC Rule 201 short-sale restriction is likely in effect this session"
+                    + (f" (yesterday's low was {pct(drop)} vs the prior close)" if drop is not None else "")
+                    + " — shorts can only be entered above the bid", 3)
+        flags.append("SSR")
     if short.get("status") == "HTB" and short.get("fee_rate") is not None:
         flags.append(f"HTB {short['fee_rate']:.0f}%")
     elif short.get("status") == "NONE":

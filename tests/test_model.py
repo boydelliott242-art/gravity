@@ -94,7 +94,7 @@ def test_report_schema_and_files(trained):
             assert k in sim, (m, k)
         assert sim["cost_assumption"] == 0.01
         assert len(sim["daily"]) == met["days"] > 0
-        assert all(len(r) == 4 and isinstance(r[0], str) for r in sim["daily"])
+        assert all(len(r) == 5 and isinstance(r[0], str) for r in sim["daily"])
         cal = rep["calibration"][m]
         assert [b["bin"] for b in cal] == list(range(1, 11))
         assert sum(b["n"] for b in cal) == rep["walk_forward"]["oos_rows"]
@@ -263,7 +263,7 @@ def test_daily_metrics_and_sim_math():
     assert sim["max_drawdown"] == pytest.approx(0.06)             # day 2: −0.05 − 0.01
     assert sim["worst_day"] == pytest.approx(-0.05)
     assert sim["daily"][0] == ["2025-01-02", -0.10, pytest.approx(np.mean([-0.10, 0.02, 0.01])),
-                               pytest.approx(np.mean([-0.10, 0.02, 0.01]))]
+                               pytest.approx(np.mean([-0.10, 0.02, 0.01])), -0.10]  # no rule mask → pub #1 = #1
     assert M._max_drawdown(np.array([0.1, -0.3, 0.1, -0.1])) == pytest.approx(0.3)
 
 
@@ -308,3 +308,29 @@ def test_calibrated_ties_are_broken_but_probabilities_unchanged():
     out = M._calibrated({"clf": Const(), "iso": Flat()}, X)
     assert np.all(np.diff(out) > 0)
     assert np.allclose(out, 0.2, atol=1e-6)
+
+
+def test_ssr_and_publication_rule():
+    import pandas as pd
+    df = pd.DataFrame({"low": [8.9, 9.5, 5.0], "close": [9.5, 9.8, 5.5], "r1": [0.0, -0.02, 0.10],
+                       "dvol20": [1e6, 1e5, 5e5]})
+    # prev close = close/(1+r1): 9.5, 10.0, 5.0 → lows 8.9 (−6.3%), 9.5 (−5%), 5.0 (0%)
+    assert list(M.ssr_next(df)) == [False, False, False]
+    df.loc[0, "low"] = 8.5  # −10.5% intraday → SSR tomorrow
+    assert list(M.ssr_next(df)) == [True, False, False]
+    assert list(M.publishable(df)) == [False, False, True]  # SSR; illiquid; ok
+    assert list(M.publishable(pd.DataFrame({"x": [1]}))) == [False]  # missing columns → not publishable
+
+
+def test_cap_limits_calibrated_probability():
+    class Clf:
+        def predict_proba(self, X):
+            return np.c_[1 - X[:, 0], X[:, 0]]
+    class Iso:
+        def predict(self, r):
+            return r
+    X = np.array([[0.2], [0.9], [0.99]])
+    out = M._calibrated({"clf": Clf(), "iso": Iso(), "cap": 0.6}, X)
+    assert out[0] == pytest.approx(0.2, abs=1e-5)
+    assert out[1] <= 0.6 + 1e-5 and out[2] <= 0.6 + 1e-5
+    assert out[2] > out[1]  # ranking survives the cap via the raw-score tie-break

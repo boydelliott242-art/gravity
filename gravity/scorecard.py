@@ -97,18 +97,37 @@ def _oc(r: pd.Series) -> dict:
     }
 
 
+def _fresh_through(hist: Dict[str, pd.DataFrame], sym: str, day: pd.Timestamp) -> bool:
+    """True when the symbol's frame is known to extend to ``day`` or later,
+    so a missing bar on ``day`` genuinely means no trades (halt)."""
+    df = hist.get(sym)
+    return df is not None and len(df) > 0 and df.index.max() >= day and not df.attrs.get("stale", False)
+
+
 def grade(hist: Dict[str, pd.DataFrame], eligible: List[str]) -> int:
-    """Grade every ungraded pick log whose session has a completed bar.
-    Returns how many sessions were graded."""
+    """Grade every ungraded pick log whose session has complete data.
+
+    Deferred (left ungraded for a later run) unless at least 80% of the
+    names that traded on the previous session also have a bar for this one,
+    and unless the #1's own data reaches the session — so a partial refresh
+    can never freeze a wrong grade. Returns how many sessions were graded."""
+    from .util import prev_trading_day
+
     n = 0
     for p in sorted(config.PICK_LOG.glob("*.json")):
         rec = _read(p)
         if not rec or rec.get("outcome"):
             continue
         day = pd.Timestamp(rec["session_date"])
-        # universe comparison for the same session
+        prev = pd.Timestamp(prev_trading_day(day.date()))
         uni = [_oc(r) for s in eligible if (r := _bar(hist, s, day)) is not None]
-        if len(uni) < 200:  # bars for that day not in yet (or a data outage) — try later
+        n_prev = sum(1 for s in eligible if hist.get(s) is not None and prev in hist[s].index)
+        if len(uni) < max(200, int(0.8 * n_prev)):
+            log.info("grade %s deferred: %d bars vs %d the session before", rec["session_date"], len(uni), n_prev)
+            continue
+        top_sym = (rec.get("top") or {}).get("symbol")
+        if top_sym and _bar(hist, top_sym, day) is None and not _fresh_through(hist, top_sym, day):
+            log.info("grade %s deferred: no fresh data for the #1 (%s) yet", rec["session_date"], top_sym)
             continue
         u_oc = np.array([x["oc"] for x in uni])
         out = {
@@ -126,7 +145,7 @@ def grade(hist: Dict[str, pd.DataFrame], eligible: List[str]) -> int:
                 t["squeezed"] = t["oh"] >= config.SQUEEZE_THRESHOLD
                 out["top"] = t
             else:
-                out["top"] = {"missing": True, "note": "no regular-session bar (halted or no trades)"}
+                out["top"] = {"missing": True, "halted": True, "note": "no regular-session bar (halted or no trades)"}
         b_oc = []
         for b in rec.get("board", []):
             r = _bar(hist, b["symbol"], day)
@@ -150,11 +169,15 @@ def summary() -> dict:
         rec = _read(p)
         if rec and rec.get("outcome"):
             days.append(rec)
-    tops = [d["outcome"]["top"] for d in days if d["outcome"].get("top") and not d["outcome"]["top"].get("missing")]
-    boards = [d["outcome"] for d in days if d["outcome"].get("board_mean_oc") is not None]
+    counted = [d for d in days if not d.get("unverified")]
+    tops = [d["outcome"]["top"] for d in counted if d["outcome"].get("top") and not d["outcome"]["top"].get("missing")]
+    halted = sum(1 for d in counted if (d["outcome"].get("top") or {}).get("missing"))
+    boards = [d["outcome"] for d in days if not d.get("unverified") and d["outcome"].get("board_mean_oc") is not None]
     live = {
-        "n_days": len(days),
+        "n_days": len(counted),
+        "n_unverified": len(days) - len(counted),
         "top_n": len(tops),
+        "top_halted": halted,
         "top_dump_rate": float(np.mean([t["dump"] for t in tops])) if tops else None,
         "top_mean_oc": float(np.mean([t["oc"] for t in tops])) if tops else None,
         "top_squeeze_rate": float(np.mean([t["squeezed"] for t in tops])) if tops else None,
@@ -168,3 +191,13 @@ def summary() -> dict:
         "days": list(reversed(days))[:250],
         "live": live,
     }
+
+
+def mark_unverified(session: str, reason: str) -> None:
+    """A pick whose publication to GitHub could not be confirmed before the
+    open is kept for transparency but excluded from the live rates."""
+    p = _path(session)
+    rec = _read(p) if p.exists() else None
+    if rec and not rec.get("outcome"):
+        rec["unverified"] = reason
+        _write(p, rec)

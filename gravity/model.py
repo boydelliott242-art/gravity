@@ -61,6 +61,10 @@ M1_FEATURES: List[str] = list(FEATURES) + list(M1_EXTRA)
 
 OC_CLIP: Tuple[float, float] = (-0.5, 0.5)   # regressor target clip (one +3,000 % day must not dominate)
 COST = 0.01                                   # assumed round-trip cost of a short, fraction of notional
+SSR_DROP = 0.10                               # Rule 201: a ≥10% intraday drop restricts shorting the next session
+LIQ_FLOOR = 300_000                           # published #1 needs ≥ $300k 20-day median dollar volume
+CAP_FROM = 0.5                                # probabilities above this are capped at their realised OOS rate
+SIM_FRACTION = 0.10                           # compounded curve: risk 10% of equity per day
 TIE_EPS = 1e-6                                # isotonic ties broken by the raw score (moves p by < 1e-6)
 BUNDLE_NAME = "bundle.pkl"
 DEFAULT_SITE_JSON = config.SITE_DATA / "model.json"
@@ -103,8 +107,15 @@ CAVEATS: List[str] = [
     "No locate constraint: the simulation assumes the #1 name could be borrowed and shorted at the "
     "open every day. Many of these names are hard to borrow or unavailable, and borrow fees (often "
     "50-500%+ annualised) are not modelled beyond the flat cost.",
-    "Fills are the official opening and closing prints (auction prices). Real fills on thin names "
-    "slip; the flat 1% round-trip cost may be optimistic.",
+    "Fills are Yahoo's daily open and close (vendor data: some opens on thin names are substituted "
+    "with the prior close). Real fills on thin names slip; the flat 1% round-trip cost may be optimistic "
+    "— the cost-sensitivity table shows how fast the edge shrinks at 3% and 5%.",
+    "SEC Rule 201: after a ≥10% intraday drop, shorts the next session may only be entered above the bid. "
+    "Many raw #1 picks were in that state (see top1_ssr_rate / top1_gross_share_ssr); the published-rule "
+    "numbers exclude them, and are the ones to look at.",
+    "Dump odds are partly a volatility forecast: the same scores also rank big UP days well (pump_auc). "
+    "The directional block (dump-vs-pump AUC, mean open→close by decile) shows how much is genuinely "
+    "downside skew.",
     "Halts: sessions where the next day is halted or has no clean print have no label and are "
     "dropped. A short trapped in a halt is exactly the worst case, and it is not in these numbers.",
     "Uncapped risk: a short can lose more than 100% in one session (the data contains open→close "
@@ -116,6 +127,33 @@ CAVEATS: List[str] = [
     "Probabilities are calibrated on the most recent held-out quarter; they drift when the market "
     "regime changes. Out-of-sample results are history, not a promise.",
 ]
+
+
+# ── Tradeability (shared with the live publication rule) ────────────────
+def _numcol(df: pd.DataFrame, c: str) -> np.ndarray:
+    """Column as float array; all-NaN when the column is absent."""
+    if c not in df.columns:
+        return np.full(len(df), np.nan)
+    return pd.to_numeric(df[c], errors="coerce").to_numpy(float)
+
+
+def ssr_next(df: pd.DataFrame) -> np.ndarray:
+    """True where the NEXT session is under the SEC Rule 201 short-sale
+    restriction: the day-t low was ≥10% below the prior close (shorts may
+    then only be entered above the national best bid)."""
+    low, close, r1 = _numcol(df, "low"), _numcol(df, "close"), _numcol(df, "r1")
+    prev = close / (1.0 + r1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.isfinite(prev) & np.isfinite(low) & (low <= (1.0 - SSR_DROP) * prev)
+
+
+def publishable(df: pd.DataFrame) -> np.ndarray:
+    """The rule the site uses for its #1 that history can check: not under
+    SSR next session and liquid (20-day median $ volume ≥ LIQ_FLOOR). Live
+    it additionally needs IBKR borrow and squeeze danger < 70, which have no
+    history — that part of the rule is unvalidated."""
+    dv = _numcol(df, "dvol20")
+    return (~ssr_next(df)) & np.isfinite(dv) & (dv >= LIQ_FLOOR)
 
 
 # ── Small helpers ────────────────────────────────────────────────────────
@@ -242,6 +280,9 @@ def _calibrated(cm: Optional[Dict[str, Any]], X: np.ndarray) -> np.ndarray:
     raw = _raw(cm["clf"], X)
     iso = cm.get("iso")
     cal = iso.predict(raw) if iso is not None else raw
+    cap = cm.get("cap")
+    if cap is not None:  # never claim more certainty than the tail ever delivered out of sample
+        cal = np.minimum(cal, cap)
     return np.clip((1.0 - TIE_EPS) * cal + TIE_EPS * raw, 0.0, 1.0)
 
 
@@ -312,14 +353,19 @@ def _auc(y: np.ndarray, p: np.ndarray) -> Optional[float]:
 
 
 def _daily_table(day: np.ndarray, prob: np.ndarray, y: np.ndarray, oc: np.ndarray,
-                 sq: Optional[np.ndarray] = None) -> pd.DataFrame:
-    """Per test day: the #1, the top-10 and the top decile by ``prob``."""
+                 sq: Optional[np.ndarray] = None, pub: Optional[np.ndarray] = None,
+                 ssr: Optional[np.ndarray] = None) -> pd.DataFrame:
+    """Per test day: the #1, the top-10 and the top decile by ``prob``; plus
+    the #1 under the publication rule (``pub``) and whether the raw #1 was
+    under Rule 201 (``ssr``)."""
     df = pd.DataFrame({"day": day, "p": prob, "y": y, "oc": oc,
-                       "sq": sq if sq is not None else np.nan})
+                       "sq": sq if sq is not None else np.nan,
+                       "pub": pub if pub is not None else True,
+                       "ssr": ssr if ssr is not None else False})
     df = df[np.isfinite(df["p"]) & np.isfinite(df["y"]) & np.isfinite(df["oc"])]
     if not len(df):
-        return pd.DataFrame(columns=["top1_y", "top1_oc", "top1_sq", "top10_y", "top10_oc",
-                                     "dec_y", "uni_y", "uni_oc", "n"])
+        return pd.DataFrame(columns=["top1_y", "top1_oc", "top1_sq", "top1_ssr", "top10_y", "top10_oc",
+                                     "dec_y", "uni_y", "uni_oc", "pub1_y", "pub1_oc", "pub1_sq", "n"])
     df = df.sort_values(["day", "p"], ascending=[True, False], kind="mergesort")
     g = df.groupby("day", sort=True)
     df["rk"] = g.cumcount() + 1
@@ -328,10 +374,14 @@ def _daily_table(day: np.ndarray, prob: np.ndarray, y: np.ndarray, oc: np.ndarra
     top10 = df[df["rk"] <= 10].groupby("day")[["y", "oc"]].mean()
     dec = df[df["rk"] <= np.ceil(0.1 * df["n"])].groupby("day")["y"].mean()
     uni = g[["y", "oc"]].mean()
+    pub1 = df[df["pub"].astype(bool)].groupby("day", sort=True).head(1).set_index("day")
     return pd.DataFrame({
         "top1_y": top1["y"], "top1_oc": top1["oc"], "top1_sq": top1["sq"],
+        "top1_ssr": top1["ssr"].astype(float),
         "top10_y": top10["y"], "top10_oc": top10["oc"],
-        "dec_y": dec, "uni_y": uni["y"], "uni_oc": uni["oc"], "n": g.size(),
+        "dec_y": dec, "uni_y": uni["y"], "uni_oc": uni["oc"],
+        "pub1_y": pub1["y"], "pub1_oc": pub1["oc"], "pub1_sq": pub1["sq"],
+        "n": g.size(),
     })
 
 
@@ -357,6 +407,14 @@ def _metrics(y: np.ndarray, p: np.ndarray, daily: pd.DataFrame) -> Dict[str, Any
             "top10_mean_oc": _f(daily["top10_oc"].mean()),
             "universe_mean_oc": _f(daily["uni_oc"].mean()),
             "top1_squeeze_rate": _f(daily["top1_sq"].mean()),
+            "top1_ssr_rate": _f(daily["top1_ssr"].mean()),
+            "top1_gross_share_ssr": _f((-daily["top1_oc"] * daily["top1_ssr"]).sum() / (-daily["top1_oc"]).sum())
+            if (-daily["top1_oc"]).sum() > 0 else None,
+            "pub1_hit": _f(daily["pub1_y"].mean()),
+            "pub1_mean_oc": _f(daily["pub1_oc"].mean()),
+            "pub1_median_oc": _f(daily["pub1_oc"].median()),
+            "pub1_squeeze_rate": _f(daily["pub1_sq"].mean()),
+            "pub1_days": int(daily["pub1_oc"].notna().sum()),
         })
     else:
         m.update({k: None for k in ("top1_hit", "top10_hit", "top_decile_hit", "universe_daily_hit",
@@ -382,11 +440,36 @@ def _sim(daily: pd.DataFrame, cost: float = COST) -> Dict[str, Any]:
     g1 = -daily["top1_oc"].to_numpy(float)
     g10 = -daily["top10_oc"].to_numpy(float)
     gu = -daily["uni_oc"].to_numpy(float)
-    rows = [[_day(d), _f(a), _f(b), _f(c)] for d, a, b, c in
-            zip(daily.index, daily["top1_oc"], daily["top10_oc"], daily["uni_oc"])]
+    gp = -daily["pub1_oc"].to_numpy(float) if "pub1_oc" in daily else np.full(len(daily), np.nan)
+    gp_ok = gp[np.isfinite(gp)]
+    rows = [[_day(d), _f(a), _f(b), _f(c), _f(e)] for d, a, b, c, e in
+            zip(daily.index, daily["top1_oc"], daily["top10_oc"], daily["uni_oc"],
+                daily["pub1_oc"] if "pub1_oc" in daily else [None] * len(daily))]
+
+    def compounded(g: np.ndarray) -> Dict[str, Any]:
+        """Risk SIM_FRACTION of equity per day on the short (loss capped at total ruin)."""
+        eq = np.cumprod(np.maximum(0.0, 1.0 + SIM_FRACTION * (g - cost)))
+        peak = np.maximum.accumulate(np.r_[1.0, eq])[1:]
+        return {"final_multiple": _f(eq[-1]) if len(eq) else None,
+                "max_drawdown_pct": _f(np.max(1 - eq / peak)) if len(eq) else None,
+                "curve": [_f(x) for x in eq[:: max(1, len(eq) // 120)]]}
+
     return {
         "daily": rows,
-        "columns": ["date", "oc_top1", "oc_top10_mean", "universe_mean_oc"],
+        "columns": ["date", "oc_top1", "oc_top10_mean", "universe_mean_oc", "oc_pub1"],
+        "pub_gross_total": _f(gp_ok.sum()) if len(gp_ok) else None,
+        "pub_net_total": _f((gp_ok - cost).sum()) if len(gp_ok) else None,
+        "pub_win_rate": _f(np.mean(gp_ok - cost > 0)) if len(gp_ok) else None,
+        "pub_max_drawdown": _max_drawdown(gp_ok - cost),
+        "pub_worst_day": _f(np.min(gp_ok)) if len(gp_ok) else None,
+        "pub_best_day": _f(np.max(gp_ok)) if len(gp_ok) else None,
+        "compounded_top1": compounded(g1),
+        "compounded_pub": compounded(gp_ok) if len(gp_ok) else None,
+        "compounded_fraction": SIM_FRACTION,
+        "cost_sensitivity": [{"cost": c, "top1_net_total": _f((g1 - c).sum()),
+                              "pub_net_total": _f((gp_ok - c).sum()) if len(gp_ok) else None}
+                             for c in (0.01, 0.03, 0.05)],
+        "top20_days_share": _f(np.sort(g1)[::-1][:20].sum() / g1.sum()) if g1.sum() > 0 else None,
         "gross_total": float(g1.sum()),
         "net_total": float((g1 - cost).sum()),
         "win_rate": float(np.mean(g1 - cost > 0)),
@@ -514,6 +597,13 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
     wf_s = time.time() - t_wf
 
     tested = np.isfinite(oos["m0"]["prob_dump"])
+    pub_mask = publishable(lab)
+    ssr_mask = ssr_next(lab)
+    y_up5 = (Y["y_oc"] >= 0.05).astype(float)
+    big_move = np.abs(Y["y_oc"]) >= 0.05
+    directional: Dict[str, Any] = {}
+    tail: Dict[str, Any] = {}
+    caps: Dict[str, Dict[str, Optional[float]]] = {}
     report_oos: Dict[str, Any] = {}
     sims: Dict[str, Any] = {}
     calib: Dict[str, Any] = {}
@@ -521,7 +611,30 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
     for m in ("m0", "m1"):
         p = oos[m]["prob_dump"]
         daily = _daily_table(row_dates[tested], p[tested], Y["y_dump"][tested], Y["y_oc"][tested],
-                             Y["y_squeeze"][tested])
+                             Y["y_squeeze"][tested], pub_mask[tested], ssr_mask[tested])
+        # Is it a DOWN forecast or just a big-move forecast? (the honest question)
+        pt, yo = p[tested], Y["y_oc"][tested]
+        dec = pd.qcut(pd.Series(pt).rank(method="first"), 10, labels=False)
+        directional[m] = {
+            "pump_auc": _auc(y_up5[tested], pt),
+            "dump_vs_pump_auc": _auc((Y["y_dump"][tested][big_move[tested]]), pt[big_move[tested]]),
+            "decile_mean_oc": [_f(v) for v in pd.Series(yo).groupby(dec.to_numpy()).mean().to_numpy()],
+            "decile_up5_rate": [_f(v) for v in pd.Series(y_up5[tested]).groupby(dec.to_numpy()).mean().to_numpy()],
+            "decile_dump_rate": [_f(v) for v in pd.Series(Y["y_dump"][tested]).groupby(dec.to_numpy()).mean().to_numpy()],
+            "up5_base_rate": _f(np.mean(y_up5[tested])),
+        }
+        # Tail calibration → caps: never show more certainty than the OOS tail delivered.
+        caps[m] = {}
+        tail[m] = {}
+        for t in TARGETS:
+            pp, yy = oos[m][PROB_COLS[t]][tested], Y[TARGETS[t]][tested]
+            hi = np.isfinite(pp) & (pp >= CAP_FROM)
+            n_hi = int(hi.sum())
+            realized = _f(np.mean(yy[hi])) if n_hi else None
+            cap = max(realized, 0.3) if (n_hi >= 30 and realized is not None) else CAP_FROM + 0.1
+            caps[m][t] = cap
+            tail[m][t] = {"from": CAP_FROM, "n": n_hi, "mean_pred": _f(np.mean(pp[hi])) if n_hi else None,
+                          "realized": realized, "cap": cap}
         report_oos[m] = _metrics(Y["y_dump"][tested], p[tested], daily)
         sims[m] = _sim(daily)
         calib[m] = _calibration(Y["y_dump"][tested], p[tested])
@@ -552,6 +665,10 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
     fit_idx = np.flatnonzero(di <= fit_end)
     cal_idx = np.flatnonzero(di >= cal_start)
     prod = {m: _fit_set(X, Y, fit_idx, cal_idx, nc, s, rng) for m, nc in (("m0", n0), ("m1", n1))}
+    for m in prod:
+        for t in TARGETS:
+            if prod[m].get(t) is not None:
+                prod[m][t]["cap"] = caps.get(m, {}).get(t)
     fin_s = time.time() - t_fin
 
     # 3) permutation importance on the held-out calibration slice (not seen by the fit)
@@ -606,6 +723,15 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
                             "rows": int(len(imp_idx)), "slice": f"{_day(dates[cal_start])} → {_day(dates[last])}",
                             "base_auc_m0": base0, "base_auc_m1": base1},
         "sim": sims,
+        "directional": directional,
+        "tail_calibration": tail,
+        "publication_rule": {
+            "text": (f"#1 = highest P(dump) among names NOT under the Rule 201 short-sale restriction the next "
+                     f"session (day-t low ≥ {SSR_DROP:.0%} below the prior close) and with a 20-day median dollar "
+                     f"volume ≥ ${LIQ_FLOOR:,.0f}. Live, the #1 must also be borrowable at IBKR and have squeeze "
+                     f"danger < 70 — those two conditions have no history and are not in this backtest."),
+            "ssr_drop": SSR_DROP, "liq_floor": LIQ_FLOOR,
+        },
         "walk_forward": {
             "n_folds": len(fold_rows), "fold_months": s["fold_months"], "embargo_sessions": s["embargo"],
             "min_train_sessions": s["min_train_sessions"], "cal_sessions": s["cal_sessions"],

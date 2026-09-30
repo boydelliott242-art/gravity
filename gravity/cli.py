@@ -39,6 +39,7 @@ LATEST_PATH = STATE / "latest.pkl"
 CONTEXT_PATH = STATE / "context.pkl"
 SIGNS_PATH = config.MODELS / "signs.json"
 ENRICH_DEADLINE_S = 300
+MIN_SCORED = 1500
 
 DISCLAIMER = (
     "GRAVITY is an automated research tool, not investment advice. Probabilities describe how "
@@ -93,22 +94,75 @@ def refresh_data(full_events: bool = True) -> dict:
     log.info("panel: %d rows × %d cols (%.0fs)", len(panel), panel.shape[1], time.time() - t0)
     ctx = {"universe": uni, "static": static, "splits": splits, "events": events, "cik_map": cmap,
            "built_at": datetime.now(timezone.utc).isoformat()}
-    with open(PANEL_PATH, "wb") as f:
-        pickle.dump(panel, f, protocol=pickle.HIGHEST_PROTOCOL)
     latest = features.latest_rows(panel)
-    latest.to_pickle(LATEST_PATH)
-    with open(CONTEXT_PATH, "wb") as f:
-        pickle.dump(ctx, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    # Coverage gate BEFORE replacing the saved state: a throttled refresh
+    # must never overwrite the last good state with a thin one.
+    run = dict(getattr(prices, "LAST_RUN", {}) or {})
+    fresh = int((pd.to_datetime(latest["date"]) == pd.to_datetime(latest["date"]).max()).sum()) if len(latest) else 0
+    bad = int(run.get("stale", 0) or 0) + int(run.get("failed", 0) or 0)
+    why = None
+    if run.get("yahoo_rate_limited"):
+        why = "Yahoo rate-limited the price refresh"
+    elif run.get("requested") and bad > 0.10 * run["requested"]:
+        why = f"{bad} of {run['requested']} price refreshes were stale or failed"
+    elif fresh < _coverage_floor():
+        why = f"only {fresh} names have a bar on the latest date (floor {_coverage_floor()})"
+    if why:
+        raise CoverageError(why)
+    _remember_coverage(fresh)
+
+    # atomic writes; context first, `latest` last = the commit marker
+    _atomic_pickle(CONTEXT_PATH, ctx)
+    _atomic_pickle(PANEL_PATH, panel)
+    _atomic_pickle(LATEST_PATH, latest)
     return {"hist": hist, "panel": panel, "latest": latest, **ctx}
+
+
+class CoverageError(RuntimeError):
+    """The data refresh came back too thin to publish honestly."""
+
+
+COVERAGE_PATH = STATE / "coverage.json"
+
+
+def _coverage_floor() -> int:
+    """MIN_SCORED, or 85% of the median of the last 10 healthy runs."""
+    try:
+        hist = json.loads(COVERAGE_PATH.read_text())
+    except (OSError, ValueError):
+        hist = []
+    med = float(np.median(hist[-10:])) if hist else 0.0
+    return int(max(MIN_SCORED, 0.85 * med))
+
+
+def _remember_coverage(n: int) -> None:
+    try:
+        hist = json.loads(COVERAGE_PATH.read_text())
+    except (OSError, ValueError):
+        hist = []
+    COVERAGE_PATH.write_text(json.dumps((hist + [int(n)])[-30:]))
+
+
+def _atomic_pickle(path, obj) -> None:
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "wb") as f:
+        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.replace(path)
 
 
 def load_state() -> Optional[dict]:
     from .sources import prices
     if not (LATEST_PATH.exists() and CONTEXT_PATH.exists()):
         return None
-    latest = pd.read_pickle(LATEST_PATH)
-    with open(CONTEXT_PATH, "rb") as f:
-        ctx = pickle.load(f)
+    try:
+        with open(LATEST_PATH, "rb") as f:
+            latest = pickle.load(f)
+        with open(CONTEXT_PATH, "rb") as f:
+            ctx = pickle.load(f)
+    except (OSError, EOFError, pickle.UnpicklingError, ValueError, AttributeError) as e:
+        log.warning("saved state unreadable (%s) — will refresh", e)
+        return None
     hist = prices.load_history(list(set(latest["symbol"]) | {config.REFERENCE_SYMBOL}), refresh=False)
     return {"latest": latest, "hist": hist, **ctx}
 
@@ -162,47 +216,129 @@ def _model_stale(days: int = 7) -> bool:
     return age > timedelta(days=days)
 
 
+def _is_late(session_iso: str) -> bool:
+    """True once that session's 9:30 ET opening bell has rung."""
+    from datetime import time as dtime
+    open_bell = datetime.combine(date.fromisoformat(session_iso), dtime(9, 30), tzinfo=ET)
+    return now_et() >= open_bell
+
+
+def _withhold(reason: str, push: bool) -> None:
+    """Leave the last good page up, but tell readers today's run was withheld."""
+    cur = publish.read_json("today.json") or {}
+    cur["withheld"] = {"at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "reason": reason}
+    publish.write_json("today.json", cur)
+    if push:
+        publish.push(f"withheld: {reason[:80]}")
+
+
+def _publish_today(today: dict, args: argparse.Namespace, message: str) -> int:
+    """Write today.json, log the picks (pre-open only) and push.
+
+    A late page never replaces a pre-open page for the same session — the
+    board readers see must be the board the track record grades."""
+    today["late"] = _is_late(today["session_date"])
+    cur = publish.read_json("today.json") or {}
+    if today["late"] and cur.get("session_date") == today["session_date"] and not cur.get("late") \
+            and not cur.get("sample"):
+        log.info("run is after the open — keeping the pre-open page for %s", today["session_date"])
+        return 0
+    publish.write_json("today.json", today)
+    if not today["late"]:
+        scorecard.log_picks(today)
+    else:
+        log.info("published after the open — not logged to the track record")
+    if args.no_push:
+        return 0
+    if publish.push(message):
+        return 0
+    if not today["late"]:
+        scorecard.mark_unverified(today["session_date"], "push to GitHub not confirmed at publish time")
+    return 3
+
+
 def cmd_evening(args: argparse.Namespace) -> int:
     from . import evidence, model
-    state = refresh_data()
+    try:
+        state = refresh_data()
+    except CoverageError as e:
+        log.error("coverage gate FAILED on refresh (%s) — no grading, previous page kept", e)
+        _withhold(f"evening data refresh too thin ({e})", not args.no_push)
+        return 2
     elig = state["latest"]["symbol"].tolist()
     n = scorecard.grade(state["hist"], elig)
     log.info("graded %d session(s)", n)
     publish.write_json("scorecard.json", scorecard.summary())
-    if args.retrain or _model_stale():
-        log.info("model stale — retraining (walk-forward)")
-        publish.write_json("model.json", model.train(state["panel"]))
-        publish.write_json("evidence.json", evidence.run_studies(state["panel"]))
-        compute_signs(state["panel"])
+    if args.retrain or _model_stale(9):
+        try:
+            log.info("model stale — retraining (walk-forward)")
+            publish.write_json("model.json", model.train(state["panel"]))
+            publish.write_json("evidence.json", evidence.run_studies(state["panel"]))
+            compute_signs(state["panel"])
+        except Exception as e:  # noqa: BLE001 — keep the existing model and carry on
+            log.exception("retrain failed — keeping the previous model")
+            net.record_status("Model retrain", False, f"failed: {e}")
     today = build_today(state, run="evening", live_extras=True)
-    publish.write_json("today.json", today)
-    scorecard.log_picks(today)
-    if not args.no_push:
-        publish.push(f"evening: watchlist for {today['session_date']}")
-    return 0
+    ok, why = healthy(today)
+    if not ok:
+        log.error("coverage gate FAILED (%s) — keeping the previous page", why)
+        _withhold(f"watchlist withheld: {why}", not args.no_push)
+        return 2
+    return _publish_today(today, args, f"evening: watchlist for {today['session_date']}")
 
 
 def cmd_morning(args: argparse.Namespace) -> int:
     state = load_state()
     session = target_session()
-    stale = state is None or pd.Timestamp(state["latest"]["date"].max()).date() < prev_trading_day(session)
-    if stale:
-        log.info("evening state missing/stale — running the full refresh first")
-        state = refresh_data()
-        publish.write_json("scorecard.json", scorecard.summary())
-    today = build_today(state, run="morning", live_extras=True)
-    # A pick published after the open can't be graded fairly — show it,
-    # but keep it out of the track record (the evening watchlist stands).
-    if market_phase() != "pre-market":
-        today["late"] = True
-        log.info("morning run after the open (%s) — not logged to the track record", market_phase())
-    publish.write_json("today.json", today)
-    if not today.get("late"):
-        scorecard.log_picks(today)
-    if not args.no_push:
-        top = (today.get("top") or {}).get("symbol", "none")
-        publish.push(f"morning: {today['session_date']} #1 {top}")
-    return 0
+    refreshed = False
+
+    def stale(st) -> bool:
+        if st is None:
+            return True
+        d = pd.to_datetime(st["latest"]["date"])
+        return d.max().date() < prev_trading_day(session) or (d == d.max()).mean() < 0.9
+
+    try:
+        if stale(state):
+            log.info("evening state missing/stale — running the full refresh first")
+            state, refreshed = refresh_data(), True
+            publish.write_json("scorecard.json", scorecard.summary())
+        today = build_today(state, run="morning", live_extras=True)
+        ok, why = healthy(today)
+        if not ok and not refreshed:
+            log.warning("coverage gate failed on saved state (%s) — refreshing once and retrying", why)
+            state = refresh_data()
+            today = build_today(state, run="morning", live_extras=True)
+            ok, why = healthy(today)
+    except CoverageError as e:
+        ok, why = False, str(e)
+    if not ok:
+        log.error("coverage gate FAILED (%s) — keeping the previous page", why)
+        _withhold(f"morning run withheld: {why}", not args.no_push)
+        return 2
+    top = (today.get("top") or {}).get("symbol", "none")
+    return _publish_today(today, args, f"morning: {today['session_date']} #1 {top}")
+
+
+def healthy(today: dict) -> tuple:
+    """Coverage gate: never overwrite a good page with a thin or stale one.
+
+    Fails when fewer than MIN_SCORED names were scored, when under 60% of
+    the eligible universe traded on the feature date, or when the features
+    are older than the session before the one we're picking for."""
+    uni = today.get("universe") or {}
+    scored, eligible = int(uni.get("scored") or 0), int(uni.get("eligible") or 0)
+    if scored < MIN_SCORED:
+        return False, f"only {scored} names scored (< {MIN_SCORED})"
+    if eligible and scored < 0.6 * eligible:
+        return False, f"only {scored}/{eligible} eligible names have a bar on the feature date"
+    session = date.fromisoformat(today["session_date"])
+    asof = date.fromisoformat(today["features_asof"])
+    if asof < prev_trading_day(session):
+        return False, f"features as of {asof} are stale for session {session}"
+    if not today.get("board"):
+        return False, "empty board"
+    return True, "ok"
 
 
 def cmd_publish(_args: argparse.Namespace) -> int:
@@ -247,6 +383,9 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
     t0 = time.time()
     session = target_session()
     phase = market_phase()
+    from .util import holidays_covered
+    if not holidays_covered(session.year):
+        net.record_status("Market calendar", False, "holiday table has run out — update gravity/util.py")
     latest: pd.DataFrame = state["latest"].copy()
     last_date = pd.Timestamp(latest["date"].max())
     # only names that actually traded on the last session are scoreable
@@ -319,7 +458,9 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
     latest["lift"] = latest["prob_dump"] / base if base else np.nan
     latest["score"] = score.rank_percentile(latest["prob_dump"])
     latest["sq_pct"] = latest["prob_squeeze"].rank(pct=True) * 100
-    latest["vol20_pct"] = pd.to_numeric(latest.get("vol20"), errors="coerce").rank(pct=True)
+    latest["range14_pct"] = pd.to_numeric(latest.get("range14"), errors="coerce").rank(pct=True)
+    latest["ssr"] = model.ssr_next(latest)
+    latest["publishable"] = model.publishable(latest)
 
     # 5) borrow + short volume for everyone (cheap bulk files)
     borrow = _safe(shortside.ibkr_borrow, default={}) or {}
@@ -438,6 +579,7 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
             "prob_squeeze": m.get("prob_squeeze"), "exp_oc": m.get("exp_oc"),
             "lift": m.get("lift"), "score": None if m.get("score") is None else int(m["score"]),
             "model_used": m.get("model_used"),
+            "ssr": bool(m.get("ssr")), "publishable": bool(m.get("publishable")),
             "squeeze_danger": sqd, "squeeze_parts": sq_parts,
             "shortability": short, "families": fams, "reasons": reasons, "flags": flags,
             "metrics": {
@@ -472,7 +614,12 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
         elif len(board) < config.BOARD_SIZE:
             p["rank"] = len(board) + 1
             board.append(p)
-    top = board[0] if board else None
+    # The #1 follows the publication rule the backtest measured: no Rule 201
+    # restriction and ≥ $300k median daily volume (plus borrow + squeeze < 70).
+    top = next((p for p in board if p.get("publishable")), None)
+    tie_n = 0
+    if top is not None:
+        tie_n = int((np.abs(latest["prob_dump"].to_numpy(float) - float(top["prob_dump"])) < 1e-4).sum())
 
     rank_of = {p["symbol"]: p["rank"] for p in board}
     twin_cards = []
@@ -512,7 +659,10 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
             "base_rate_dump": base,
             "trained_through": report.get("trained_through"),
             "oos_auc": ((report.get("oos") or {}).get("m1" if use_open_syms else "m0") or {}).get("auc"),
+            "prob_cap": {m_: ((bundle.get(m_) or {}).get("dump") or {}).get("cap") for m_ in ("m0", "m1")},
+            "publication_rule": (report.get("publication_rule") or {}).get("text"),
         },
+        "top_tie_count": tie_n,
         "top": top,
         "board": board,
         "squeeze_zone": squeeze_zone,

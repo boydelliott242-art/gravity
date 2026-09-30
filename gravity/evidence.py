@@ -162,6 +162,7 @@ def _stats(sub: pd.DataFrame) -> Dict[str, Any]:
         "pct_dump": mean(_col(sub, "y_dump")),
         "pct_bigdump": mean(_col(sub, "y_bigdump")),
         "pct_squeeze": mean(_col(sub, "y_squeeze")),
+        "pct_up5": mean((oc >= 0.05).astype(float).where(oc.notna())),
         "median_oc": med(oc),
         "mean_oc": mean(oc),
         "median_c5": med(c5),
@@ -184,12 +185,21 @@ def _sentence(lead: str, st: Dict[str, Any], ref: Optional[float], same_day: boo
     else:
         cmp_txt = f" — {lift:.2f}× the {_pct(ref)} rate for comparable name-days"
     small = f" Small sample (n = {n:,}) — treat as anecdotal." if n < SMALL_N else ""
+    up = st.get("pct_up5")
+    lu = st.get("lift_up5")
+    if up is not None:
+        both = (f" It also RAN UP 5%+ open→close {_pct(up)} of the time"
+                + (f" ({lu:.2f}× normal)" if lu else "")
+                + (" — so this is mostly a bigger-move signal, not a clean downside one." if st.get("skew") == "both"
+                   else " — the tilt is to the upside." if st.get("skew") == "up" else " — the tilt is to the downside."))
+    else:
+        both = ""
     return (
         f"{lead} ({n:,} cases across {st['n_symbols']:,} stocks), {when} fell "
         f"{abs(config.DUMP_THRESHOLD):.0%}+ from open to close {_pct(st['pct_dump'])} of the time{ci_txt}"
         f"{cmp_txt}. Median open→close {_signed_pct(st['median_oc'])}; it closed below its open "
         f"{_pct(st['pct_red_oc'])} of the time and squeezed {config.SQUEEZE_THRESHOLD:.0%}+ above the open "
-        f"{_pct(st['pct_squeeze'])} of the time.{small}"
+        f"{_pct(st['pct_squeeze'])} of the time.{both}{small}"
     )
 
 
@@ -214,6 +224,12 @@ def run_studies(panel: pd.DataFrame, n_boot: int = N_BOOT, seed: int = SEED) -> 
         st["lift_dump"] = (st["pct_dump"] / ref) if (st["pct_dump"] is not None and ref) else None
         st["ref_pct_dump"] = ref
         st["ref_n"] = int(ref_rows.sum())
+        oc_all = _col(lab, "y_oc").to_numpy(float)
+        up_ref = float(np.nanmean(oc_all[ref_rows] >= 0.05)) if ref_rows.any() else None
+        st["ref_pct_up5"] = up_ref
+        st["lift_up5"] = (st["pct_up5"] / up_ref) if (st.get("pct_up5") is not None and up_ref) else None
+        st["skew"] = ("down" if (st["lift_dump"] or 0) > (st["lift_up5"] or 0) * 1.1
+                      else "up" if (st["lift_up5"] or 0) > (st["lift_dump"] or 0) * 1.1 else "both")
         out = {"id": sid, "title": title, "condition": condition, "same_session_condition": bool(same_day)}
         out.update(st)
         out["plain"] = _sentence(lead, st, ref if compare else None, same_day)
