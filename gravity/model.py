@@ -1,0 +1,722 @@
+"""Walk-forward-validated dump / squeeze models (CONTRACTS §8, §12).
+
+Two model sets, identical except for one column:
+
+* **M0** — ``features.FEATURES`` only: everything known at the close of
+  ``t``. Used the evening before and for every name in the morning.
+* **M1** — ``FEATURES + M1_EXTRA`` (``gap_open``). In the backtest this is
+  the real 9:30 open of ``t+1``; live it is a pre-market price proxy, so M1
+  is only used for the shortlist names that have a pre-market print.
+
+Each set has calibrated classifiers for ``y_dump`` (open→close ≤ −5 %),
+``y_bigdump`` (≤ −15 %) and ``y_squeeze`` (open→high ≥ +20 %), plus a
+regressor for the clipped open→close return (``exp_oc``).
+
+Recipe (identical in every walk-forward fold and in production):
+
+1. training window = every labeled session before the test window, minus
+   an embargo of ``EMBARGO`` sessions (labels look one session ahead);
+2. the last ``CAL_SESSIONS`` sessions of that window are held out;
+   ``HistGradientBoosting`` (NaN-native) is fit on the sessions before them
+   (minus another embargo) and isotonic regression maps its raw scores to
+   probabilities on the held-out, *later* slice;
+3. the ``exp_oc`` regressor is fit on the whole window (it is not calibrated).
+
+Walk-forward = expanding window, test folds of ``fold_months`` calendar
+months, out-of-sample predictions for every test session → AUC, Brier,
+calibration deciles, daily top-1 / top-10 / top-decile hit rates and a
+"short the #1 at the open, cover at the close" simulation. Production is
+the same recipe with the window extended to the last labeled session.
+
+Nothing here downloads anything; the panel comes from ``features``.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+import pickle
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
+import numpy as np
+import pandas as pd
+
+from . import config
+from .features import FAMILIES, FEATURE_DOCS, FEATURES, LABELS, M1_EXTRA
+from .util import clean
+
+log = logging.getLogger(__name__)
+
+# ── Settings ─────────────────────────────────────────────────────────────
+TARGETS: Dict[str, str] = {"dump": "y_dump", "bigdump": "y_bigdump", "squeeze": "y_squeeze"}
+PROB_COLS: Dict[str, str] = {"dump": "prob_dump", "bigdump": "prob_bigdump", "squeeze": "prob_squeeze"}
+OUT_COLUMNS: List[str] = ["prob_dump", "prob_bigdump", "prob_squeeze", "exp_oc"]
+M0_FEATURES: List[str] = list(FEATURES)
+M1_FEATURES: List[str] = list(FEATURES) + list(M1_EXTRA)
+
+OC_CLIP: Tuple[float, float] = (-0.5, 0.5)   # regressor target clip (one +3,000 % day must not dominate)
+COST = 0.01                                   # assumed round-trip cost of a short, fraction of notional
+TIE_EPS = 1e-6                                # isotonic ties broken by the raw score (moves p by < 1e-6)
+BUNDLE_NAME = "bundle.pkl"
+DEFAULT_SITE_JSON = config.SITE_DATA / "model.json"
+BUNDLE_VERSION = 1
+
+DEFAULTS: Dict[str, Any] = {
+    "embargo": 5,                  # sessions between the last training label and the first test/cal day
+    "min_train_sessions": 252,     # first test fold starts after ~1 year of labeled sessions
+    "cal_sessions": 63,            # held-out later slice for isotonic calibration (~1 quarter)
+    "max_fit_rows": 400_000,       # per-fit row cap (see _subsample); keeps the full train ≲ 15 min
+    "importance_rows": 40_000,     # rows used for permutation importance
+    "hgb": {
+        "learning_rate": 0.1,
+        "max_iter": 200,
+        "max_leaf_nodes": 31,
+        "min_samples_leaf": 200,
+        "l2_regularization": 1.0,
+        "early_stopping": True,
+        "validation_fraction": 0.1,
+        "n_iter_no_change": 20,
+        "random_state": 0,
+    },
+    "seed": 0,
+}
+
+TARGET_TEXT = {
+    "dump": f"next session open→close ≤ {config.DUMP_THRESHOLD:+.0%}",
+    "bigdump": f"next session open→close ≤ {config.BIG_DUMP_THRESHOLD:+.0%}",
+    "squeeze": f"next session open→high ≥ {config.SQUEEZE_THRESHOLD:+.0%}",
+    "exp_oc": f"expected next-session open→close, each training outcome clipped to "
+              f"[{OC_CLIP[0]:+.0%}, {OC_CLIP[1]:+.0%}]",
+}
+
+CAVEATS: List[str] = [
+    "Survivorship bias: the universe is the set of names listed today. Stocks that collapsed and "
+    "delisted during the last three years are missing, so historical dump rates are probably "
+    "understated. The universe is also chosen by today's market cap and price, which over-represents "
+    "stocks that shrank into small-cap territory — a mild look-ahead that can flatter a model that "
+    "shorts weak, volatile names. The backtest is not a fully point-in-time universe.",
+    "No locate constraint: the simulation assumes the #1 name could be borrowed and shorted at the "
+    "open every day. Many of these names are hard to borrow or unavailable, and borrow fees (often "
+    "50-500%+ annualised) are not modelled beyond the flat cost.",
+    "Fills are the official opening and closing prints (auction prices). Real fills on thin names "
+    "slip; the flat 1% round-trip cost may be optimistic.",
+    "Halts: sessions where the next day is halted or has no clean print have no label and are "
+    "dropped. A short trapped in a halt is exactly the worst case, and it is not in these numbers.",
+    "Uncapped risk: a short can lose more than 100% in one session (the data contains open→close "
+    "moves above +1,000%). Daily P&L is summed at 1x notional per day, not compounded, with no stop.",
+    "M1 uses the real 9:30 open in the backtest; live it uses a pre-market price as a proxy for the "
+    "open, which can differ materially. Treat M1 live numbers as less reliable than its backtest.",
+    "Historical filing features are form/item based (no text matching); names without SEC history "
+    "get blank filing features. Live text-matched catalysts are an overlay the model never trained on.",
+    "Probabilities are calibrated on the most recent held-out quarter; they drift when the market "
+    "regime changes. Out-of-sample results are history, not a promise.",
+]
+
+
+# ── Small helpers ────────────────────────────────────────────────────────
+def _settings(fold_months: int, params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    s = json.loads(json.dumps(DEFAULTS))
+    for k, v in (params or {}).items():
+        if k == "hgb" and isinstance(v, dict):
+            s["hgb"].update(v)
+        else:
+            s[k] = v
+    s["fold_months"] = int(max(1, fold_months))
+    return s
+
+
+def _iso_utc() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _day(d: Any) -> Optional[str]:
+    if d is None:
+        return None
+    try:
+        return pd.Timestamp(d).strftime("%Y-%m-%d")
+    except (TypeError, ValueError):
+        return None
+
+
+def _f(x: Any) -> Optional[float]:
+    """float or None (NaN/inf → None)."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def _matrix(rows: pd.DataFrame, cols: Sequence[str]) -> np.ndarray:
+    out = np.full((len(rows), len(cols)), np.nan, dtype=np.float32)
+    missing = [c for c in cols if c not in rows.columns]
+    if missing:
+        log.warning("model: %d feature column(s) missing from rows → NaN: %s", len(missing), missing[:8])
+    for j, c in enumerate(cols):
+        if c in rows.columns:
+            v = pd.to_numeric(rows[c], errors="coerce").to_numpy(dtype=np.float64)
+            v[~np.isfinite(v)] = np.nan
+            out[:, j] = v
+    return out
+
+
+def _subsample(y: np.ndarray, cap: int, rng: np.random.Generator,
+               classify: bool) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """Row indices (and weights) for one fit, at most ``cap`` rows.
+
+    Classifiers keep every positive (up to half the cap) and a random share
+    of negatives, re-weighted so the weighted base rate equals the true one;
+    the regressor takes a uniform random sample. Isotonic calibration is fit
+    afterwards on untouched, unweighted rows, so this never biases the
+    reported probabilities."""
+    n = len(y)
+    if n <= cap:
+        return np.arange(n), None
+    if not classify:
+        return np.sort(rng.choice(n, cap, replace=False)), None
+    pos = np.flatnonzero(y == 1)
+    neg = np.flatnonzero(y != 1)
+    k_pos = min(len(pos), cap // 2)
+    k_neg = min(len(neg), cap - k_pos)
+    p_idx = rng.choice(pos, k_pos, replace=False) if k_pos < len(pos) else pos
+    n_idx = rng.choice(neg, k_neg, replace=False) if k_neg < len(neg) else neg
+    idx = np.sort(np.r_[p_idx, n_idx])
+    w = np.where(y[idx] == 1, len(pos) / max(k_pos, 1), len(neg) / max(k_neg, 1)).astype(np.float64)
+    w /= w.mean()
+    return idx, w
+
+
+def _fit_classifier(X: np.ndarray, y: np.ndarray, s: Dict[str, Any], rng: np.random.Generator):
+    from sklearn.ensemble import HistGradientBoostingClassifier
+
+    if len(y) == 0 or np.unique(y).size < 2:
+        return None
+    idx, w = _subsample(y, int(s["max_fit_rows"]), rng, classify=True)
+    params = dict(s["hgb"])
+    # early stopping needs enough positives in its random validation split
+    if params.get("early_stopping") and (y[idx] == 1).sum() < 200:
+        params["early_stopping"] = False
+        params["max_iter"] = min(int(params["max_iter"]), 150)
+    m = HistGradientBoostingClassifier(**params)
+    m.fit(X[idx], y[idx], sample_weight=w)
+    return m
+
+
+def _fit_regressor(X: np.ndarray, y: np.ndarray, s: Dict[str, Any], rng: np.random.Generator):
+    from sklearn.ensemble import HistGradientBoostingRegressor
+
+    if len(y) < 50:
+        return None
+    idx, _ = _subsample(y, int(s["max_fit_rows"]), rng, classify=False)
+    m = HistGradientBoostingRegressor(**s["hgb"])
+    m.fit(X[idx], np.clip(y[idx], *OC_CLIP))
+    return m
+
+
+def _raw(clf, X: np.ndarray) -> np.ndarray:
+    if clf is None or len(X) == 0:
+        return np.full(len(X), np.nan)
+    return clf.predict_proba(X)[:, 1]
+
+
+def _fit_iso(raw: np.ndarray, y: np.ndarray):
+    from sklearn.isotonic import IsotonicRegression
+
+    ok = np.isfinite(raw) & np.isfinite(y)
+    if ok.sum() < 50 or np.unique(y[ok]).size < 2:
+        return None
+    return IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip").fit(raw[ok], y[ok])
+
+
+def _calibrated(cm: Optional[Dict[str, Any]], X: np.ndarray) -> np.ndarray:
+    """Calibrated probability. Isotonic maps are step-like; exact ties are
+    broken by the raw score with weight ``TIE_EPS`` so rankings are stable
+    (the probability moves by less than 1e-6)."""
+    if not cm or cm.get("clf") is None:
+        return np.full(len(X), np.nan)
+    raw = _raw(cm["clf"], X)
+    iso = cm.get("iso")
+    cal = iso.predict(raw) if iso is not None else raw
+    return np.clip((1.0 - TIE_EPS) * cal + TIE_EPS * raw, 0.0, 1.0)
+
+
+def _predict_set(ms: Dict[str, Any], X: np.ndarray) -> Dict[str, np.ndarray]:
+    out = {PROB_COLS[t]: _calibrated(ms.get(t), X) for t in TARGETS}
+    # a ≤ −15 % day is also a ≤ −5 % day: keep the probabilities coherent
+    out["prob_bigdump"] = np.fmin(out["prob_bigdump"], out["prob_dump"])
+    reg = ms.get("oc")
+    out["exp_oc"] = reg.predict(X) if (reg is not None and len(X)) else np.full(len(X), np.nan)
+    return out
+
+
+def _fit_set(X: np.ndarray, Y: Dict[str, np.ndarray], fit_idx: np.ndarray, cal_idx: np.ndarray,
+             ncols: int, s: Dict[str, Any], rng: np.random.Generator) -> Dict[str, Any]:
+    """One model set (M0 when ``ncols == len(FEATURES)``, M1 with gap_open)."""
+    Xf = X[fit_idx, :ncols]
+    Xc = X[cal_idx, :ncols]
+    ms: Dict[str, Any] = {}
+    for t, col in TARGETS.items():
+        clf = _fit_classifier(Xf, Y[col][fit_idx], s, rng)
+        iso = _fit_iso(_raw(clf, Xc), Y[col][cal_idx]) if clf is not None else None
+        ms[t] = {"clf": clf, "iso": iso}
+    all_idx = np.r_[fit_idx, cal_idx]
+    ms["oc"] = _fit_regressor(X[all_idx, :ncols], Y["y_oc"][all_idx], s, rng)
+    return ms
+
+
+# ── Windows ──────────────────────────────────────────────────────────────
+def _fold_windows(dates: np.ndarray, s: Dict[str, Any]) -> List[Dict[str, int]]:
+    """Walk-forward folds as indices into the sorted unique label dates."""
+    n = len(dates)
+    emb, cal = int(s["embargo"]), int(s["cal_sessions"])
+    min_fit = 40
+    start = max(int(s["min_train_sessions"]), cal + 2 * emb + min_fit)
+    if n - start < 5:
+        return []
+    per = pd.DatetimeIndex(dates).to_period("M")
+    months = (per.year * 12 + per.month - 1).to_numpy()
+    # folds align to calendar months from the first test month; a stub first
+    # fold (the start landed near a month end) is merged into the next one
+    per_q = int(s["fold_months"])
+    bucket = (months - months[start] + (months[start] % per_q if per_q > 1 else 0)) // per_q
+    first = np.flatnonzero(bucket[start:] == bucket[start]) + start
+    if len(first) < 10 and first[-1] + 1 < n:
+        bucket[first] = bucket[first[-1] + 1]
+    folds = []
+    for b in np.unique(bucket[start:]):
+        te = np.flatnonzero((bucket == b) & (np.arange(n) >= start))
+        a, z = int(te[0]), int(te[-1])
+        train_end = a - emb - 1                  # last training label date
+        cal_start = train_end - cal + 1
+        fit_end = cal_start - emb - 1
+        if fit_end < min_fit:
+            continue
+        folds.append({"test_start": a, "test_end": z, "train_end": train_end,
+                      "cal_start": cal_start, "fit_end": fit_end})
+    return folds
+
+
+# ── Metrics ──────────────────────────────────────────────────────────────
+def _auc(y: np.ndarray, p: np.ndarray) -> Optional[float]:
+    from sklearn.metrics import roc_auc_score
+
+    ok = np.isfinite(y) & np.isfinite(p)
+    if ok.sum() < 10 or np.unique(y[ok]).size < 2:
+        return None
+    return float(roc_auc_score(y[ok], p[ok]))
+
+
+def _daily_table(day: np.ndarray, prob: np.ndarray, y: np.ndarray, oc: np.ndarray,
+                 sq: Optional[np.ndarray] = None) -> pd.DataFrame:
+    """Per test day: the #1, the top-10 and the top decile by ``prob``."""
+    df = pd.DataFrame({"day": day, "p": prob, "y": y, "oc": oc,
+                       "sq": sq if sq is not None else np.nan})
+    df = df[np.isfinite(df["p"]) & np.isfinite(df["y"]) & np.isfinite(df["oc"])]
+    if not len(df):
+        return pd.DataFrame(columns=["top1_y", "top1_oc", "top1_sq", "top10_y", "top10_oc",
+                                     "dec_y", "uni_y", "uni_oc", "n"])
+    df = df.sort_values(["day", "p"], ascending=[True, False], kind="mergesort")
+    g = df.groupby("day", sort=True)
+    df["rk"] = g.cumcount() + 1
+    df["n"] = g["p"].transform("size")
+    top1 = df[df["rk"] == 1].set_index("day")
+    top10 = df[df["rk"] <= 10].groupby("day")[["y", "oc"]].mean()
+    dec = df[df["rk"] <= np.ceil(0.1 * df["n"])].groupby("day")["y"].mean()
+    uni = g[["y", "oc"]].mean()
+    return pd.DataFrame({
+        "top1_y": top1["y"], "top1_oc": top1["oc"], "top1_sq": top1["sq"],
+        "top10_y": top10["y"], "top10_oc": top10["oc"],
+        "dec_y": dec, "uni_y": uni["y"], "uni_oc": uni["oc"], "n": g.size(),
+    })
+
+
+def _metrics(y: np.ndarray, p: np.ndarray, daily: pd.DataFrame) -> Dict[str, Any]:
+    ok = np.isfinite(y) & np.isfinite(p)
+    brier = float(np.mean((p[ok] - y[ok]) ** 2)) if ok.any() else None
+    m: Dict[str, Any] = {
+        "auc": _auc(y, p),
+        "brier": brier,
+        "base_rate": float(np.mean(y[ok])) if ok.any() else None,
+        "mean_pred": float(np.mean(p[ok])) if ok.any() else None,
+        "n": int(ok.sum()),
+        "days": int(len(daily)),
+    }
+    if len(daily):
+        m.update({
+            "top1_hit": _f(daily["top1_y"].mean()),
+            "top10_hit": _f(daily["top10_y"].mean()),
+            "top_decile_hit": _f(daily["dec_y"].mean()),
+            "universe_daily_hit": _f(daily["uni_y"].mean()),
+            "top1_mean_oc": _f(daily["top1_oc"].mean()),
+            "top1_median_oc": _f(daily["top1_oc"].median()),
+            "top10_mean_oc": _f(daily["top10_oc"].mean()),
+            "universe_mean_oc": _f(daily["uni_oc"].mean()),
+            "top1_squeeze_rate": _f(daily["top1_sq"].mean()),
+        })
+    else:
+        m.update({k: None for k in ("top1_hit", "top10_hit", "top_decile_hit", "universe_daily_hit",
+                                    "top1_mean_oc", "top1_median_oc", "top10_mean_oc",
+                                    "universe_mean_oc", "top1_squeeze_rate")})
+    return m
+
+
+def _max_drawdown(pnl: np.ndarray) -> Optional[float]:
+    if not len(pnl):
+        return None
+    cum = np.cumsum(pnl)
+    peak = np.maximum.accumulate(np.r_[0.0, cum])[1:]
+    return float(np.max(peak - cum))
+
+
+def _sim(daily: pd.DataFrame, cost: float = COST) -> Dict[str, Any]:
+    """Short the #1 (and, separately, an equal-weight top-10 basket) at the
+    open and cover at the close, every test day, 1x notional, summed."""
+    if not len(daily):
+        return {"daily": [], "gross_total": None, "net_total": None, "win_rate": None,
+                "max_drawdown": None, "cost_assumption": cost}
+    g1 = -daily["top1_oc"].to_numpy(float)
+    g10 = -daily["top10_oc"].to_numpy(float)
+    gu = -daily["uni_oc"].to_numpy(float)
+    rows = [[_day(d), _f(a), _f(b), _f(c)] for d, a, b, c in
+            zip(daily.index, daily["top1_oc"], daily["top10_oc"], daily["uni_oc"])]
+    return {
+        "daily": rows,
+        "columns": ["date", "oc_top1", "oc_top10_mean", "universe_mean_oc"],
+        "gross_total": float(g1.sum()),
+        "net_total": float((g1 - cost).sum()),
+        "win_rate": float(np.mean(g1 - cost > 0)),
+        "gross_win_rate": float(np.mean(g1 > 0)),
+        "max_drawdown": _max_drawdown(g1 - cost),
+        "mean_daily_net": float(np.mean(g1 - cost)),
+        "worst_day": float(np.min(g1)),
+        "best_day": float(np.max(g1)),
+        "top10_gross_total": float(g10.sum()),
+        "top10_net_total": float((g10 - cost).sum()),
+        "top10_win_rate": float(np.mean(g10 - cost > 0)),
+        "top10_max_drawdown": _max_drawdown(g10 - cost),
+        "top10_worst_day": float(np.min(g10)),
+        "universe_gross_total": float(gu.sum()),
+        "universe_net_total": float((gu - cost).sum()),
+        "cost_assumption": cost,
+        "units": "sum of daily returns at 1x notional (not compounded); short return = -(close/open - 1)",
+    }
+
+
+def _calibration(y: np.ndarray, p: np.ndarray, bins: int = 10) -> List[Dict[str, Any]]:
+    ok = np.isfinite(y) & np.isfinite(p)
+    if ok.sum() < bins:
+        return []
+    yy, pp = y[ok], p[ok]
+    r = pd.Series(pp).rank(method="first").to_numpy()
+    b = np.minimum((r - 1) * bins // len(pp), bins - 1).astype(int)
+    out = []
+    for i in range(bins):
+        m = b == i
+        if m.any():
+            out.append({"bin": i + 1, "pred": float(pp[m].mean()), "actual": float(yy[m].mean()),
+                        "n": int(m.sum()), "pred_max": float(pp[m].max())})
+    return out
+
+
+# ── Importance ───────────────────────────────────────────────────────────
+def _importance(clf, X: np.ndarray, y: np.ndarray, cols: List[str],
+                rng: np.random.Generator) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[float]]:
+    """AUC drop when a feature (or a whole family, jointly) is shuffled."""
+    base = _auc(y, _raw(clf, X)) if clf is not None else None
+    if base is None:
+        return [], [], None
+    perm = rng.permutation(len(y))
+    per: List[Dict[str, Any]] = []
+    for j, c in enumerate(cols):
+        Xp = X.copy()
+        Xp[:, j] = X[perm, j]
+        a = _auc(y, _raw(clf, Xp))
+        per.append({"family": FEATURE_DOCS[c][0], "feature": c,
+                    "importance": None if a is None else base - a, "doc": FEATURE_DOCS[c][1]})
+    fam: List[Dict[str, Any]] = []
+    for f in FAMILIES:
+        js = [j for j, c in enumerate(cols) if FEATURE_DOCS[c][0] == f]
+        if not js:
+            continue
+        Xp = X.copy()
+        Xp[:, js] = X[perm][:, js]
+        a = _auc(y, _raw(clf, Xp))
+        fam.append({"family": f, "importance": None if a is None else base - a, "n_features": len(js)})
+    per.sort(key=lambda d: -(d["importance"] if d["importance"] is not None else -1e9))
+    fam.sort(key=lambda d: -(d["importance"] if d["importance"] is not None else -1e9))
+    return per, fam, base
+
+
+# ── Public API ───────────────────────────────────────────────────────────
+def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
+          site_json: Union[Path, str, None] = DEFAULT_SITE_JSON,
+          fold_months: int = 1, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Walk-forward evaluation + production fit. Returns the §12 report,
+    writes it to ``site_json`` (unless None) and pickles the bundle to
+    ``out_dir/bundle.pkl``."""
+    import sklearn
+
+    t_all = time.time()
+    s = _settings(fold_months, params)
+    rng = np.random.default_rng(int(s["seed"]))
+    need = ["date", "symbol"] + M1_FEATURES + ["y_oc", "y_dump", "y_bigdump", "y_squeeze"]
+    missing = [c for c in need if c not in panel.columns]
+    if missing:
+        raise ValueError(f"panel is missing columns: {missing[:10]}")
+
+    lab = panel[panel["y_dump"].notna() & panel["y_oc"].notna()]
+    lab = lab.sort_values(["date", "symbol"], kind="mergesort").reset_index(drop=True)
+    if len(lab) < 1000:
+        raise ValueError(f"only {len(lab)} labeled rows — not enough to train")
+    row_dates = pd.to_datetime(lab["date"]).to_numpy(dtype="datetime64[ns]")
+    dates = np.unique(row_dates)
+    di = np.searchsorted(dates, row_dates)
+    X = _matrix(lab, M1_FEATURES)
+    Y = {c: lab[c].to_numpy(dtype=np.float64) for c in ("y_oc", "y_dump", "y_bigdump", "y_squeeze")}
+    n0, n1 = len(M0_FEATURES), len(M1_FEATURES)
+    log.info("train: %d labeled rows, %d symbols, %d sessions (%s → %s)", len(lab), lab["symbol"].nunique(),
+             len(dates), _day(dates[0]), _day(dates[-1]))
+
+    # 1) walk-forward
+    t_wf = time.time()
+    folds = _fold_windows(dates, s)
+    oos = {m: {c: np.full(len(lab), np.nan) for c in OUT_COLUMNS} for m in ("m0", "m1")}
+    fold_rows: List[Dict[str, Any]] = []
+    for k, fw in enumerate(folds):
+        t_f = time.time()
+        fit_idx = np.flatnonzero(di <= fw["fit_end"])
+        cal_idx = np.flatnonzero((di >= fw["cal_start"]) & (di <= fw["train_end"]))
+        te_idx = np.flatnonzero((di >= fw["test_start"]) & (di <= fw["test_end"]))
+        if not len(te_idx) or not len(cal_idx):
+            continue
+        row = {"fold": k + 1, "fit_end": _day(dates[fw["fit_end"]]),
+               "cal_start": _day(dates[fw["cal_start"]]), "train_end": _day(dates[fw["train_end"]]),
+               "test_start": _day(dates[fw["test_start"]]), "test_end": _day(dates[fw["test_end"]]),
+               "embargo_sessions": int(fw["test_start"] - fw["train_end"] - 1),
+               "n_fit": int(len(fit_idx)), "n_cal": int(len(cal_idx)), "n_test": int(len(te_idx)),
+               "base_rate": _f(np.mean(Y["y_dump"][te_idx]))}
+        for m, nc in (("m0", n0), ("m1", n1)):
+            ms = _fit_set(X, Y, fit_idx, cal_idx, nc, s, rng)
+            pr = _predict_set(ms, X[te_idx, :nc])
+            for c in OUT_COLUMNS:
+                oos[m][c][te_idx] = pr[c]
+            row[f"auc_{m}"] = _auc(Y["y_dump"][te_idx], pr["prob_dump"])
+        row["seconds"] = round(time.time() - t_f, 1)
+        fold_rows.append(row)
+        log.info("fold %d/%d test %s→%s  n_fit=%d n_test=%d  AUC m0 %.3f m1 %.3f  (%.1fs)", k + 1, len(folds),
+                 row["test_start"], row["test_end"], row["n_fit"], row["n_test"],
+                 row["auc_m0"] or float("nan"), row["auc_m1"] or float("nan"), row["seconds"])
+    wf_s = time.time() - t_wf
+
+    tested = np.isfinite(oos["m0"]["prob_dump"])
+    report_oos: Dict[str, Any] = {}
+    sims: Dict[str, Any] = {}
+    calib: Dict[str, Any] = {}
+    extra: Dict[str, Any] = {}
+    for m in ("m0", "m1"):
+        p = oos[m]["prob_dump"]
+        daily = _daily_table(row_dates[tested], p[tested], Y["y_dump"][tested], Y["y_oc"][tested],
+                             Y["y_squeeze"][tested])
+        report_oos[m] = _metrics(Y["y_dump"][tested], p[tested], daily)
+        sims[m] = _sim(daily)
+        calib[m] = _calibration(Y["y_dump"][tested], p[tested])
+        for t in ("bigdump", "squeeze"):
+            yy, pp = Y[TARGETS[t]][tested], oos[m][PROB_COLS[t]][tested]
+            ok = np.isfinite(pp)
+            extra[f"{m}_{t}"] = {"auc": _auc(yy, pp),
+                                 "brier": _f(np.mean((pp[ok] - yy[ok]) ** 2)) if ok.any() else None,
+                                 "base_rate": _f(np.mean(yy)) if len(yy) else None,
+                                 "calibration": _calibration(yy, pp)}
+        eo = oos[m]["exp_oc"][tested]
+        yo = Y["y_oc"][tested]
+        ok = np.isfinite(eo)
+        extra[f"{m}_exp_oc"] = {
+            "spearman": _f(pd.Series(eo[ok]).corr(pd.Series(np.clip(yo[ok], *OC_CLIP)), method="spearman"))
+            if ok.sum() > 10 else None,
+            "mae_clipped": _f(np.mean(np.abs(eo[ok] - np.clip(yo[ok], *OC_CLIP)))) if ok.any() else None,
+        }
+    report_oos["extra"] = extra
+
+    # 2) production fit: same recipe, window extended to the last labeled session
+    t_fin = time.time()
+    last = len(dates) - 1
+    cal_start = max(last - int(s["cal_sessions"]) + 1, 0)
+    fit_end = cal_start - int(s["embargo"]) - 1
+    if fit_end < 20:
+        raise ValueError("not enough history for a production fit")
+    fit_idx = np.flatnonzero(di <= fit_end)
+    cal_idx = np.flatnonzero(di >= cal_start)
+    prod = {m: _fit_set(X, Y, fit_idx, cal_idx, nc, s, rng) for m, nc in (("m0", n0), ("m1", n1))}
+    fin_s = time.time() - t_fin
+
+    # 3) permutation importance on the held-out calibration slice (not seen by the fit)
+    t_imp = time.time()
+    k = min(len(cal_idx), int(s["importance_rows"]))
+    imp_idx = np.sort(rng.choice(cal_idx, k, replace=False)) if k < len(cal_idx) else cal_idx
+    imp0, fam0, base0 = _importance(prod["m0"]["dump"]["clf"], X[imp_idx, :n0], Y["y_dump"][imp_idx], M0_FEATURES, rng)
+    imp1, fam1, base1 = _importance(prod["m1"]["dump"]["clf"], X[imp_idx, :n1], Y["y_dump"][imp_idx], M1_FEATURES, rng)
+    imp_s = time.time() - t_imp
+
+    # 4) report
+    all_dates = pd.to_datetime(panel["date"])
+    later = all_dates[all_dates > pd.Timestamp(dates[-1])]
+    trained_through = _day(later.min()) if len(later) else _day(dates[-1])
+    n_iters = {f"{m}_{t}": int(getattr(prod[m][t]["clf"], "n_iter_", 0) or 0) for m in prod for t in TARGETS}
+    notes = [
+        f"HistGradientBoosting (NaN-native), {len(M0_FEATURES)} features for M0, "
+        f"{len(M1_FEATURES)} for M1 (+ gap_open). learning_rate {s['hgb']['learning_rate']}, "
+        f"≤ {s['hgb']['max_iter']} trees with early stopping on a random 10% of each fit window.",
+        f"Walk-forward: expanding window, {s['fold_months']}-month test folds, embargo "
+        f"{s['embargo']} sessions before every test fold and before every calibration slice; "
+        f"first test fold after {s['min_train_sessions']} labeled sessions.",
+        f"Calibration: isotonic regression on the last {s['cal_sessions']} sessions of each training "
+        f"window (held out from the tree fit, later in time).",
+        f"Row cap: at most {s['max_fit_rows']:,} rows per fit. Classifiers keep all positives (up to half "
+        f"the cap) and a random share of negatives, re-weighted to the true base rate; regressors use a "
+        f"uniform random sample. Calibration and evaluation always use every row.",
+        f"exp_oc regressors are fit on the whole training window with outcomes clipped to "
+        f"[{OC_CLIP[0]:+.0%}, {OC_CLIP[1]:+.0%}].",
+        "prob_bigdump is capped at prob_dump (a −15% day is also a −5% day).",
+        f"Production model: fit through {_day(dates[fit_end])}, calibrated on "
+        f"{_day(dates[cal_start])} → {_day(dates[last])} — the exact recipe the walk-forward evaluated.",
+        "Top-k and simulation rankings use each day's eligible names only (price ≥ $0.10, 20-day median "
+        "dollar volume ≥ $50k, ≥ 60 prior sessions); no shortability filter.",
+    ]
+    report: Dict[str, Any] = {
+        "trained_at": _iso_utc(),
+        "trained_through": trained_through,
+        "last_label_date": _day(dates[-1]),
+        "n_rows": int(len(lab)),
+        "n_symbols": int(lab["symbol"].nunique()),
+        "n_days": int(len(dates)),
+        "targets": TARGET_TEXT,
+        "base_rate": {t: _f(np.mean(Y[c])) for t, c in TARGETS.items()},
+        "oos": report_oos,
+        "calibration": calib,
+        "importance": imp0,
+        "importance_family": fam0,
+        "importance_m1": imp1,
+        "importance_m1_family": fam1,
+        "importance_meta": {"model": "m0 dump (m1 in importance_m1*)", "metric": "AUC drop when shuffled",
+                            "rows": int(len(imp_idx)), "slice": f"{_day(dates[cal_start])} → {_day(dates[last])}",
+                            "base_auc_m0": base0, "base_auc_m1": base1},
+        "sim": sims,
+        "walk_forward": {
+            "n_folds": len(fold_rows), "fold_months": s["fold_months"], "embargo_sessions": s["embargo"],
+            "min_train_sessions": s["min_train_sessions"], "cal_sessions": s["cal_sessions"],
+            "oos_start": fold_rows[0]["test_start"] if fold_rows else None,
+            "oos_end": fold_rows[-1]["test_end"] if fold_rows else None,
+            "oos_rows": int(tested.sum()),
+            "fits_per_fold": 2 * (len(TARGETS) + 1), "final_fits": 2 * (len(TARGETS) + 1),
+        },
+        "folds": fold_rows,
+        "production": {"fit_through": _day(dates[fit_end]), "calibration_start": _day(dates[cal_start]),
+                       "calibration_end": _day(dates[last]), "n_fit_rows": int(len(fit_idx)),
+                       "n_cal_rows": int(len(cal_idx)), "n_iter": n_iters},
+        "training_notes": notes,
+        "caveats": CAVEATS,
+        "params": {"hgb": s["hgb"], "max_fit_rows": s["max_fit_rows"], "cost": COST, "oc_clip": list(OC_CLIP)},
+        "features": {"m0": M0_FEATURES, "m1": M1_FEATURES},
+        "sklearn_version": sklearn.__version__,
+        "timing": {"walk_forward_s": round(wf_s, 1), "final_fit_s": round(fin_s, 1),
+                   "importance_s": round(imp_s, 1), "total_s": round(time.time() - t_all, 1)},
+    }
+    report = clean(report)
+
+    bundle = {
+        "version": BUNDLE_VERSION,
+        "trained_at": report["trained_at"],
+        "features": M0_FEATURES,
+        "m1_features": M1_FEATURES,
+        "m0": prod["m0"],
+        "m1": prod["m1"],
+        "report": report,
+        "sklearn_version": sklearn.__version__,
+    }
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tmp = out_dir / (BUNDLE_NAME + ".tmp")
+    with open(tmp, "wb") as fh:
+        pickle.dump(bundle, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, out_dir / BUNDLE_NAME)
+    if site_json is not None:
+        p = Path(site_json)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tj = p.with_suffix(".tmp")
+        tj.write_text(json.dumps(report, separators=(",", ":"), ensure_ascii=False, allow_nan=False))
+        os.replace(tj, p)
+    log.info("train: done in %.1fs (walk-forward %.1fs, %d folds; final %.1fs; importance %.1fs)",
+             time.time() - t_all, wf_s, len(fold_rows), fin_s, imp_s)
+    return report
+
+
+def load(out_dir: Path = config.MODELS) -> Optional[Dict[str, Any]]:
+    """The production bundle, or None when missing/unreadable."""
+    p = Path(out_dir) / BUNDLE_NAME
+    if not p.exists():
+        return None
+    try:
+        with open(p, "rb") as fh:
+            b = pickle.load(fh)
+    except Exception as e:  # noqa: BLE001 — corrupt/incompatible pickle → no model
+        log.warning("model: cannot load %s: %s", p, e)
+        return None
+    if not isinstance(b, dict) or "m0" not in b or "m1" not in b:
+        log.warning("model: %s is not a GRAVITY bundle", p)
+        return None
+    try:
+        import sklearn
+
+        if b.get("sklearn_version") and b["sklearn_version"] != sklearn.__version__:
+            log.warning("model: bundle trained with scikit-learn %s, running %s — retrain recommended",
+                        b["sklearn_version"], sklearn.__version__)
+    except ImportError:  # pragma: no cover
+        pass
+    return b
+
+
+def predict(bundle: Dict[str, Any], rows: pd.DataFrame, use_open: bool) -> pd.DataFrame:
+    """prob_dump, prob_bigdump, prob_squeeze, exp_oc (+ ``model``: m0/m1),
+    indexed like ``rows``. With ``use_open`` rows that have a finite
+    ``gap_open`` get M1; the rest fall back to M0."""
+    n = len(rows)
+    vals = {c: np.full(n, np.nan) for c in OUT_COLUMNS}
+    which = np.full(n, "m0", dtype=object)
+    if bundle is not None and n:
+        f0 = list(bundle.get("features") or M0_FEATURES)
+        f1 = list(bundle.get("m1_features") or (f0 + list(M1_EXTRA)))
+        X = _matrix(rows, f1)
+        use1 = np.zeros(n, dtype=bool)
+        if use_open:
+            if "gap_open" in rows.columns:
+                use1 = np.isfinite(X[:, f1.index("gap_open")])
+            else:
+                log.warning("predict: use_open=True but rows have no gap_open — using M0 for every row")
+        for m, mask, cols in (("m0", ~use1, len(f0)), ("m1", use1, len(f1))):
+            if not mask.any():
+                continue
+            pr = _predict_set(bundle[m], X[mask, :cols])
+            for c in OUT_COLUMNS:
+                vals[c][mask] = pr[c]
+            which[mask] = m
+    out = pd.DataFrame(vals, index=rows.index)[OUT_COLUMNS]
+    out["model"] = which
+    return out
+
+
+def time_one_fit(lab: pd.DataFrame, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Time one capped y_dump classifier fit at the size of ``lab`` (scale test)."""
+    s = _settings(1, params)
+    lab = lab[lab["y_dump"].notna()]
+    X = _matrix(lab, M1_FEATURES)
+    y = lab["y_dump"].to_numpy(dtype=np.float64)
+    t = time.time()
+    clf = _fit_classifier(X, y, s, np.random.default_rng(0))
+    fit_s = time.time() - t
+    return {"fit_s": fit_s, "n_rows": int(len(y)), "n_train": int(min(len(y), s["max_fit_rows"])),
+            "n_iter": int(getattr(clf, "n_iter_", 0) or 0)}

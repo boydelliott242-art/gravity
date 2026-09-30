@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en" class="no-js">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>GRAVITY — What goes up.</title>
+  <meta name="description" content="A daily pre-market radar of the US small and micro-caps with the highest evidence-based odds of a large open-to-close drop. Research, not advice.">
+  <meta name="theme-color" content="#07080a">
+  <meta name="color-scheme" content="dark">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+  <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter+Tight:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="assets/css/app.css">
+  <link rel="modulepreload" href="assets/js/app.js">
+  <script>document.documentElement.classList.remove('no-js');document.documentElement.classList.add('js');</script>
+  <script type="module" src="assets/js/app.js"></script>
+</head>
+<body>
+  <a class="skip" href="#board">Skip to the board</a>
+
+  <header class="masthead" id="masthead">
+    <div class="sample-banner" id="sample-banner" role="status" hidden>
+      <div class="wrap">
+        <strong>Sample data — pipeline has not published yet</strong>
+        <span>Every number below is placeholder. Tickers with digits are fictional; INHD figures are round placeholders, not quotes.</span>
+      </div>
+    </div>
+    <div class="stale-banner" id="stale-banner" role="status" hidden><div class="wrap"></div></div>
+    <div class="bar wrap">
+      <a class="wordmark" href="#top" aria-label="GRAVITY, back to top"><span class="wordmark__mark" aria-hidden="true"></span>Gravity</a>
+      <nav class="bar-nav" aria-label="Sections">
+        <a href="#board">Board</a>
+        <a href="#wire">Wire</a>
+        <a href="#position">INHD</a>
+        <a href="#twins">Twins</a>
+        <a href="#squeeze">Squeeze</a>
+        <a href="#record">Record</a>
+        <a href="#evidence">Evidence</a>
+        <a href="#method">Method</a>
+      </nav>
+      <div class="bar-status" id="bar-status" aria-live="polite">
+        <span class="opt3" id="st-session">—</span>
+        <span class="sep opt" aria-hidden="true"></span>
+        <span class="opt" id="st-run">—</span>
+        <span class="sep opt" aria-hidden="true"></span>
+        <span class="opt2" id="st-phase">—</span>
+        <span class="sep opt2" aria-hidden="true"></span>
+        <span class="opt2" id="st-updated">—</span>
+        <button class="feeds-btn" id="feeds-btn" type="button" aria-expanded="false" aria-controls="feeds-pop">Feeds —</button>
+      </div>
+    </div>
+    <div class="feeds-pop" id="feeds-pop" role="region" aria-label="Data source health" hidden></div>
+  </header>
+
+  <main id="main">
+    <!-- 01 · HERO -->
+    <section class="hero" id="top" aria-labelledby="hero-title">
+      <div class="hero-art" id="hero-art">
+        <canvas id="field" aria-hidden="true"></canvas>
+        <div class="hero-art__top wrap">
+          <div>
+            <p class="eyebrow" id="hero-eyebrow">Today's #1</p>
+            <p class="hero-art__tag">What goes up.</p>
+          </div>
+          <p class="hero-art__caption" id="hero-caption"></p>
+        </div>
+        <div class="hero-art__title wrap" id="hero-title-wrap">
+          <div>
+            <h1 id="hero-title"><span class="hero-ticker hero-ticker--none">Loading today's radar…</span></h1>
+          </div>
+        </div>
+      </div>
+      <div class="hero-body wrap" id="hero-body"></div>
+    </section>
+
+    <!-- 02 · BOARD -->
+    <section class="section" id="board" aria-labelledby="board-title">
+      <div class="wrap">
+        <header class="sec-head reveal">
+          <p class="sec-num">02</p>
+          <h2 class="sec-title" id="board-title">The Board</h2>
+          <p class="sec-dek" id="board-dek">Ranked by the model's probability of an open→close drop of 5% or more this session. The tick on each bar is the base rate for the average name.</p>
+        </header>
+        <div id="board-root"></div>
+      </div>
+    </section>
+
+    <!-- 03 · WIRE -->
+    <section class="section" id="wire" aria-labelledby="wire-title">
+      <div class="wrap">
+        <header class="sec-head reveal">
+          <p class="sec-num">03</p>
+          <h2 class="sec-title" id="wire-title">Catalyst <em>Wire</em></h2>
+          <p class="sec-dek">Overnight filings, bearish headlines and big pre-market moves, newest first (times US Eastern). Every line links to its source.</p>
+        </header>
+        <div id="wire-root"></div>
+      </div>
+    </section>
+
+    <!-- 04 · INHD -->
+    <section class="section" id="position" aria-labelledby="position-title">
+      <div class="wrap">
+        <header class="sec-head reveal">
+          <p class="sec-num">04</p>
+          <h2 class="sec-title" id="position-title">Your INHD <em>short</em></h2>
+          <p class="sec-dek">The reference position: what it has done since you shorted it, what it costs to hold, and what the filings say.</p>
+        </header>
+        <div id="position-root"></div>
+      </div>
+    </section>
+
+    <!-- 05 · TWINS -->
+    <section class="section" id="twins" aria-labelledby="twins-title">
+      <div class="wrap">
+        <header class="sec-head reveal">
+          <p class="sec-num">05</p>
+          <h2 class="sec-title" id="twins-title">INHD <em>Twins</em></h2>
+          <p class="sec-dek">Names whose profile looks like INHD's — size, price, reverse-split habit, drawdown, dilution cadence, geography. Structurally similar, not guaranteed to behave the same.</p>
+        </header>
+        <div id="twins-root"></div>
+      </div>
+    </section>
+
+    <!-- 06 · SQUEEZE -->
+    <section class="section" id="squeeze" aria-labelledby="squeeze-title">
+      <div class="wrap">
+        <header class="sec-head reveal">
+          <p class="sec-num">06</p>
+          <h2 class="sec-title" id="squeeze-title">Squeeze <em>Zone</em></h2>
+          <p class="sec-dek">They look like dumps, but they are dangerous or impossible to short. Kept off the board on purpose.</p>
+        </header>
+        <div id="squeeze-root"></div>
+      </div>
+    </section>
+
+    <!-- 07 · TRACK RECORD -->
+    <section class="section" id="record" aria-labelledby="record-title">
+      <div class="wrap">
+        <header class="sec-head reveal">
+          <p class="sec-num">07</p>
+          <h2 class="sec-title" id="record-title">Track <em>Record</em></h2>
+          <p class="sec-dek">Every published #1 is graded after the close against what actually happened — and against every other eligible name that day. Nothing is edited after grading.</p>
+        </header>
+        <div id="record-root"></div>
+      </div>
+    </section>
+
+    <!-- 08 · EVIDENCE -->
+    <section class="section" id="evidence" aria-labelledby="evidence-title">
+      <div class="wrap">
+        <header class="sec-head reveal">
+          <p class="sec-num">08</p>
+          <h2 class="sec-title" id="evidence-title">Evidence <em>Lab</em></h2>
+          <p class="sec-dek">How often each setup actually dumped the next session, measured on three years of small/micro-cap history. The whisker is a 95% interval; the dashed line is the base rate.</p>
+        </header>
+        <div id="evidence-root"></div>
+      </div>
+    </section>
+
+    <!-- 09 · METHOD -->
+    <section class="section" id="method" aria-labelledby="method-title">
+      <div class="wrap">
+        <header class="sec-head reveal">
+          <p class="sec-num">09</p>
+          <h2 class="sec-title" id="method-title">How it works <em>&amp; limits</em></h2>
+          <p class="sec-dek">Read once. The short version: a probability, not a promise.</p>
+        </header>
+        <div class="method reveal">
+          <div>
+            <h3>What the number means</h3>
+            <p>A reading of <span data-bind="example-prob">31%</span> means: in walk-forward testing, setups like this one fell <b>5% or more from the open to the close</b> about <span data-bind="example-n">31</span> times in 100. The average eligible name does that roughly <span data-bind="base-rate">12</span> times in 100 — that ratio is the <b>lift</b>.</p>
+            <p>Most sessions, even the #1 does <b>not</b> dump. The edge is in the odds across many days, not in any one pick.</p>
+          </div>
+          <div>
+            <h3>What goes in</h3>
+            <ul>
+              <li><b>Nasdaq</b> — universe, quotes, pre-market prints, short interest</li>
+              <li><b>SEC EDGAR</b> — offerings, shelf and resale registrations, deficiency notices, reverse splits</li>
+              <li><b>FINRA</b> — daily short-sale volume</li>
+              <li><b>IBKR</b> — borrow availability and fee</li>
+              <li><b>Yahoo Finance</b> — split-adjusted daily history, float</li>
+              <li><b>Google News</b> — headlines, tagged</li>
+            </ul>
+            <p style="margin-top:16px">Zacks, Bloomberg and Danelfin ratings are proprietary, so they are one-click links — never scraped or republished.</p>
+          </div>
+          <div>
+            <h3>What it is not</h3>
+            <p>Not advice, not a signal service, not a recommendation to trade anything. It is an automated research summary built from public data that can be late or wrong.</p>
+            <p>Missing data is shown as “—”, never guessed. Every fact carries its date and a link to where it came from.</p>
+          </div>
+          <div>
+            <h3>The risks of shorting micro-caps</h3>
+            <ul>
+              <li><b>Unlimited loss.</b> A stock can only fall 100%; it can rise 500% before lunch.</li>
+              <li><b>Squeezes.</b> Tiny floats and crowded shorts can gap violently higher.</li>
+              <li><b>Halts.</b> You may be unable to cover while a halted name reprices.</li>
+              <li><b>Recalls.</b> Your broker can recall borrowed shares and force a buy-in.</li>
+              <li><b>Fees.</b> Hard-to-borrow fees of 100%+ a year accrue daily and compound the damage.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot" id="foot">
+    <div class="wrap">
+      <p class="foot__mark" aria-hidden="true">Gravity<em>.</em></p>
+      <div class="foot__grid">
+        <div>
+          <p class="eyebrow" style="margin-bottom:16px">Data timestamps</p>
+          <dl id="foot-times"><dt>today.json</dt><dd>—</dd></dl>
+        </div>
+        <div>
+          <p class="eyebrow" style="margin-bottom:16px">Disclaimer</p>
+          <p class="disc" id="foot-disclaimer">GRAVITY is an automated research tool, not investment advice. Probabilities describe how similar historical setups behaved; any single session can go either way. Short selling carries unlimited loss potential, squeezes, halts, borrow recalls and fees. Data comes from public sources that can be late or wrong. Do your own research.</p>
+          <p class="disc">Not affiliated with Nasdaq, the SEC, FINRA, Interactive Brokers, Yahoo, Google, Zacks, Danelfin, Bloomberg, Dow Jones or any site linked here. Times are US Eastern unless marked.</p>
+        </div>
+      </div>
+    </div>
+  </footer>
+
+  <dialog class="dossier" id="dossier" aria-labelledby="dossier-title"></dialog>
+
+  <noscript>
+    <div class="wrap" style="padding:32px 16px">GRAVITY needs JavaScript to read today's data files. The raw feeds are at <a href="data/today.json">data/today.json</a>.</div>
+  </noscript>
+</body>
+</html>
