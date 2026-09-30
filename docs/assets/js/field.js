@@ -456,7 +456,16 @@ export function mountField(canvas, series, opts = {}) {
   // ── lifecycle ──
   layout();
   if (mode === 'webgl') {
-    startIntro();
+    if (document.hidden) {
+      // Loaded in a background tab: rAF won't run, so paint the settled
+      // curve once — the page must never look blank (previews, tab restores).
+      placeHome();
+      setPhase('hold');
+      dirty = true;
+      draw();
+    } else {
+      startIntro();
+    }
     kick();
   } else {
     drawStatic();
