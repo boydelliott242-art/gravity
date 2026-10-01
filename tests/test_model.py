@@ -83,7 +83,7 @@ def test_report_schema_and_files(trained):
     for k in ("trained_at", "trained_through", "n_rows", "n_symbols", "n_days", "targets", "base_rate",
               "oos", "calibration", "importance", "sim", "caveats", "training_notes", "walk_forward", "folds"):
         assert k in rep, k
-    assert set(rep["base_rate"]) == {"dump", "bigdump", "squeeze"}
+    assert {"dump", "bigdump", "squeeze"} <= set(rep["base_rate"])
     assert set(rep["targets"]) >= {"dump", "bigdump", "squeeze"}
     for m in ("m0", "m1"):
         met = rep["oos"][m]
@@ -118,11 +118,11 @@ def test_report_schema_and_files(trained):
     assert b["trained_at"] == rep["trained_at"]
     assert b["features"] == FEATURES and b["m1_features"] == FEATURES + M1_EXTRA
     for m in ("m0", "m1"):
-        assert set(b[m]) == {"dump", "bigdump", "squeeze", "oc"}
+        assert {"dump", "bigdump", "squeeze", "oc", "swing", "pump"} <= set(b[m])
         for t in ("dump", "bigdump", "squeeze"):
             assert b[m][t]["clf"] is not None and b[m][t]["iso"] is not None
     assert set(b["report"]["oos"]) >= {"m0", "m1"}
-    assert set(b["report"]["base_rate"]) == {"dump", "bigdump", "squeeze"}
+    assert {"dump", "bigdump", "squeeze", "swing", "pump"} <= set(b["report"]["base_rate"])
 
 
 def test_walk_forward_windows_are_out_of_sample(trained):

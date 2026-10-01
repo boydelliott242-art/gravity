@@ -31,9 +31,14 @@ acquire() {
   fi
   return 1
 }
+# live: cheap exit outside the regular session, and never queue behind a big run
+if [ "$MODE" = "live" ]; then
+  $PY -c "from gravity.util import market_phase;import sys;sys.exit(0 if market_phase()=='open' else 3)" 2>/dev/null
+  [ $? -eq 3 ] && exit 0
+fi
 waited=0
 until acquire; do
-  if [ "$MODE" = "train" ] || [ $waited -ge 1200 ]; then
+  if [ "$MODE" = "train" ] || [ "$MODE" = "live" ] || [ $waited -ge 1200 ]; then
     echo "$(date) another GRAVITY run holds the lock — giving up on $MODE"; exit 0
   fi
   sleep 30; waited=$((waited + 30))

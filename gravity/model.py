@@ -47,15 +47,18 @@ import numpy as np
 import pandas as pd
 
 from . import config
-from .features import FAMILIES, FEATURE_DOCS, FEATURES, LABELS, M1_EXTRA
+from .features import (FAMILIES, FEATURE_DOCS, FEATURES, FINRA_FEATURES, LABELS, M1_EXTRA,
+                       PUMP_THRESHOLD, SWING_THRESHOLD)
 from .util import clean
 
 log = logging.getLogger(__name__)
 
 # ── Settings ─────────────────────────────────────────────────────────────
-TARGETS: Dict[str, str] = {"dump": "y_dump", "bigdump": "y_bigdump", "squeeze": "y_squeeze"}
-PROB_COLS: Dict[str, str] = {"dump": "prob_dump", "bigdump": "prob_bigdump", "squeeze": "prob_squeeze"}
-OUT_COLUMNS: List[str] = ["prob_dump", "prob_bigdump", "prob_squeeze", "exp_oc"]
+TARGETS: Dict[str, str] = {"dump": "y_dump", "bigdump": "y_bigdump", "squeeze": "y_squeeze",
+                           "swing": "y_swing", "pump": "y_pump"}
+PROB_COLS: Dict[str, str] = {t: f"prob_{t}" for t in TARGETS}
+OUT_COLUMNS: List[str] = ["prob_dump", "prob_bigdump", "prob_squeeze", "prob_swing", "prob_pump", "skew", "exp_oc"]
+SWING_HOLD = 5                                # sessions a swing short is held (enter next open, cover 5th close)
 M0_FEATURES: List[str] = list(FEATURES)
 M1_FEATURES: List[str] = list(FEATURES) + list(M1_EXTRA)
 
@@ -94,6 +97,10 @@ TARGET_TEXT = {
     "dump": f"next session open→close ≤ {config.DUMP_THRESHOLD:+.0%}",
     "bigdump": f"next session open→close ≤ {config.BIG_DUMP_THRESHOLD:+.0%}",
     "squeeze": f"next session open→high ≥ {config.SQUEEZE_THRESHOLD:+.0%}",
+    "swing": f"close {SWING_HOLD} sessions later ≤ {SWING_THRESHOLD:+.0%} versus the next session's open "
+             f"(short at the next open, cover at the close {SWING_HOLD} sessions later)",
+    "pump": f"next session open→close ≥ {PUMP_THRESHOLD:+.0%}",
+    "skew": "P(dump) ÷ (P(dump) + P(pump)): the downside share of a ±5% open→close move",
     "exp_oc": f"expected next-session open→close, each training outcome clipped to "
               f"[{OC_CLIP[0]:+.0%}, {OC_CLIP[1]:+.0%}]",
 }
@@ -286,10 +293,21 @@ def _calibrated(cm: Optional[Dict[str, Any]], X: np.ndarray) -> np.ndarray:
     return np.clip((1.0 - TIE_EPS) * cal + TIE_EPS * raw, 0.0, 1.0)
 
 
+def skew_of(prob_dump: np.ndarray, prob_pump: np.ndarray) -> np.ndarray:
+    """P(dump) / (P(dump) + P(pump)) — NaN when either is unknown or both are 0."""
+    d = np.asarray(prob_dump, dtype=float)
+    u = np.asarray(prob_pump, dtype=float)
+    tot = d + u
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = np.where(np.isfinite(tot) & (tot > 0), d / tot, np.nan)
+    return out
+
+
 def _predict_set(ms: Dict[str, Any], X: np.ndarray) -> Dict[str, np.ndarray]:
     out = {PROB_COLS[t]: _calibrated(ms.get(t), X) for t in TARGETS}
     # a ≤ −15 % day is also a ≤ −5 % day: keep the probabilities coherent
     out["prob_bigdump"] = np.fmin(out["prob_bigdump"], out["prob_dump"])
+    out["skew"] = skew_of(out["prob_dump"], out["prob_pump"])
     reg = ms.get("oc")
     out["exp_oc"] = reg.predict(X) if (reg is not None and len(X)) else np.full(len(X), np.nan)
     return out
@@ -297,12 +315,17 @@ def _predict_set(ms: Dict[str, Any], X: np.ndarray) -> Dict[str, np.ndarray]:
 
 def _fit_set(X: np.ndarray, Y: Dict[str, np.ndarray], fit_idx: np.ndarray, cal_idx: np.ndarray,
              ncols: int, s: Dict[str, Any], rng: np.random.Generator) -> Dict[str, Any]:
-    """One model set (M0 when ``ncols == len(FEATURES)``, M1 with gap_open)."""
+    """One model set (M0 when ``ncols == len(FEATURES)``, M1 with gap_open).
+
+    Rows whose label for a target is unknown (``y_swing`` needs t+5) are
+    left out of that target's fit and calibration only."""
     Xf = X[fit_idx, :ncols]
     Xc = X[cal_idx, :ncols]
     ms: Dict[str, Any] = {}
     for t, col in TARGETS.items():
-        clf = _fit_classifier(Xf, Y[col][fit_idx], s, rng)
+        yf = Y[col][fit_idx]
+        okf = np.isfinite(yf)
+        clf = _fit_classifier(Xf[okf] if not okf.all() else Xf, yf[okf], s, rng)
         iso = _fit_iso(_raw(clf, Xc), Y[col][cal_idx]) if clf is not None else None
         ms[t] = {"clf": clf, "iso": iso}
     all_idx = np.r_[fit_idx, cal_idx]
@@ -506,6 +529,109 @@ def _calibration(y: np.ndarray, p: np.ndarray, bins: int = 10) -> List[Dict[str,
     return out
 
 
+# ── Swing (5-session) evaluation ─────────────────────────────────────────
+def _swing_table(day: np.ndarray, sym: np.ndarray, prob: np.ndarray, y: np.ndarray, c5: np.ndarray,
+                 h5: np.ndarray, pub: np.ndarray) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Per test day, ranked by ``prob`` among names whose 5-session outcome
+    is known: the #1, the top-10 and the #1 under the publication rule.
+    Returns (daily, picks) where ``picks`` holds every top-10 row."""
+    df = pd.DataFrame({"day": day, "sym": sym, "p": prob, "y": y, "c5": c5, "h5": h5,
+                       "pub": pub.astype(bool)})
+    df = df[np.isfinite(df["p"]) & np.isfinite(df["y"]) & np.isfinite(df["c5"])]
+    if not len(df):
+        return pd.DataFrame(), df
+    df = df.sort_values(["day", "p"], ascending=[True, False], kind="mergesort")
+    g = df.groupby("day", sort=True)
+    df["rk"] = g.cumcount() + 1
+    top1 = df[df["rk"] == 1].set_index("day")
+    top10 = df[df["rk"] <= 10]
+    t10 = top10.groupby("day")[["y", "c5"]].mean()
+    uni = g[["y", "c5"]].mean()
+    pub1 = df[df["pub"]].groupby("day", sort=True).head(1).set_index("day")
+    daily = pd.DataFrame({
+        "top1_sym": top1["sym"], "top1_y": top1["y"], "top1_c5": top1["c5"], "top1_h5": top1["h5"],
+        "top10_y": t10["y"], "top10_c5": t10["c5"], "uni_y": uni["y"], "uni_c5": uni["c5"],
+        "pub1_sym": pub1["sym"], "pub1_y": pub1["y"], "pub1_c5": pub1["c5"], "pub1_h5": pub1["h5"],
+    })
+    return daily, top10
+
+
+def _swing_sim(daily: pd.DataFrame, col: str, cost: float = COST) -> Dict[str, Any]:
+    """Non-overlapping swing shorts: enter on every ``SWING_HOLD``-th test
+    session only, short that day's #1 at the next open, cover at the close
+    ``SWING_HOLD`` sessions later. 1x notional per trade, summed."""
+    empty = {"n_trades": 0, "gross_total": None, "net_total": None, "win_rate": None, "worst_trade": None,
+             "best_trade": None, "max_drawdown": None, "mean_trade_net": None, "trades": [],
+             "cost_assumption": cost}
+    if not len(daily) or col not in daily:
+        return empty
+    entries = daily.iloc[::SWING_HOLD]
+    sym_col = col.replace("_c5", "_sym")
+    rows = entries[np.isfinite(entries[col].to_numpy(float))]
+    if not len(rows):
+        return empty
+    g = -rows[col].to_numpy(float)
+    net = g - cost
+    return {
+        "n_trades": int(len(g)),
+        "gross_total": _f(g.sum()),
+        "net_total": _f(net.sum()),
+        "win_rate": _f(np.mean(net > 0)),
+        "worst_trade": _f(np.min(g)),
+        "best_trade": _f(np.max(g)),
+        "max_drawdown": _max_drawdown(net),
+        "mean_trade_net": _f(np.mean(net)),
+        "trades": [[_day(d), (str(s) if isinstance(s, str) else None), _f(c)]
+                   for d, s, c in zip(rows.index, rows[sym_col] if sym_col in rows else [None] * len(rows),
+                                      rows[col])],
+        "trade_columns": ["entry_signal_date", "symbol", "c5"],
+        "cost_assumption": cost,
+        "units": (f"one trade every {SWING_HOLD} test sessions (never overlapping); short return = "
+                  f"-(close {SWING_HOLD} sessions later / next open - 1); summed at 1x notional"),
+    }
+
+
+def _swing_report(day: np.ndarray, sym: np.ndarray, prob: np.ndarray, y: np.ndarray, c5: np.ndarray,
+                  h5: np.ndarray, pub: np.ndarray, cost: float = COST) -> Dict[str, Any]:
+    daily, picks = _swing_table(day, sym, prob, y, c5, h5, pub)
+    if not len(daily):
+        return {"days": 0}
+    have_h5 = bool(np.isfinite(daily["top1_h5"].to_numpy(float)).any())
+
+    def sq(x: pd.Series) -> Optional[float]:
+        v = x.to_numpy(float)
+        v = v[np.isfinite(v)]
+        return _f(np.mean(v >= config.SQUEEZE_THRESHOLD)) if len(v) else None
+
+    out: Dict[str, Any] = {
+        "days": int(len(daily)),
+        "hold_sessions": SWING_HOLD,
+        "threshold": SWING_THRESHOLD,
+        "base_rate": _f(np.nanmean(y[np.isfinite(prob) & np.isfinite(c5)])) if np.isfinite(y).any() else None,
+        "top1_hit": _f(daily["top1_y"].mean()),
+        "top1_mean_c5": _f(daily["top1_c5"].mean()),
+        "top1_median_c5": _f(daily["top1_c5"].median()),
+        "top10_hit": _f(daily["top10_y"].mean()),
+        "top10_mean_c5": _f(picks["c5"].mean()),
+        "top10_median_c5": _f(picks["c5"].median()),
+        "universe_daily_hit": _f(daily["uni_y"].mean()),
+        "universe_mean_c5": _f(daily["uni_c5"].mean()),
+        "pub1_days": int(daily["pub1_c5"].notna().sum()),
+        "pub1_hit": _f(daily["pub1_y"].mean()),
+        "pub1_mean_c5": _f(daily["pub1_c5"].mean()),
+        "pub1_median_c5": _f(daily["pub1_c5"].median()),
+        "sim": _swing_sim(daily, "top1_c5", cost),
+        "sim_pub": _swing_sim(daily, "pub1_c5", cost),
+    }
+    if have_h5:  # squeeze inside the holding window: highest high ≥ +20% above the entry open
+        out["top1_squeeze_rate"] = sq(daily["top1_h5"])
+        out["top10_squeeze_rate"] = sq(picks["h5"])
+        out["pub1_squeeze_rate"] = sq(daily["pub1_h5"])
+        out["squeeze_definition"] = (f"highest high over the {SWING_HOLD} sessions ≥ "
+                                     f"{config.SQUEEZE_THRESHOLD:+.0%} above the entry open")
+    return out
+
+
 # ── Importance ───────────────────────────────────────────────────────────
 def _importance(clf, X: np.ndarray, y: np.ndarray, cols: List[str],
                 rng: np.random.Generator) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[float]]:
@@ -536,21 +662,55 @@ def _importance(clf, X: np.ndarray, y: np.ndarray, cols: List[str],
 
 
 # ── Public API ───────────────────────────────────────────────────────────
+def _label_arrays(lab: pd.DataFrame) -> Dict[str, np.ndarray]:
+    """Label arrays for training. ``y_swing`` / ``y_pump`` are derived from
+    ``y_c5`` / ``y_oc`` (same definitions as ``features``) when an older
+    panel lacks them; ``y_h5`` is NaN when absent (squeeze-in-window omitted)."""
+    Y = {c: lab[c].to_numpy(dtype=np.float64) for c in ("y_oc", "y_dump", "y_bigdump", "y_squeeze")}
+    c5 = _numcol(lab, "y_c5")
+    Y["y_c5"] = c5
+    with np.errstate(invalid="ignore"):
+        Y["y_swing"] = (_numcol(lab, "y_swing") if "y_swing" in lab.columns
+                        else np.where(np.isfinite(c5), (c5 <= SWING_THRESHOLD).astype(float), np.nan))
+        Y["y_pump"] = (_numcol(lab, "y_pump") if "y_pump" in lab.columns
+                       else np.where(np.isfinite(Y["y_oc"]), (Y["y_oc"] >= PUMP_THRESHOLD).astype(float), np.nan))
+    Y["y_h5"] = _numcol(lab, "y_h5")
+    return Y
+
+
+def _decile_means(score: np.ndarray, v: np.ndarray) -> List[Optional[float]]:
+    ok = np.isfinite(score) & np.isfinite(v)
+    if ok.sum() < 10:
+        return []
+    dec = pd.qcut(pd.Series(score[ok]).rank(method="first"), 10, labels=False).to_numpy()
+    return [_f(x) for x in pd.Series(v[ok]).groupby(dec).mean().to_numpy()]
+
+
 def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
           site_json: Union[Path, str, None] = DEFAULT_SITE_JSON,
-          fold_months: int = 1, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+          fold_months: int = 1, params: Optional[Dict[str, Any]] = None,
+          features: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     """Walk-forward evaluation + production fit. Returns the §12 report,
     writes it to ``site_json`` (unless None) and pickles the bundle to
-    ``out_dir/bundle.pkl``."""
+    ``out_dir/bundle.pkl``. ``features`` overrides the M0 column list
+    (default ``features.FEATURES``; M1 = it + ``M1_EXTRA``) — used to
+    compare feature sets; the bundle records the list it was trained on."""
     import sklearn
 
     t_all = time.time()
     s = _settings(fold_months, params)
     rng = np.random.default_rng(int(s["seed"]))
-    need = ["date", "symbol"] + M1_FEATURES + ["y_oc", "y_dump", "y_bigdump", "y_squeeze"]
+    f0: List[str] = list(features) if features is not None else list(M0_FEATURES)
+    f1: List[str] = f0 + [c for c in M1_EXTRA if c not in f0]
+    unknown = [c for c in f1 if c not in FEATURE_DOCS]
+    if unknown:
+        raise ValueError(f"unknown feature columns: {unknown[:10]}")
+    need = ["date", "symbol"] + [c for c in f1 if c not in FINRA_FEATURES] + ["y_oc", "y_dump", "y_bigdump", "y_squeeze"]
     missing = [c for c in need if c not in panel.columns]
     if missing:
         raise ValueError(f"panel is missing columns: {missing[:10]}")
+    if any(c not in panel.columns for c in f1):   # FINRA columns on an old panel → NaN (warned in _matrix)
+        log.warning("train: panel predates the FINRA features — they are all NaN in this fit")
 
     lab = panel[panel["y_dump"].notna() & panel["y_oc"].notna()]
     lab = lab.sort_values(["date", "symbol"], kind="mergesort").reset_index(drop=True)
@@ -559,9 +719,9 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
     row_dates = pd.to_datetime(lab["date"]).to_numpy(dtype="datetime64[ns]")
     dates = np.unique(row_dates)
     di = np.searchsorted(dates, row_dates)
-    X = _matrix(lab, M1_FEATURES)
-    Y = {c: lab[c].to_numpy(dtype=np.float64) for c in ("y_oc", "y_dump", "y_bigdump", "y_squeeze")}
-    n0, n1 = len(M0_FEATURES), len(M1_FEATURES)
+    X = _matrix(lab, f1)
+    Y = _label_arrays(lab)
+    n0, n1 = len(f0), len(f1)
     log.info("train: %d labeled rows, %d symbols, %d sessions (%s → %s)", len(lab), lab["symbol"].nunique(),
              len(dates), _day(dates[0]), _day(dates[-1]))
 
@@ -599,7 +759,7 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
     tested = np.isfinite(oos["m0"]["prob_dump"])
     pub_mask = publishable(lab)
     ssr_mask = ssr_next(lab)
-    y_up5 = (Y["y_oc"] >= 0.05).astype(float)
+    y_up5 = Y["y_pump"]
     big_move = np.abs(Y["y_oc"]) >= 0.05
     directional: Dict[str, Any] = {}
     tail: Dict[str, Any] = {}
@@ -608,6 +768,8 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
     sims: Dict[str, Any] = {}
     calib: Dict[str, Any] = {}
     extra: Dict[str, Any] = {}
+    swing: Dict[str, Any] = {}
+    sym_arr = lab["symbol"].astype(str).to_numpy()
     for m in ("m0", "m1"):
         p = oos[m]["prob_dump"]
         daily = _daily_table(row_dates[tested], p[tested], Y["y_dump"][tested], Y["y_oc"][tested],
@@ -623,12 +785,28 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
             "decile_dump_rate": [_f(v) for v in pd.Series(Y["y_dump"][tested]).groupby(dec.to_numpy()).mean().to_numpy()],
             "up5_base_rate": _f(np.mean(y_up5[tested])),
         }
+        # the dedicated pump / swing models, and skew as a direction score
+        pp_t = oos[m]["prob_pump"][tested]
+        ps_t = oos[m]["prob_swing"][tested]
+        sk_t = oos[m]["skew"][tested]
+        ysw = Y["y_swing"][tested]
+        bm = big_move[tested]
+        directional[m].update({
+            "pump_model_auc": _auc(y_up5[tested], pp_t),
+            "pump_base_rate": _f(np.nanmean(y_up5[tested])),
+            "skew_dump_vs_pump_auc": _auc(Y["y_dump"][tested][bm], sk_t[bm]),
+            "swing_auc": _auc(ysw, ps_t),
+            "swing_base_rate": _f(np.nanmean(ysw)) if np.isfinite(ysw).any() else None,
+            "dump_score_swing_auc": _auc(ysw, pt),
+            "swing_decile_mean_c5": _decile_means(ps_t, Y["y_c5"][tested]),
+            "swing_decile_rate": _decile_means(ps_t, ysw),
+        })
         # Tail calibration → caps: never show more certainty than the OOS tail delivered.
         caps[m] = {}
         tail[m] = {}
         for t in TARGETS:
             pp, yy = oos[m][PROB_COLS[t]][tested], Y[TARGETS[t]][tested]
-            hi = np.isfinite(pp) & (pp >= CAP_FROM)
+            hi = np.isfinite(pp) & np.isfinite(yy) & (pp >= CAP_FROM)
             n_hi = int(hi.sum())
             realized = _f(np.mean(yy[hi])) if n_hi else None
             cap = max(realized, 0.3) if (n_hi >= 30 and realized is not None) else CAP_FROM + 0.1
@@ -638,13 +816,16 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
         report_oos[m] = _metrics(Y["y_dump"][tested], p[tested], daily)
         sims[m] = _sim(daily)
         calib[m] = _calibration(Y["y_dump"][tested], p[tested])
-        for t in ("bigdump", "squeeze"):
+        for t in ("bigdump", "squeeze", "swing", "pump"):
             yy, pp = Y[TARGETS[t]][tested], oos[m][PROB_COLS[t]][tested]
-            ok = np.isfinite(pp)
+            ok = np.isfinite(pp) & np.isfinite(yy)
             extra[f"{m}_{t}"] = {"auc": _auc(yy, pp),
                                  "brier": _f(np.mean((pp[ok] - yy[ok]) ** 2)) if ok.any() else None,
-                                 "base_rate": _f(np.mean(yy)) if len(yy) else None,
+                                 "base_rate": _f(np.mean(yy[ok])) if ok.any() else None,
+                                 "n": int(ok.sum()),
                                  "calibration": _calibration(yy, pp)}
+        swing[m] = _swing_report(row_dates[tested], sym_arr[tested], oos[m]["prob_swing"][tested],
+                                 Y["y_swing"][tested], Y["y_c5"][tested], Y["y_h5"][tested], pub_mask[tested])
         eo = oos[m]["exp_oc"][tested]
         yo = Y["y_oc"][tested]
         ok = np.isfinite(eo)
@@ -675,8 +856,8 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
     t_imp = time.time()
     k = min(len(cal_idx), int(s["importance_rows"]))
     imp_idx = np.sort(rng.choice(cal_idx, k, replace=False)) if k < len(cal_idx) else cal_idx
-    imp0, fam0, base0 = _importance(prod["m0"]["dump"]["clf"], X[imp_idx, :n0], Y["y_dump"][imp_idx], M0_FEATURES, rng)
-    imp1, fam1, base1 = _importance(prod["m1"]["dump"]["clf"], X[imp_idx, :n1], Y["y_dump"][imp_idx], M1_FEATURES, rng)
+    imp0, fam0, base0 = _importance(prod["m0"]["dump"]["clf"], X[imp_idx, :n0], Y["y_dump"][imp_idx], f0, rng)
+    imp1, fam1, base1 = _importance(prod["m1"]["dump"]["clf"], X[imp_idx, :n1], Y["y_dump"][imp_idx], f1, rng)
     imp_s = time.time() - t_imp
 
     # 4) report
@@ -685,8 +866,8 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
     trained_through = _day(later.min()) if len(later) else _day(dates[-1])
     n_iters = {f"{m}_{t}": int(getattr(prod[m][t]["clf"], "n_iter_", 0) or 0) for m in prod for t in TARGETS}
     notes = [
-        f"HistGradientBoosting (NaN-native), {len(M0_FEATURES)} features for M0, "
-        f"{len(M1_FEATURES)} for M1 (+ gap_open). learning_rate {s['hgb']['learning_rate']}, "
+        f"HistGradientBoosting (NaN-native), {len(f0)} features for M0, "
+        f"{len(f1)} for M1 (+ gap_open). learning_rate {s['hgb']['learning_rate']}, "
         f"≤ {s['hgb']['max_iter']} trees with early stopping on a random 10% of each fit window.",
         f"Walk-forward: expanding window, {s['fold_months']}-month test folds, embargo "
         f"{s['embargo']} sessions before every test fold and before every calibration slice; "
@@ -712,8 +893,9 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
         "n_symbols": int(lab["symbol"].nunique()),
         "n_days": int(len(dates)),
         "targets": TARGET_TEXT,
-        "base_rate": {t: _f(np.mean(Y[c])) for t, c in TARGETS.items()},
+        "base_rate": {t: _f(np.nanmean(Y[c])) if np.isfinite(Y[c]).any() else None for t, c in TARGETS.items()},
         "oos": report_oos,
+        "swing": swing,
         "calibration": calib,
         "importance": imp0,
         "importance_family": fam0,
@@ -747,7 +929,7 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
         "training_notes": notes,
         "caveats": CAVEATS,
         "params": {"hgb": s["hgb"], "max_fit_rows": s["max_fit_rows"], "cost": COST, "oc_clip": list(OC_CLIP)},
-        "features": {"m0": M0_FEATURES, "m1": M1_FEATURES},
+        "features": {"m0": f0, "m1": f1},
         "sklearn_version": sklearn.__version__,
         "timing": {"walk_forward_s": round(wf_s, 1), "final_fit_s": round(fin_s, 1),
                    "importance_s": round(imp_s, 1), "total_s": round(time.time() - t_all, 1)},
@@ -757,8 +939,8 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
     bundle = {
         "version": BUNDLE_VERSION,
         "trained_at": report["trained_at"],
-        "features": M0_FEATURES,
-        "m1_features": M1_FEATURES,
+        "features": f0,
+        "m1_features": f1,
         "m0": prod["m0"],
         "m1": prod["m1"],
         "report": report,
@@ -807,22 +989,17 @@ def load(out_dir: Path = config.MODELS) -> Optional[Dict[str, Any]]:
 
 
 def predict(bundle: Dict[str, Any], rows: pd.DataFrame, use_open: bool) -> pd.DataFrame:
-    """prob_dump, prob_bigdump, prob_squeeze, exp_oc (+ ``model``: m0/m1),
-    indexed like ``rows``. With ``use_open`` rows that have a finite
-    ``gap_open`` get M1; the rest fall back to M0."""
+    """prob_dump, prob_bigdump, prob_squeeze, prob_swing, prob_pump, skew,
+    exp_oc (+ ``model``: m0/m1), indexed like ``rows``. With ``use_open``
+    rows that have a finite ``gap_open`` get M1; the rest fall back to M0.
+    A bundle trained before a target existed gives NaN for it (and skew)."""
     n = len(rows)
     vals = {c: np.full(n, np.nan) for c in OUT_COLUMNS}
     which = np.full(n, "m0", dtype=object)
     if bundle is not None and n:
-        f0 = list(bundle.get("features") or M0_FEATURES)
-        f1 = list(bundle.get("m1_features") or (f0 + list(M1_EXTRA)))
-        X = _matrix(rows, f1)
-        use1 = np.zeros(n, dtype=bool)
-        if use_open:
-            if "gap_open" in rows.columns:
-                use1 = np.isfinite(X[:, f1.index("gap_open")])
-            else:
-                log.warning("predict: use_open=True but rows have no gap_open — using M0 for every row")
+        f0, f1, X, use1 = _model_masks(bundle, rows, use_open)
+        if use_open and "gap_open" not in rows.columns:
+            log.warning("predict: use_open=True but rows have no gap_open — using M0 for every row")
         for m, mask, cols in (("m0", ~use1, len(f0)), ("m1", use1, len(f1))):
             if not mask.any():
                 continue
@@ -832,6 +1009,62 @@ def predict(bundle: Dict[str, Any], rows: pd.DataFrame, use_open: bool) -> pd.Da
             which[mask] = m
     out = pd.DataFrame(vals, index=rows.index)[OUT_COLUMNS]
     out["model"] = which
+    return out
+
+
+def _model_masks(bundle: Dict[str, Any], rows: pd.DataFrame, use_open: bool):
+    f0 = list(bundle.get("features") or M0_FEATURES)
+    f1 = list(bundle.get("m1_features") or (f0 + list(M1_EXTRA)))
+    X = _matrix(rows, f1)
+    use1 = np.zeros(len(rows), dtype=bool)
+    if use_open and "gap_open" in rows.columns and "gap_open" in f1:
+        use1 = np.isfinite(X[:, f1.index("gap_open")])
+    return f0, f1, X, use1
+
+
+def attribute(bundle: Dict[str, Any], rows: pd.DataFrame, use_open: bool = False) -> pd.DataFrame:
+    """Which feature families drive each row's dump score (CONTRACTS §14.2).
+
+    For every family, all of its columns are replaced by their medians over
+    ``rows`` (the day's scored universe — pass all of it, not one name) and
+    the *raw* (uncalibrated) score of the dump classifier is recomputed;
+    ``attr_<family>`` = max(0, raw − raw_replaced), normalised so a row's
+    attributions sum to 1 (NaN when no family pushes the score up). One
+    batched predict per family per model set. Descriptive, not causal: a
+    tree model's families interact, and the shares answer "how much lower
+    would the score be if this family looked typical for today".
+    """
+    cols = [f"attr_{f}" for f in FAMILIES]
+    out = pd.DataFrame(np.nan, index=rows.index, columns=cols)
+    if bundle is None or not len(rows):
+        return out
+    f0, f1, X, use1 = _model_masks(bundle, rows, use_open)
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)   # all-NaN column → NaN median (stays unknown)
+        med = np.nanmedian(X.astype(np.float64), axis=0).astype(np.float32)
+    vals = np.full((len(rows), len(FAMILIES)), np.nan)
+    for m, mask, names in (("m0", ~use1, f0), ("m1", use1, f1)):
+        cm = (bundle.get(m) or {}).get("dump") or {}
+        clf = cm.get("clf")
+        if clf is None or not mask.any():
+            continue
+        Xm = X[mask, :len(names)]
+        raw = _raw(clf, Xm)
+        drops = np.zeros((len(Xm), len(FAMILIES)))
+        for k, fam in enumerate(FAMILIES):
+            js = [j for j, c in enumerate(names) if FEATURE_DOCS.get(c, ("",))[0] == fam]
+            if not js:
+                continue
+            Xr = Xm.copy()
+            Xr[:, js] = med[js]
+            drops[:, k] = np.maximum(0.0, raw - _raw(clf, Xr))
+        tot = drops.sum(axis=1)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            share = np.where((tot > 0)[:, None], drops / tot[:, None], np.nan)
+        vals[mask] = share
+    out.loc[:, cols] = vals
     return out
 
 

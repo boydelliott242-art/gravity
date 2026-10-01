@@ -371,3 +371,85 @@ History file (written at publish, graded after the close):
 `{"session_date","published_at","top": {"symbol","prob_dump","score","premarket"}, "board": [{"rank","symbol","prob_dump"}], "outcome": null | {"graded_at","top": {"open","high","low","close","oc","ol","oh","dump": bool}, "board_mean_oc", "board_dump_rate", "universe_mean_oc", "universe_dump_rate"}}`
 
 Scorecard = `{"asof","days":[...graded history rows...],"live": {"n_days","top_dump_rate","top_mean_oc","board_dump_rate","universe_dump_rate"} }`.
+
+---
+
+## 14. GODMODE add-ons (2026-09-30) — keep the existing look; add, don't restyle
+
+**Removed:** the INHD reference position (`today.reference`) and every INHD
+mention on the site. `twins` now = lookalikes of **today's #1**
+(`today.twins_anchor` = its symbol). Evidence study `inhd_profile` is renamed
+`serial_rs` ("Serial reverse-splitter: Asia-linked, 2+ reverse splits in 2
+years, −90% from the high").
+
+### 14.1 New sources — `gravity/sources/intel.py`
+
+```python
+def dilution_intel(symbol: str, cik: int | None) -> dict | None
+# {"shares_now","shares_1y_ago","shares_growth_1y" (now/1y-ago ratio),"shares_asof",
+#  "cash","cash_date","quarterly_burn","runway_q",
+#  "last_offering": {"date","form","url","type": "atm"|"priced"|"registered_direct"|"shelf_takedown"|"other",
+#                    "price": float|None,"shares": float|None,"gross": float|None} | None,
+#  "atm_capacity": float|None,           # $ size of an at-the-market program if stated
+#  "warrants": {"shares": float|None,"exercise_price": float|None,"url"} | None,
+#  "sources": [url, ...]}
+def insider_sales(symbol: str, cik: int | None, days: int = 90) -> dict | None
+# {"n_sales","shares_sold","value_sold","last_date","n_buys","value_bought","n_144",
+#  "trades": [{"date","name","title","code","shares","price","value","url"}]}   # Form 4 XML, open-market S/P only
+def chatter(symbols: list[str]) -> dict[str, dict]
+# Stocktwits api/2/streams/symbol/{SYM}.json → {"msgs_per_day": float, "span_hours": float, "bull": int, "bear": int,
+#  "watchers": int|None, "latest": iso, "url": "https://stocktwits.com/symbol/SYM"}
+def ipo_calendar(months: int = 9) -> list[dict]      # Nasdaq /api/ipo/calendar?date=YYYY-MM priced rows
+# [{"symbol","name","priced_date": "YYYY-MM-DD","price","shares","offer_amount","exchange"}]
+def lockups(session: date, horizon_days: int = 30, lookback_days: int = 10) -> list[dict]
+# IPOs whose priced_date + 180 days falls in [session - lookback, session + horizon]
+# [{"symbol","name","ipo_date","ipo_price","lockup_date","days_to"}]   (days_to < 0 = already expired)
+def earnings_ahead(start: date, sessions: int = 5) -> list[dict]
+# street.earnings_calendar for each of the next N trading days: [{"date","symbol","time","eps_forecast","n_ests"}]
+def intraday(symbol: str) -> dict | None
+# Nasdaq /api/quote/{SYM}/chart?assetclass=stocks → {"asof","last","open","high","low","prev_close",
+#  "points": [[epoch_ms, price], ...] (≤ 90, downsampled), "source": "nasdaq"}
+```
+
+### 14.2 Model additions (`features.py`, `model.py`, `evidence.py`, `sources/finra_hist.py`)
+
+- New labels: `y_swing` = `y_c5 ≤ −0.15` (5-session swing short: short at the
+  next open, cover at the close five sessions later), `y_pump` = `y_oc ≥ +0.05`.
+- New targets in every model set → `predict` adds `prob_swing`, `prob_pump`,
+  and `skew = prob_dump / (prob_dump + prob_pump)` (downside share of a big move).
+- Historical FINRA short-volume features (family `flow`), from
+  `finra_hist.load(start, end) -> DataFrame[date, symbol, short_volume, total_volume]`
+  (forever cache per day): kept **only if** walk-forward OOS improves.
+- `model.attribute(bundle, rows, use_open=False) -> DataFrame` with one
+  column per family `attr_<family>`: drop in the raw dump score when that
+  family's features are replaced by the rows' medians, clipped at 0 and
+  normalised to sum to 1 (NaN when all ≤ 0).
+- Report adds `swing` = {metrics for top-1/top-10 by prob_swing: hit rate,
+  mean/median y_c5, pub-rule variants, sim of non-overlapping entries}.
+
+### 14.3 `today.json` additions
+
+- `twins_anchor`: symbol. `reference`: removed.
+- Pick adds: `prob_swing`, `prob_pump`, `skew`, `attribution` ({family: 0–1}),
+  `dilution` (§14.1 dilution_intel | null), `insider` (| null), `chatter` (| null),
+  `borrow_history` ([[date, fee, available], …] oldest→newest), `prob_history`
+  ([[date, prob_dump], …]).
+- `swing_board`: [Pick, …] (top 15 by prob_swing, same Pick shape, `rank` = swing rank).
+- `market`: {"breadth_up","median_r1","n_up20","n_down20","iwm_r1","iwm_r5",
+  "universe_dump_rate_20d","regime": "calm"|"normal"|"wild","regime_pct" (0–100 percentile of today's mean prob_dump vs the last 250 sessions)}.
+- `sectors`: [{"sector","n","mean_prob","n_top100","top": [sym, sym, sym]}] sorted by mean_prob desc.
+- `calendar`: {"earnings": [{"date","symbol","name","time","in_universe","prob_dump"}],
+  "lockups": [{"symbol","name","ipo_date","ipo_price","lockup_date","days_to","price","vs_ipo","prob_dump"}]}.
+
+### 14.4 New files
+
+- `docs/data/universe.json` = {"asof","session_date","columns":[...],"rows":[[...], ...]} — every scored name;
+  columns: symbol, name, price, market_cap, prob_dump, prob_squeeze, prob_swing, skew, score, board_rank,
+  ssr, publishable, borrow_status, fee_rate, available, squeeze_danger, sector, country, flags, spark (last 30 closes).
+- `docs/data/live.json` (every ~15 min in session) = {"asof","session_date","phase",
+  "top": {"symbol","open","last","high","low","oc_now","oh_now","ol_now","points":[[ms,price],…]} | null,
+  "board": [{"symbol","open","last","high","low","oc_now"}], "board_mean_oc_now"}.
+  Clearly labelled live/unofficial; the official grade is the evening one.
+- `docs/data/probs/YYYY-MM-DD.json` (daily universe probabilities) and
+  `docs/data/borrow/YYYY-MM-DD.json` (daily IBKR fee/availability for the universe) — history stores.
+- `docs/feed.xml` (RSS of each day's #1), `docs/manifest.webmanifest` + icons (installable on a phone home screen).

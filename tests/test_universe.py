@@ -232,3 +232,10 @@ def test_live_load_universe(tmp_cache):
           f"universe={len(df)} asia={int(df['asia'].sum())} excluded={df.attrs['excluded']}")
     if "INHD" in set(df["symbol"]):
         print("INHD row:", df.set_index("symbol").loc["INHD"].to_dict())
+
+
+def test_nyse_style_warrant_tickers_excluded():
+    from gravity.sources.universe import exclusion_reason
+    assert exclusion_reason("RAC/WS", "Rithm Acquisition Corp") == "warrant"
+    assert exclusion_reason("ABC.WS", "Some Co") == "warrant"
+    assert exclusion_reason("WS", "Worthington Steel") is None   # a real ticker named WS stays

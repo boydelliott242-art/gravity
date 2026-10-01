@@ -38,6 +38,7 @@ PANEL_PATH = STATE / "panel.pkl"
 LATEST_PATH = STATE / "latest.pkl"
 CONTEXT_PATH = STATE / "context.pkl"
 SIGNS_PATH = config.MODELS / "signs.json"
+REGIME_PATH = STATE / "regime.json"
 ENRICH_DEADLINE_S = 300
 MIN_SCORED = 1500
 
@@ -58,8 +59,6 @@ def refresh_data(full_events: bool = True) -> dict:
     t0 = time.time()
     uni = universe.load_universe()
     syms = uni["symbol"].tolist()
-    if config.REFERENCE_SYMBOL not in syms:
-        syms.append(config.REFERENCE_SYMBOL)
     log.info("universe: %d eligible symbols", len(syms))
 
     hist = prices.load_history(syms, refresh=True)
@@ -90,7 +89,17 @@ def refresh_data(full_events: bool = True) -> dict:
             static.at[s, "asia"] = True
     log.info("asia flag refined from SEC addresses: +%d", refined)
 
-    panel = features.build_panel(hist, events, splits, static, bench)
+    # FINRA Reg SHO daily short volume history (cached forever per day)
+    short_vol = None
+    try:
+        from .sources import finra_hist
+        start = min(df.index.min() for df in hist.values()).date()
+        short_vol = finra_hist.load(start, now_et().date(), symbols=list(hist))
+        log.info("finra history: %d rows (%.0fs)", len(short_vol), time.time() - t0)
+    except Exception as e:  # noqa: BLE001 — flow features are optional; NaN when missing
+        log.warning("finra history unavailable: %s", e)
+
+    panel = features.build_panel(hist, events, splits, static, bench, short_vol=short_vol)
     log.info("panel: %d rows × %d cols (%.0fs)", len(panel), panel.shape[1], time.time() - t0)
     ctx = {"universe": uni, "static": static, "splits": splits, "events": events, "cik_map": cmap,
            "built_at": datetime.now(timezone.utc).isoformat()}
@@ -102,9 +111,8 @@ def refresh_data(full_events: bool = True) -> dict:
     fresh = int((pd.to_datetime(latest["date"]) == pd.to_datetime(latest["date"]).max()).sum()) if len(latest) else 0
     bad = int(run.get("stale", 0) or 0) + int(run.get("failed", 0) or 0)
     why = None
-    if run.get("yahoo_rate_limited"):
-        why = "Yahoo rate-limited the price refresh"
-    elif run.get("requested") and bad > 0.10 * run["requested"]:
+    # A throttled symbol or two is normal; judge by how much actually came back.
+    if run.get("requested") and bad > 0.10 * run["requested"]:
         why = f"{bad} of {run['requested']} price refreshes were stale or failed"
     elif fresh < _coverage_floor():
         why = f"only {fresh} names have a bar on the latest date (floor {_coverage_floor()})"
@@ -163,8 +171,40 @@ def load_state() -> Optional[dict]:
     except (OSError, EOFError, pickle.UnpicklingError, ValueError, AttributeError) as e:
         log.warning("saved state unreadable (%s) — will refresh", e)
         return None
-    hist = prices.load_history(list(set(latest["symbol"]) | {config.REFERENCE_SYMBOL}), refresh=False)
+    hist = prices.load_history(list(set(latest["symbol"])), refresh=False)
     return {"latest": latest, "hist": hist, **ctx}
+
+
+def _listing_dates(hist: dict) -> Dict[str, Any]:
+    """symbol → first daily bar (≈ first trading day for names listed inside the history)."""
+    return {s: df.index.min() for s, df in hist.items() if df is not None and len(df)}
+
+
+def update_regime(panel: pd.DataFrame) -> Optional[float]:
+    """Mean model P(dump) per session over the last ~250 sessions (so today's
+    reading can be placed in context) and the universe's realised dump rate
+    over the last 20 graded sessions."""
+    from . import model
+    b = model.load()
+    if b is None or panel is None or not len(panel):
+        return None
+    d = pd.to_datetime(panel["date"])
+    days = np.sort(d.unique())[-250:]
+    sub = panel[d.isin(days)]
+    pr = model.predict(b, sub, use_open=False)["prob_dump"]
+    means = pr.groupby(pd.to_datetime(sub["date"]).dt.strftime("%Y-%m-%d").to_numpy()).mean()
+    REGIME_PATH.write_text(json.dumps({k: round(float(v), 5) for k, v in means.items()}))
+    lab = panel[panel["y_dump"].notna()]
+    ld = pd.to_datetime(lab["date"])
+    last20 = np.sort(ld.unique())[-20:]
+    rate = float(lab.loc[ld.isin(last20), "y_dump"].mean()) if len(last20) else None
+    try:
+        ctx = pickle.loads(CONTEXT_PATH.read_bytes())
+        ctx["universe_dump_rate_20d"] = rate
+        _atomic_pickle(CONTEXT_PATH, ctx)
+    except (OSError, EOFError, pickle.UnpicklingError, ValueError):
+        pass
+    return rate
 
 
 def compute_signs(panel: pd.DataFrame) -> Dict[str, float]:
@@ -194,9 +234,10 @@ def cmd_train(_args: argparse.Namespace) -> int:
     panel = state["panel"]
     report = model.train(panel)
     publish.write_json("model.json", report)
-    ev = evidence.run_studies(panel)
+    ev = evidence.run_studies(panel, listing_dates=_listing_dates(state["hist"]))
     publish.write_json("evidence.json", ev)
     compute_signs(panel)
+    _safe(update_regime, panel)
     log.info("train done: %s", {k: report.get(k) for k in ("n_rows", "n_symbols", "trained_through")})
     return 0
 
@@ -246,6 +287,8 @@ def _publish_today(today: dict, args: argparse.Namespace, message: str) -> int:
     publish.write_json("today.json", today)
     if not today["late"]:
         scorecard.log_picks(today)
+        from . import feed
+        _safe(feed.write)
     else:
         log.info("published after the open — not logged to the track record")
     if args.no_push:
@@ -273,11 +316,12 @@ def cmd_evening(args: argparse.Namespace) -> int:
         try:
             log.info("model stale — retraining (walk-forward)")
             publish.write_json("model.json", model.train(state["panel"]))
-            publish.write_json("evidence.json", evidence.run_studies(state["panel"]))
+            publish.write_json("evidence.json", evidence.run_studies(state["panel"], listing_dates=_listing_dates(state["hist"])))
             compute_signs(state["panel"])
         except Exception as e:  # noqa: BLE001 — keep the existing model and carry on
             log.exception("retrain failed — keeping the previous model")
             net.record_status("Model retrain", False, f"failed: {e}")
+    state["universe_dump_rate_20d"] = _safe(update_regime, state["panel"])
     today = build_today(state, run="evening", live_extras=True)
     ok, why = healthy(today)
     if not ok:
@@ -317,7 +361,12 @@ def cmd_morning(args: argparse.Namespace) -> int:
         _withhold(f"morning run withheld: {why}", not args.no_push)
         return 2
     top = (today.get("top") or {}).get("symbol", "none")
-    return _publish_today(today, args, f"morning: {today['session_date']} #1 {top}")
+    rc = _publish_today(today, args, f"morning: {today['session_date']} #1 {top}")
+    if rc == 0 and not args.no_push and today.get("top") and not today.get("late"):
+        tp = today["top"]
+        publish._notify(f"Today's #1: {tp['symbol']} — {tp['prob_dump'] * 100:.0f}% odds of a 5%+ open→close drop "
+                        f"(squeeze odds {tp.get('prob_squeeze', 0) * 100:.0f}%). Research, not advice.")
+    return rc
 
 
 def healthy(today: dict) -> tuple:
@@ -339,6 +388,11 @@ def healthy(today: dict) -> tuple:
     if not today.get("board"):
         return False, "empty board"
     return True, "ok"
+
+
+def cmd_live(args: argparse.Namespace) -> int:
+    from . import live
+    return live.run(push=not args.no_push)
 
 
 def cmd_publish(_args: argparse.Namespace) -> int:
@@ -375,9 +429,64 @@ def _safe(fn, *a, default=None, **k):
         return default
 
 
-def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
-    from . import features, model
+def _intel():
+    try:
+        from .sources import intel
+        return intel
+    except ImportError:  # pragma: no cover — optional until built
+        return None
+
+
+def enrich(symbols: List[str], latest: pd.DataFrame, cmap: dict, splits: dict,
+           deadline_s: float, deep: Optional[List[str]] = None) -> dict:
+    """Per-name lookups (news, short interest, analyst, float, dilution,
+    insider sales, chatter), all overlapped under ONE hard deadline — a
+    slow feed must never hold the pre-market publish hostage. Anything
+    unfinished is simply missing ("—")."""
     from .sources import news as newsmod
+    from .sources import shortside, street
+
+    intel = _intel()
+    deep = set(deep or [])
+    t_e = time.time()
+    ex = ThreadPoolExecutor(max_workers=12)
+    F: Dict[str, Dict[str, Any]] = {k: {} for k in ("news", "si", "analyst", "dilution", "insider")}
+    for s in symbols:
+        name = str(latest.at[s, "name"] or "") if s in latest.index and "name" in latest.columns else ""
+        cik = (cmap.get(s) or {}).get("cik")
+        F["news"][s] = ex.submit(_safe, newsmod.headlines, s, name, default=[])
+        F["si"][s] = ex.submit(_safe, shortside.short_interest, s, default=[])
+        F["analyst"][s] = ex.submit(_safe, street.analyst, s)
+        if intel is not None and cik:
+            F["dilution"][s] = ex.submit(_safe, intel.dilution_intel, s, cik, splits.get(s, []))
+            if s in deep:
+                F["insider"][s] = ex.submit(_safe, intel.insider_sales, s, cik)
+    f_fl = ex.submit(_safe, shortside.float_shares, symbols, default={})
+    f_ch = ex.submit(_safe, intel.chatter, symbols, default={}) if intel is not None else None
+    allf = [f for d in F.values() for f in d.values()] + [f_fl] + ([f_ch] if f_ch else [])
+    _done, pending = wait(allf, timeout=deadline_s)
+    ex.shutdown(wait=False, cancel_futures=True)
+
+    def res(f, default):
+        return (f.result() if f is not None and f.done() and not f.cancelled() else None) or default
+
+    out = {k: {s: res(f, [] if k in ("news", "si") else None) for s, f in d.items()} for k, d in F.items()}
+    out["floats"] = res(f_fl, {})
+    out["chatter"] = res(f_ch, {}) if f_ch else {}
+    if pending:
+        net.record_status("Enrichment deadline", False, f"{len(pending)} lookups unfinished after {deadline_s:.0f}s — shown as missing")
+    log.info("enrichment for %d names in %.0fs (%d unfinished)", len(symbols), time.time() - t_e, len(pending))
+    return out
+
+
+def _merge(dst: dict, src: dict) -> None:
+    for k, v in src.items():
+        if isinstance(v, dict):
+            dst.setdefault(k, {}).update(v)
+
+
+def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
+    from . import features, history, model
     from .sources import prices, sec, shortside, street
 
     t0 = time.time()
@@ -397,6 +506,10 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
     bundle = model.load()
     if bundle is None:
         raise SystemExit("no trained model — run `python -m gravity.cli train` first")
+    cmap = state.get("cik_map", {})
+    splits = state.get("splits", {})
+    hist = state["hist"]
+    events = state.get("events", {})
 
     # 1) overnight/live filings the feature history can't contain yet
     since = datetime.combine(last_date.date(), datetime.min.time(), tzinfo=ET).replace(hour=16)
@@ -411,23 +524,24 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
         s = e.get("symbol")
         if s:
             overnight.setdefault(s, []).append(e)
-
     log.info("overnight filings: %d symbols (%d live + %d full-text) in %.0fs",
              len(overnight), len(overnight_list), len(ft), time.time() - t_s)
 
     # 2) model pass 1 (M0) on everything
+    OUT = ["prob_dump", "prob_bigdump", "prob_squeeze", "exp_oc", "prob_swing", "prob_pump", "skew"]
     pred = model.predict(bundle, latest, use_open=False)
-    latest = latest.join(pred[["prob_dump", "prob_bigdump", "prob_squeeze", "exp_oc"]], rsuffix="_m")
+    latest = latest.join(pred[[c for c in OUT if c in pred.columns]], rsuffix="_m")
+    for c in OUT:
+        if c not in latest.columns:
+            latest[c] = np.nan
     latest["model_used"] = "m0"
 
     # 3) shortlist → pre-market snapshot → M1 where we have a gap proxy
     order = latest.sort_values("prob_dump", ascending=False)
-    shortlist = list(order.index[:150])
+    shortlist = list(order.index[:300])
     for s, evs in overnight.items():
         if s in latest.index and any(e.get("category") in score.SUPPLY_CATS for e in evs) and s not in shortlist:
             shortlist.append(s)
-    if config.REFERENCE_SYMBOL in latest.index and config.REFERENCE_SYMBOL not in shortlist:
-        shortlist.append(config.REFERENCE_SYMBOL)
     pre: Dict[str, dict] = {}
     if phase == "pre-market" or run == "morning":
         t_p = time.time()
@@ -438,8 +552,9 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
         sub = latest.loc[use_open_syms].copy()
         sub["gap_open"] = [pre[s]["gap_pct"] for s in use_open_syms]
         p1 = model.predict(bundle, sub, use_open=True)
-        for c in ("prob_dump", "prob_bigdump", "prob_squeeze", "exp_oc"):
-            latest.loc[use_open_syms, c] = p1[c].values
+        for c in OUT:
+            if c in p1.columns:
+                latest.loc[use_open_syms, c] = p1[c].values
         latest.loc[use_open_syms, "model_used"] = "m1"
 
     # 4) flag supply filings the model hasn't seen (probability unchanged — see score.overlay_catalysts)
@@ -471,61 +586,46 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
         latest["short_ratio_5d"] = (g["short_volume"] / g["total_volume"].replace(0, np.nan)).reindex(latest.index)
     else:
         latest["short_ratio_5d"] = np.nan
+    latest["borrow_status"] = [score.shortability(s, borrow, borrow_ok)["status"] for s in latest.index]
+    _safe(history.save_probs, session.isoformat(), last_date.date().isoformat(), latest["prob_dump"])
+    if borrow_ok:
+        _safe(history.save_borrow, now_et().date().isoformat(), borrow, list(latest.index))
 
-    # 6) families
+    # 6) families (descriptive) + model attribution (what the model actually weighed)
     feature_docs = getattr(features, "FEATURE_DOCS", {})
     try:
         signs = json.loads(SIGNS_PATH.read_text())
     except (OSError, ValueError):
         signs = {}
-    fam = score.family_scores(latest, feature_docs, signs)
-    latest = latest.join(fam)
+    latest = latest.join(score.family_scores(latest, feature_docs, signs))
 
-    # 7) rank + dossier enrichment for the names we'll show
+    # 7) candidates: board pool, swing pool, provisional #1 (for twins)
     order = latest.sort_values("prob_dump", ascending=False)
-    dossier = list(order.index[: config.DOSSIER_SIZE])
+    board_pool = list(order.index[: config.DOSSIER_SIZE])
+    shortable = latest["borrow_status"].isin(["ETB", "HTB", "UNKNOWN"])
+    swing_order = latest[shortable & latest["prob_swing"].notna()].sort_values("prob_swing", ascending=False)
+    swing_pool = list(swing_order.index[:25])
+    provisional = next((s for s in order.index if latest.at[s, "publishable"] and latest.at[s, "borrow_status"] in ("ETB", "HTB")), None)
     feat_rows = latest.copy()
-    feat_rows["market_cap"] = uni["market_cap"].reindex(feat_rows.index)
-    tw = twins.find_twins(feat_rows, session_year=session.year)
-    extra = [t["symbol"] for t in tw] + [config.REFERENCE_SYMBOL]
-    for s in extra:
-        if s not in dossier and s in latest.index:
-            dossier.append(s)
+    tw = twins.find_twins(feat_rows, ref=provisional, session_year=session.year) if provisional else []
+    dossier = list(dict.fromkeys(board_pool + swing_pool + [t["symbol"] for t in tw]))
 
-    news: Dict[str, list] = {}
-    si: Dict[str, list] = {}
-    analyst: Dict[str, Any] = {}
-    floats: Dict[str, dict] = {}
+    E: Dict[str, Dict[str, Any]] = {k: {} for k in ("news", "si", "analyst", "dilution", "insider", "floats", "chatter")}
     if live_extras:
-        # Each source is throttled per host inside net.get, so overlapping
-        # them only hides latency (Nasdaq answers in ~2-3 s per call).
-        # Hard deadline: a slow feed must never hold the pre-market publish
-        # hostage — anything unfinished is shown as missing ("—").
-        t_e = time.time()
-        ex = ThreadPoolExecutor(max_workers=12)
-        f_news = {s: ex.submit(_safe, newsmod.headlines, s, str(latest.at[s, "name"] or ""), default=[]) for s in dossier}
-        f_si = {s: ex.submit(_safe, shortside.short_interest, s, default=[]) for s in dossier}
-        f_an = {s: ex.submit(_safe, street.analyst, s) for s in dossier}
-        f_fl = ex.submit(_safe, shortside.float_shares, dossier, default={})
-        allf = list(f_news.values()) + list(f_si.values()) + list(f_an.values()) + [f_fl]
-        _done, pending = wait(allf, timeout=ENRICH_DEADLINE_S)
-        ex.shutdown(wait=False, cancel_futures=True)
-
-        def res(f, default):
-            return (f.result() if f.done() and not f.cancelled() else None) or default
-
-        news = {s: res(f, []) for s, f in f_news.items()}
-        si = {s: res(f, []) for s, f in f_si.items()}
-        analyst = {s: res(f, None) for s, f in f_an.items()}
-        floats = res(f_fl, {})
-        if pending:
-            net.record_status("Enrichment deadline", False, f"{len(pending)} lookups unfinished after {ENRICH_DEADLINE_S}s — shown as missing")
-        log.info("enrichment for %d names in %.0fs (%d unfinished)", len(dossier), time.time() - t_e, len(pending))
+        _merge(E, enrich(dossier, latest, cmap, splits, ENRICH_DEADLINE_S, deep=board_pool[:30] + swing_pool[:5]))
     danel = _safe(street.danelfin, dossier[:15], default={}) or {}
+
+    # attribution for everything we'll show
+    attr = pd.DataFrame(index=dossier)
+    if hasattr(model, "attribute"):
+        # medians over the WHOLE scored universe = "a typical name today"
+        a = _safe(model.attribute, bundle, latest, False, default=None)
+        if a is not None and len(a):
+            attr = a.reindex(dossier)
+
     # text-classify recent 8-K/6-K for the top of the board so offering language is caught
-    events = state.get("events", {})
     todo = []
-    for s in dossier[:30]:
+    for s in board_pool[:30]:
         for e in _filings_for(s, events, overnight)[:4]:
             if e.get("form") in ("8-K", "6-K", "424B5", "424B3") and not e.get("text_tags") and e.get("url"):
                 if (session - date.fromisoformat(e["date"])).days <= 14:
@@ -541,16 +641,19 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
                 e["category"] = cat
     log.info("text-classified %d recent filings in %.0fs", len(todo), time.time() - t_t)
 
-    cmap = state.get("cik_map", {})
-    splits = state.get("splits", {})
-    hist = state["hist"]
+    def attribution(sym: str) -> Optional[dict]:
+        if sym not in attr.index:
+            return None
+        row = {c.replace("attr_", ""): (None if pd.isna(v) else round(float(v), 4))
+               for c, v in attr.loc[sym].items() if str(c).startswith("attr_")}
+        return row if any(v for v in row.values()) else None
 
     def make_pick(sym: str, rank: Optional[int], with_chart: bool) -> dict:
         r = latest.loc[sym]
         m = {k: (None if pd.isna(v) else v) for k, v in r.items() if not isinstance(v, (list, dict))}
         short = score.shortability(sym, borrow, borrow_ok)
-        si_rows = si.get(sym) or []
-        fl = floats.get(sym) or {}
+        si_rows = E["si"].get(sym) or []
+        fl = E["floats"].get(sym) or {}
         si_pct = None
         if si_rows and fl.get("float"):
             si_pct = (si_rows[0].get("interest") or 0) / fl["float"] if fl["float"] else None
@@ -560,16 +663,28 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
         sqd, sq_parts = score.squeeze_danger(
             m.get("sq_pct"), short, si_pct, dtc, fl.get("float"), m.get("short_ratio_5d"))
         filings = _filings_for(sym, events, overnight)[:12]
-        nws = news.get(sym, [])[:8]
+        nws = E["news"].get(sym, [])[:8]
         reasons, flags = score.build_reasons(
             m, pre.get(sym), filings, splits.get(sym, []), nws, short, session, notes.get(sym))
+        tight = history.borrow_tightening(sym)
+        if tight:
+            reasons.append({"family": "flow", "text": tight, "strength": 2, "url": None})
+            flags.append("BORROW TIGHTENING")
+        dil = E["dilution"].get(sym)
+        if dil and (dil.get("shares_growth_1y") or 0) >= 2:
+            reasons.append({"family": "dilution", "text": f"Share count up {dil['shares_growth_1y']:.1f}× in a year (SEC filings)",
+                            "strength": 2, "url": (dil.get("sources") or [None])[0]})
+        if dil and dil.get("runway_q") is not None and dil["runway_q"] < 2:
+            reasons.append({"family": "dilution", "text": f"Cash runway about {dil['runway_q']:.1f} quarters at the recent burn — likely to raise",
+                            "strength": 2, "url": (dil.get("sources") or [None])[0]})
+        reasons.sort(key=lambda x: -x["strength"])
         fams = {f: (None if pd.isna(r.get(f, np.nan)) else int(r.get(f))) for f in ("dilution", "exhaustion", "decay", "flow")}
-        a = analyst.get(sym) or None
+        a = E["analyst"].get(sym) or None
         fams["street"] = _street_score(a)
-        fams["news"] = _news_score(nws) if sym in news else None
+        fams["news"] = _news_score(nws) if sym in E["news"] else None
         cik = cmap.get(sym, {}).get("cik")
         price = m.get("close")
-        pick = {
+        return {
             "rank": rank, "symbol": sym, "name": m.get("name"),
             "exchange": cmap.get(sym, {}).get("exchange"), "country": m.get("country"),
             "sector": m.get("sector"), "industry": m.get("industry"),
@@ -577,11 +692,13 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
             "premarket": pre.get(sym) if sym in pre else None,
             "prob_dump": m.get("prob_dump"), "prob_bigdump": m.get("prob_bigdump"),
             "prob_squeeze": m.get("prob_squeeze"), "exp_oc": m.get("exp_oc"),
+            "prob_swing": m.get("prob_swing"), "prob_pump": m.get("prob_pump"), "skew": m.get("skew"),
             "lift": m.get("lift"), "score": None if m.get("score") is None else int(m["score"]),
             "model_used": m.get("model_used"),
             "ssr": bool(m.get("ssr")), "publishable": bool(m.get("publishable")),
             "squeeze_danger": sqd, "squeeze_parts": sq_parts,
             "shortability": short, "families": fams, "reasons": reasons, "flags": flags,
+            "attribution": attribution(sym),
             "metrics": {
                 k: m.get(k) for k in (
                     "r1", "r3", "r5", "r20", "rvol1", "rsi14", "dist_ma20", "dist_ma50", "dd_52w",
@@ -594,17 +711,14 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
             },
             "filings": filings, "news": nws,
             "street": {"analyst": a, "danelfin": danel.get(sym)},
+            "dilution": dil, "insider": E["insider"].get(sym), "chatter": E["chatter"].get(sym),
+            "borrow_history": history.borrow_history(sym), "prob_history": history.prob_history(sym),
             "links": _safe(street.deep_links, sym, cik, default={}) or {},
             "chart": score.chart_rows(hist.get(sym)) if with_chart else [],
-            "inhd_similarity": sim_map.get(sym),
         }
-        return pick
-
-    sim_map = {t["symbol"]: t["similarity"] for t in tw}
-    sim_map[config.REFERENCE_SYMBOL] = 1.0
 
     board, squeeze_zone = [], []
-    for sym in order.index[: config.DOSSIER_SIZE]:
+    for sym in board_pool:
         p = make_pick(sym, None, with_chart=True)
         bad = p["shortability"]["status"] == "NONE" or (p["squeeze_danger"] or 0) >= 70 or "HALTED" in p["flags"]
         if bad:
@@ -621,6 +735,13 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
     if top is not None:
         tie_n = int((np.abs(latest["prob_dump"].to_numpy(float) - float(top["prob_dump"])) < 1e-4).sum())
 
+    # lookalikes are anchored to the FINAL #1 (re-run if enrichment changed it)
+    anchor = top["symbol"] if top else None
+    if anchor and anchor != provisional:
+        tw = twins.find_twins(feat_rows, ref=anchor, session_year=session.year)
+        new_syms = [t["symbol"] for t in tw if t["symbol"] not in dossier]
+        if new_syms and live_extras:
+            _merge(E, enrich(new_syms, latest, cmap, splits, 120))
     rank_of = {p["symbol"]: p["rank"] for p in board}
     twin_cards = []
     for t in tw:
@@ -628,17 +749,28 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
         if s not in latest.index:
             continue
         r = latest.loc[s]
+        pick = make_pick(s, rank_of.get(s), with_chart=True)
         twin_cards.append({
             "symbol": s, "name": r.get("name"), "similarity": t["similarity"], "reasons": t["reasons"],
             "price": r.get("close"), "market_cap": r.get("market_cap"), "country": r.get("country"),
             "prob_dump": r.get("prob_dump"), "rank": rank_of.get(s),
             "score": None if pd.isna(r.get("score")) else int(r.get("score")),
-            "pick": make_pick(s, rank_of.get(s), with_chart=True),
+            "flags": pick["flags"], "pick": pick,
         })
-        twin_cards[-1]["flags"] = twin_cards[-1]["pick"]["flags"]
 
-    reference = _reference(latest, hist, borrow, borrow_ok, make_pick, rank_of, events, overnight, news, splits)
-    wire = _catalyst_wire(overnight, news, pre, latest, session)
+    swing_board = []
+    for s in swing_pool:
+        pk = make_pick(s, None, with_chart=True)
+        # a week-long short sits through every squeeze: same exclusions as the board
+        if pk["shortability"]["status"] == "NONE" or (pk["squeeze_danger"] or 0) >= 70 or "HALTED" in pk["flags"]:
+            continue
+        pk["rank"] = len(swing_board) + 1
+        pk["board_rank"] = rank_of.get(s)
+        swing_board.append(pk)
+        if len(swing_board) >= 15:
+            break
+
+    wire = _catalyst_wire(overnight, E["news"], pre, latest, session)
     earnings = []
     for e in _safe(street.earnings_calendar, session, default=[]) or []:
         e["in_universe"] = e.get("symbol") in latest.index
@@ -665,16 +797,118 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
         "top_tie_count": tie_n,
         "top": top,
         "board": board,
+        "swing_board": swing_board,
         "squeeze_zone": squeeze_zone,
         "catalyst_wire": wire,
+        "twins_anchor": anchor,
         "twins": twin_cards,
-        "reference": reference,
+        "market": _market_block(latest, state),
+        "sectors": _sector_block(latest),
+        "calendar": _calendar_block(session, latest, hist),
         "earnings": earnings[:40],
         "sources": [st for st in net.STATUS.values() if "(optional)" not in str(st.get("detail", ""))],
         "disclaimer": DISCLAIMER,
     }
+    # side files: full-universe lookup + history stores
+    _safe(_write_universe, latest, hist, borrow, borrow_ok, events, splits, rank_of, session, pre, notes)
     log.info("built today (%s run) for %s in %.0fs — #1 %s", run, session, time.time() - t0, (top or {}).get("symbol"))
     return clean(today)
+
+
+def _market_block(latest: pd.DataFrame, state: dict) -> dict:
+    """Today's tape vs history: breadth, extremes, and how 'dumpy' the
+    universe's odds are compared with the last year of sessions."""
+    def col(c):
+        return pd.to_numeric(latest[c], errors="coerce") if c in latest.columns else pd.Series(dtype=float)
+
+    r1 = col("r1")
+    mean_p = float(col("prob_dump").mean()) if len(latest) else None
+    regime_pct, regime = None, None
+    try:
+        hist_means = json.loads(REGIME_PATH.read_text())
+    except (OSError, ValueError):
+        hist_means = {}
+    if hist_means and mean_p is not None:
+        vals = np.array(list(hist_means.values())[-250:], dtype=float)
+        regime_pct = float((vals < mean_p).mean() * 100)
+        regime = "wild" if regime_pct >= 80 else "calm" if regime_pct <= 20 else "normal"
+    return {
+        "breadth_up": _f(col("breadth_up").median()) if "breadth_up" in latest.columns else _f((r1 > 0).mean()),
+        "median_r1": _f(r1.median()),
+        "n_up20": int((r1 >= 0.20).sum()), "n_down20": int((r1 <= -0.20).sum()),
+        "iwm_r1": _f(col("iwm_r1").median()), "iwm_r5": _f(col("iwm_r5").median()),
+        "mean_prob_dump": mean_p,
+        "universe_dump_rate_20d": state.get("universe_dump_rate_20d"),
+        "regime": regime, "regime_pct": regime_pct,
+    }
+
+
+def _sector_block(latest: pd.DataFrame) -> list:
+    df = latest[["sector", "prob_dump"]].copy()
+    df["sector"] = df["sector"].fillna("").replace("", "Other")
+    top100 = set(latest.sort_values("prob_dump", ascending=False).index[:100])
+    out = []
+    for sec_name, g in df.groupby("sector"):
+        if len(g) < 5:
+            continue
+        out.append({"sector": sec_name, "n": int(len(g)), "mean_prob": _f(g["prob_dump"].mean()),
+                    "n_top100": int(sum(1 for s in g.index if s in top100)),
+                    "top": list(g.sort_values("prob_dump", ascending=False).index[:3])})
+    return sorted(out, key=lambda x: -(x["mean_prob"] or 0))
+
+
+def _calendar_block(session: date, latest: pd.DataFrame, hist: dict) -> dict:
+    intel = _intel()
+    earn, locks = [], []
+    if intel is not None:
+        for e in _safe(intel.earnings_ahead, session, 5, default=[]) or []:
+            s = e.get("symbol")
+            e["in_universe"] = s in latest.index
+            e["name"] = e.get("name") or (latest.at[s, "name"] if s in latest.index else None)
+            e["prob_dump"] = _f(latest.at[s, "prob_dump"]) if s in latest.index else None
+            earn.append(e)
+        for lk in _safe(intel.lockups, session, default=[]) or []:
+            s = lk.get("symbol")
+            df = hist.get(s)
+            price = _f(df["close"].iloc[-1]) if df is not None and len(df) else None
+            lk["price"] = price
+            lk["vs_ipo"] = (price / lk["ipo_price"] - 1) if (price and lk.get("ipo_price")) else None
+            lk["prob_dump"] = _f(latest.at[s, "prob_dump"]) if s in latest.index else None
+            locks.append(lk)
+    earn.sort(key=lambda e: (e.get("date") or "", not e["in_universe"], -(e.get("prob_dump") or 0)))
+    locks.sort(key=lambda x: x.get("days_to") if x.get("days_to") is not None else 999)
+    return {"earnings": [e for e in earn if e["in_universe"]][:80], "lockups": locks[:40]}
+
+
+def _write_universe(latest, hist, borrow, borrow_ok, events, splits, rank_of, session, pre, notes) -> None:
+    cols = ["symbol", "name", "price", "market_cap", "prob_dump", "prob_squeeze", "prob_swing", "skew", "score",
+            "board_rank", "ssr", "publishable", "borrow_status", "fee_rate", "available", "squeeze_danger",
+            "sector", "country", "flags", "spark"]
+    rows = []
+    for s, r in latest.iterrows():
+        m = {k: (None if (not isinstance(v, (list, dict)) and pd.isna(v)) else v) for k, v in r.items()}
+        short = score.shortability(s, borrow, borrow_ok)
+        sqd, _ = score.squeeze_danger(m.get("sq_pct"), short, None, None, None, m.get("short_ratio_5d"))
+        _, flags = score.build_reasons(m, pre.get(s), _filings_for(s, events, {})[:8], splits.get(s, []),
+                                       [], short, session, notes.get(s))
+        df = hist.get(s)
+        spark = [round(float(x), 4) for x in df["close"].tail(30)] if df is not None and len(df) else []
+        rows.append([s, m.get("name"), _f(m.get("close")), _f(m.get("market_cap")), _f(m.get("prob_dump")),
+                     _f(m.get("prob_squeeze")), _f(m.get("prob_swing")), _f(m.get("skew")),
+                     None if m.get("score") is None else int(m["score"]), rank_of.get(s),
+                     bool(m.get("ssr")), bool(m.get("publishable")), short["status"], short.get("fee_rate"),
+                     short.get("available"), sqd, m.get("sector"), m.get("country"), flags, spark])
+    rows.sort(key=lambda x: -(x[4] or 0))
+    publish.write_json("universe.json", {"asof": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                         "session_date": session.isoformat(), "columns": cols, "rows": rows})
+
+
+def _f(x: Any) -> Optional[float]:
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return None if (math.isnan(v) or math.isinf(v)) else v
 
 
 def _street_score(a: Optional[dict]) -> Optional[int]:
@@ -716,58 +950,6 @@ def _zone_reason(p: dict) -> str:
     if (parts.get("model") or 0) >= 0.8:
         bits.append("model sees high odds of a +20% intraday spike")
     return "Squeeze danger " + str(p["squeeze_danger"]) + "/100: " + (", ".join(bits) or "multiple crowding signals")
-
-
-def _reference(latest, hist, borrow, borrow_ok, make_pick, rank_of, events, overnight, news, state_splits=None) -> dict:
-    state_splits = state_splits or {}
-    sym = config.REFERENCE_SYMBOL
-    df = hist.get(sym)
-    ref_date = config.REFERENCE_SHORT_DATE
-    ref_price = None
-    if df is not None and len(df):
-        on = df[df.index <= pd.Timestamp(ref_date)]
-        if len(on):
-            ref_price = float(on["close"].iloc[-1])
-    price = float(df["close"].iloc[-1]) if df is not None and len(df) else None
-    pick = make_pick(sym, rank_of.get(sym), with_chart=False) if sym in latest.index else None
-    notes = []
-    if pick and pick["shortability"].get("fee_rate") is not None:
-        notes.append(f"Borrow currently costs about {pick['shortability']['fee_rate']:.0f}% a year at IBKR "
-                     f"(~{pick['shortability']['fee_rate'] / 12:.1f}% of the position per month).")
-    if ref_price and price:
-        notes.append(f"{sym} is {((price / ref_price) - 1) * 100:+.0f}% since {ref_date} "
-                     f"(${ref_price:.2f} → ${price:.2f}); a short from then is up about {(1 - price / ref_price) * 100:.0f}% before fees.")
-    allf = _filings_for(sym, events, overnight)
-    supply = [e for e in allf if e.get("category") in score.SUPPLY_CATS | {"atm"}]
-    if supply:
-        e = supply[0]
-        notes.append(f"Most recent supply filing: {score.CAT_LABEL.get(e['category'], e['category'])} "
-                     f"({e.get('form')}, {e.get('date')}) — the company can keep issuing shares into the market "
-                     f"while it stays effective.")
-    rs = [x for x in state_splits.get(sym, []) if (x.get("ratio") or 1) < 1]
-    if len(rs) >= 2:
-        notes.append(f"{len(rs)} reverse splits on record ({', '.join(score.split_label(x['ratio']) + ' ' + x['date'] for x in rs[-3:])}) — "
-                     f"a pattern that usually comes with repeated dilution.")
-    late = [e for e in allf if e.get("category") == "late_filing"]
-    if late:
-        notes.append(f"Filed a late-filing notice ({late[0].get('form')}) on {late[0].get('date')}.")
-    return {
-        "symbol": sym,
-        "name": (pick or {}).get("name") or "Inno Holdings Inc.",
-        "price": price,
-        "prev_close": price,
-        "short_ref_date": ref_date,
-        "short_ref_price": ref_price,
-        "change_since_ref": (price / ref_price - 1) if (price and ref_price) else None,
-        "chart": score.chart_rows(
-            df[df.index >= pd.Timestamp(ref_date) - pd.Timedelta(days=21)] if df is not None else None, 400),
-        "borrow": score.shortability(sym, borrow, borrow_ok),
-        "pick": pick,
-        "rank": rank_of.get(sym),
-        "filings": _filings_for(sym, events, overnight)[:12],
-        "news": news.get(sym, [])[:8],
-        "notes": notes,
-    }
 
 
 def _ts(x: Any) -> float:
@@ -834,6 +1016,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     m = sub.add_parser("morning")
     m.add_argument("--no-push", action="store_true")
     sub.add_parser("publish")
+    lv = sub.add_parser("live")
+    lv.add_argument("--no-push", action="store_true")
     args = ap.parse_args(argv)
 
     logfile = config.LOGS / f"{date.today().isoformat()}.log"
@@ -844,7 +1028,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     logging.getLogger("yfinance").setLevel(logging.CRITICAL)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
-    cmds = {"train": cmd_train, "evening": cmd_evening, "morning": cmd_morning, "publish": cmd_publish}
+    cmds = {"train": cmd_train, "evening": cmd_evening, "morning": cmd_morning, "publish": cmd_publish, "live": cmd_live}
     return cmds[args.cmd](args)
 
 

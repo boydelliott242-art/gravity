@@ -50,4 +50,31 @@ PL
 
 write_plist com.gravity.morning morning "$(cal 7 20; cal 8 5)"
 write_plist com.gravity.evening evening "$(cal 17 10)"
+# live tape: every 15 minutes (run.sh exits immediately outside 9:30–16:00 ET)
+write_interval() { # label mode seconds
+  cat > "$LA/$1.plist" <<PL
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$1</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/bash</string><string>$ROOT/scripts/run.sh</string><string>$2</string></array>
+  <key>StartInterval</key><integer>$3</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>GRAVITY_ROOT</key><string>$ROOT</string>
+    <key>SEC_USER_AGENT</key><string>$SEC_UA</string>
+  </dict>
+  <key>StandardOutPath</key><string>$ROOT/data/logs/$2.log</string>
+  <key>StandardErrorPath</key><string>$ROOT/data/logs/$2.log</string>
+  <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
+PL
+  launchctl unload "$LA/$1.plist" 2>/dev/null || true
+  launchctl load "$LA/$1.plist"
+  echo "installed $1"
+}
+write_interval com.gravity.live live 900
 write_plist com.gravity.train train '    <dict><key>Weekday</key><integer>6</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>'

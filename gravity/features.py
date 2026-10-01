@@ -67,10 +67,27 @@ FEATURES: List[str] = [
     "iwm_r1", "iwm_r5", "iwm_r20", "breadth_up", "breadth_ma50", "univ_r1_med", "spike_share",
 ]
 
+# FINRA Reg SHO daily short volume (family "flow"), from
+# ``sources.finra_hist``. Always built into the panel (NaN when no
+# ``short_vol`` is passed); part of the model inputs only when
+# ``USE_FINRA`` — they are kept only if walk-forward OOS improves (§14.2).
+FINRA_FEATURES: List[str] = ["sv_ratio_1", "sv_ratio_5", "sv_ratio_20", "sv_ratio_z", "finra_share"]
+USE_FINRA = False
+if USE_FINRA:
+    FEATURES += FINRA_FEATURES
+# Every feature column the panel carries (FEATURES first, stable order).
+PANEL_FEATURES: List[str] = FEATURES + [c for c in FINRA_FEATURES if c not in FEATURES]
+
 # Only known at/after the 9:30 open of t+1 (live proxy = pre-market price).
 M1_EXTRA: List[str] = ["gap_open"]
 
-LABELS: List[str] = ["y_oc", "y_co", "y_gap", "y_ol", "y_oh", "y_c5", "y_dump", "y_bigdump", "y_squeeze"]
+LABELS: List[str] = ["y_oc", "y_co", "y_gap", "y_ol", "y_oh", "y_c5", "y_dump", "y_bigdump", "y_squeeze",
+                     "y_swing", "y_pump", "y_h5"]
+# y_swing = y_c5 ≤ SWING_THRESHOLD (short the next open, cover the close 5 sessions later)
+# y_pump  = y_oc ≥ PUMP_THRESHOLD  (the mirror of a dump: a +5 % open→close day)
+# y_h5    = highest high over t+1..t+5 / O[t+1] − 1 (worst adverse excursion of that swing short)
+SWING_THRESHOLD = float(getattr(config, "SWING_THRESHOLD", -0.15))
+PUMP_THRESHOLD = float(getattr(config, "PUMP_THRESHOLD", 0.05))
 
 # Non-feature columns carried on every row (bars of t, the as-traded price,
 # raw dollar volume, static attributes, and the live-row marker).
@@ -78,6 +95,7 @@ INFO_COLUMNS: List[str] = [
     "date", "symbol", "open", "high", "low", "close", "volume",
     "price", "dvol20", "ipo_year", "is_last_bar",
 ]
+PANEL_COLUMNS: List[str] = INFO_COLUMNS + PANEL_FEATURES + M1_EXTRA + LABELS
 
 # name → (family, plain-English description). The site shows these.
 FEATURE_DOCS: Dict[str, Tuple[str, str]] = {
@@ -157,11 +175,17 @@ FEATURE_DOCS: Dict[str, Tuple[str, str]] = {
     "univ_r1_med": ("market", "Median return of eligible small caps today."),
     "spike_share": ("market", "Share of eligible small caps up 20%+ today (speculative froth)."),
     "gap_open": ("exhaustion", "Next session's opening gap versus today's close (known at 9:30; live proxy = pre-market price)."),
+    "sv_ratio_1": ("flow", "Share of today's FINRA-reported (off-exchange) volume that was sold short (FINRA Reg SHO)."),
+    "sv_ratio_5": ("flow", "FINRA short-volume share over the last 5 sessions (total short ÷ total reported)."),
+    "sv_ratio_20": ("flow", "FINRA short-volume share over the last 20 sessions (total short ÷ total reported)."),
+    "sv_ratio_z": ("flow", "Today's FINRA short-volume share versus its prior 20 sessions, in standard deviations."),
+    "finra_share": ("flow", "FINRA-reported (off-exchange) volume as a share of today's consolidated volume."),
 }
 
-assert set(FEATURE_DOCS) == set(FEATURES) | set(M1_EXTRA), "FEATURE_DOCS out of sync"
+assert set(FEATURE_DOCS) == set(PANEL_FEATURES) | set(M1_EXTRA), "FEATURE_DOCS out of sync"
 assert all(f in FAMILIES for f, _ in FEATURE_DOCS.values())
 assert len(set(FEATURES)) == len(FEATURES)
+assert len(set(PANEL_FEATURES)) == len(PANEL_FEATURES)
 
 # ── Tunables (not in config: only this module needs them) ────────────────
 MIN_PRIOR_BARS = 60              # rows need ≥ 60 bars before t
@@ -563,6 +587,86 @@ def _bench_returns(bench: Optional[pd.DataFrame], dates: np.ndarray) -> Dict[str
     return out
 
 
+def _roll_ratio(B: _Blocks, num: np.ndarray, den: np.ndarray, w: int, min_obs: int) -> np.ndarray:
+    """Σnum / Σden over the trailing ``w`` rows (inclusive), counting only
+    rows where both are known; NaN with fewer than ``min_obs`` such rows."""
+    ok = np.isfinite(num) & np.isfinite(den)
+    sn = B.roll(np.where(ok, num, 0.0), w, "sum", 1)
+    sd = B.roll(np.where(ok, den, 0.0), w, "sum", 1)
+    cnt = B.roll(ok.astype(float), w, "sum", 1)
+    out = _safe_div(sn, sd)
+    out[cnt < min_obs] = np.nan
+    return out
+
+
+FINRA_Z_WINDOW = 20
+FINRA_Z_MIN_OBS = 10
+FINRA_Z_SD_FLOOR = 0.02          # a near-constant short share must not explode the z-score
+
+
+def _finra_features(
+    short_vol: Optional[pd.DataFrame], B: _Blocks, row_key: np.ndarray,
+    code_of: Dict[str, int], vol: np.ndarray, price: np.ndarray, close: np.ndarray,
+) -> Dict[str, np.ndarray]:
+    """FINRA short-volume features (family ``flow``).
+
+    Session ``t``'s FINRA row maps onto panel row ``t`` exactly (same symbol,
+    same date); a symbol/day with no FINRA row is unknown (NaN), not zero.
+    Rolling windows run over the symbol's own rows ≤ t. ``finra_share``
+    compares FINRA's as-traded share count with the as-traded consolidated
+    volume (split-adjusted volume × close / as-traded price).
+    """
+    n = B.n
+    out = {k: np.full(n, np.nan) for k in FINRA_FEATURES}
+    if short_vol is None or not len(short_vol) or not n:
+        return out
+    sv = short_vol
+    need = {"date", "symbol", "short_volume", "total_volume"}
+    if not need.issubset(sv.columns):
+        log.warning("build_panel: short_vol lacks %s — FINRA features NaN", sorted(need - set(sv.columns)))
+        return out
+    codes = sv["symbol"].map(code_of)
+    ok = codes.notna().to_numpy()
+    if not ok.any():
+        return out
+    sv = sv[ok]
+    dday = pd.to_datetime(sv["date"], errors="coerce").to_numpy(dtype="datetime64[D]").astype(np.int64)
+    key = codes[ok].to_numpy(dtype=np.int64) * _KEY_STRIDE + dday
+    s_short = pd.to_numeric(sv["short_volume"], errors="coerce").to_numpy(float)
+    s_total = pd.to_numeric(sv["total_volume"], errors="coerce").to_numpy(float)
+    good = (dday != _NAT_DAY) & np.isfinite(s_short) & np.isfinite(s_total) & (s_short >= 0) & (s_total >= 0)
+    key, s_short, s_total = key[good], s_short[good], s_total[good]
+    pos = np.searchsorted(row_key, key)                       # row_key is strictly increasing
+    hit = (pos < n) & (row_key[np.clip(pos, 0, n - 1)] == key)
+    short = np.full(n, np.nan)
+    total = np.full(n, np.nan)
+    short[pos[hit]] = s_short[hit]
+    total[pos[hit]] = s_total[hit]
+
+    daily = _safe_div(short, total)
+    out["sv_ratio_1"] = daily
+    out["sv_ratio_5"] = _roll_ratio(B, short, total, 5, 3)
+    out["sv_ratio_20"] = _roll_ratio(B, short, total, 20, 12)
+    w = FINRA_Z_WINDOW
+    okd = np.isfinite(daily)
+    d0 = np.where(okd, daily, 0.0)
+    s1 = B.lag(B.roll(d0, w, "sum", 1), 1)                    # prior 20 rows: t−20 .. t−1
+    s2 = B.lag(B.roll(d0 * d0, w, "sum", 1), 1)
+    cnt = B.lag(B.roll(okd.astype(float), w, "sum", 1), 1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = s1 / cnt
+        var = np.maximum(s2 / cnt - mean * mean, 0.0) * cnt / np.maximum(cnt - 1.0, 1.0)
+        z = (daily - mean) / np.maximum(np.sqrt(var), FINRA_Z_SD_FLOOR)
+    z[~(cnt >= FINRA_Z_MIN_OBS)] = np.nan
+    z[~np.isfinite(z)] = np.nan
+    out["sv_ratio_z"] = z
+    traded_vol = _safe_div(vol * close, price)                 # as-traded shares (dollar volume is split-invariant)
+    share = _safe_div(total, traded_vol)
+    share[~(vol > 0)] = np.nan
+    out["finra_share"] = share
+    return out
+
+
 # ── Public API ───────────────────────────────────────────────────────────
 def build_panel(
     hist: Dict[str, pd.DataFrame],
@@ -571,8 +675,9 @@ def build_panel(
     static: pd.DataFrame,
     bench: Optional[pd.DataFrame] = None,
     min_date: Optional[str] = None,
+    short_vol: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
-    """Build the (date, symbol) panel of FEATURES + M1_EXTRA + LABELS.
+    """Build the (date, symbol) panel of PANEL_FEATURES + M1_EXTRA + LABELS.
 
     ``events``: symbol → FilingEvents. A symbol **absent** from ``events``
     gets NaN filing features (unknown, not zero); present with ``[]`` → zeros.
@@ -581,6 +686,11 @@ def build_panel(
     ``ipo_year`` are used. ``bench``: IWM bars (optional → NaN iwm_*).
     ``min_date``: drop output rows before this date (history before it is
     still used as look-back).
+    ``short_vol``: FINRA daily short volume, DataFrame[date, symbol,
+    short_volume, total_volume] (``sources.finra_hist.load``). The file for
+    session ``t`` is published after ``t``'s close, so it is a feature *at*
+    ``t`` (used for the ``t+1`` decision) — like ``t``'s own bar. ``None`` →
+    the FINRA columns are NaN.
     """
     t0 = time.time()
     events = events or {}
@@ -725,6 +835,9 @@ def build_panel(
     # 8) market (bench) — cross-sectional ones come after the row filter
     f.update(_bench_returns(bench, dates))
 
+    # 8b) FINRA short volume (session t's file → row t; never a later file)
+    f.update(_finra_features(short_vol, B, row_key, code_of, vol, price, c))
+
     # 9) labels: session t+1 = next row, only if it is the next market session
     cal_days = _market_calendar(dates, bench).astype("datetime64[D]").astype(np.int64)
     ci = np.searchsorted(cal_days, days)
@@ -766,6 +879,10 @@ def build_panel(
     lab["y_dump"] = np.where(ok1, (lab["y_oc"] <= config.DUMP_THRESHOLD).astype(float), np.nan)
     lab["y_bigdump"] = np.where(ok1, (lab["y_oc"] <= config.BIG_DUMP_THRESHOLD).astype(float), np.nan)
     lab["y_squeeze"] = np.where(ok1, (lab["y_oh"] >= config.SQUEEZE_THRESHOLD).astype(float), np.nan)
+    lab["y_swing"] = np.where(ok5, (lab["y_c5"] <= SWING_THRESHOLD).astype(float), np.nan)
+    lab["y_pump"] = np.where(ok1, (lab["y_oc"] >= PUMP_THRESHOLD).astype(float), np.nan)
+    h5 = np.fmax.reduce([B.lead(rh, k) for k in range(1, 6)])       # NaN-skipping: halted bars have no high
+    lab["y_h5"] = np.where(ok5, h5 / o1 - 1.0, np.nan)
 
     # 10) row filter
     mask = (
@@ -784,7 +901,7 @@ def build_panel(
         "price": price[sel], "dvol20": dvol20[sel], "ipo_year": ipo_year[sel],
         "is_last_bar": (B.idx == B.end_of)[sel],
     }
-    for k in FEATURES:
+    for k in PANEL_FEATURES:
         if k in f:
             out[k] = f[k][sel]
     out["gap_open"] = lab["y_gap"][sel]
@@ -795,9 +912,9 @@ def build_panel(
     # 11) cross-sectional (per date, over the eligible universe that day)
     _cross_sectional(panel)
 
-    for k in FEATURES + M1_EXTRA + LABELS + ["open", "high", "low", "close", "volume", "price", "dvol20", "ipo_year"]:
+    for k in PANEL_FEATURES + M1_EXTRA + LABELS + ["open", "high", "low", "close", "volume", "price", "dvol20", "ipo_year"]:
         panel[k] = panel[k].astype(np.float32)
-    panel = panel[INFO_COLUMNS + FEATURES + M1_EXTRA + LABELS]
+    panel = panel[PANEL_COLUMNS]
     panel.attrs["built_seconds"] = round(time.time() - t0, 2)
     log.info("build_panel: %d symbols, %d rows in, %d rows out (%.1fs)", len(syms), n, len(panel), time.time() - t0)
     return panel
@@ -828,7 +945,7 @@ def _cross_sectional(panel: pd.DataFrame) -> None:
 
 
 def _empty_panel() -> pd.DataFrame:
-    cols = INFO_COLUMNS + FEATURES + M1_EXTRA + LABELS
+    cols = PANEL_COLUMNS
     df = pd.DataFrame({c: pd.Series(dtype=np.float32) for c in cols})
     df["date"] = pd.Series(dtype="datetime64[ns]")
     df["symbol"] = pd.Series(dtype=object)

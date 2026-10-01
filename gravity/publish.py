@@ -20,7 +20,7 @@ from .util import clean
 
 log = logging.getLogger(__name__)
 
-DATA_PATH = "docs/data"
+DATA_PATHS = ("docs/data", "docs/feed.xml")
 
 
 def write_json(name: str, obj: Any) -> Path:
@@ -70,7 +70,7 @@ def _unsafe_state() -> Optional[str]:
 
 
 def push(message: str) -> bool:
-    """Commit docs/data and push. True only when origin/main == local HEAD."""
+    """Commit docs/data (+ feed.xml) and push. True only when origin/main == local HEAD."""
     try:
         why = _unsafe_state()
         if why:
@@ -84,10 +84,11 @@ def push(message: str) -> bool:
             _notify("Publish refused: GitHub has commits this Mac doesn't. Needs a manual pull.")
             return False
 
-        _git("add", "--", DATA_PATH)
-        staged = _git("diff", "--cached", "--quiet", "--", DATA_PATH, check=False).returncode != 0
+        paths = [x for x in DATA_PATHS if (config.ROOT / x).exists()]
+        _git("add", "--", *paths)
+        staged = _git("diff", "--cached", "--quiet", "--", *paths, check=False).returncode != 0
         if staged:
-            _git("commit", "-q", "-m", message, "--", DATA_PATH)
+            _git("commit", "-q", "-m", message, "--", *paths)
         ahead = int(_git("rev-list", "--count", "origin/main..HEAD", check=False).stdout.strip() or 0) if has_remote else 1
         if not ahead:
             log.info("publish: nothing new to push")

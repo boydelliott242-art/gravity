@@ -1,4 +1,4 @@
-"""INHD lookalikes — names whose *profile* resembles the reference short.
+"""Lookalikes — names whose *profile* resembles today's #1.
 
 Similarity is a weighted distance on robust-standardised profile traits
 (size, price, reverse-split habit, drawdown, dilution cadence, geography,
@@ -58,11 +58,11 @@ def profile_frame(rows: pd.DataFrame, session_year: int) -> pd.DataFrame:
 
 
 def find_twins(
-    rows: pd.DataFrame, ref: str = config.REFERENCE_SYMBOL, k: int = config.TWINS_SIZE,
+    rows: pd.DataFrame, ref: Optional[str] = None, k: int = config.TWINS_SIZE,
     session_year: int = 2026,
 ) -> List[dict]:
     """Return the k most similar symbols to ``ref`` (excluding itself)."""
-    if ref not in rows.index:
+    if not ref or ref not in rows.index:
         return []
     prof = profile_frame(rows, session_year)
     z = prof.apply(_robust_z)

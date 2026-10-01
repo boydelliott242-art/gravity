@@ -106,11 +106,16 @@ def _studies() -> List[Dict[str, Any]]:
              lead="For Asia-linked issuers within two years of their IPO",
              mask=lambda p: (_col(p, "asia") == 1) & (_col(p, "ipo_age") <= 2),
              defined=has("asia", "ipo_age")),
-        dict(id="inhd_profile", title="INHD profile",
+        dict(id="serial_rs", title="Serial reverse-splitter",
              condition="asia = 1, ≥ 2 reverse splits in 2 years, 52-week drawdown > 90%",
-             lead="For INHD-like names (Asia-linked, two or more reverse splits in two years, down 90%+ from the high)",
+             lead="For serial reverse-splitters (Asia-linked, two or more reverse splits in two years, down 90%+ from the high)",
              mask=lambda p: (_col(p, "asia") == 1) & (_col(p, "rs_count_2y") >= 2) & (_col(p, "dd_52w") < -0.90),
              defined=has("asia", "rs_count_2y", "dd_52w")),
+        dict(id="lockup_180", title="IPO lock-up window (day ~180)",
+             condition="170–190 calendar days after the first trading day, for names that listed after 2024-01-15",
+             lead="In the lock-up expiry window — about 180 days after listing, when insiders may start selling",
+             mask=lambda p: (_col(p, "days_listed") >= 170) & (_col(p, "days_listed") <= 190),
+             defined=has("days_listed")),
     ]
     return out
 
@@ -163,6 +168,7 @@ def _stats(sub: pd.DataFrame) -> Dict[str, Any]:
         "pct_bigdump": mean(_col(sub, "y_bigdump")),
         "pct_squeeze": mean(_col(sub, "y_squeeze")),
         "pct_up5": mean((oc >= 0.05).astype(float).where(oc.notna())),
+        "pct_swing": mean(_col(sub, "y_swing")),
         "median_oc": med(oc),
         "mean_oc": mean(oc),
         "median_c5": med(c5),
@@ -203,12 +209,18 @@ def _sentence(lead: str, st: Dict[str, Any], ref: Optional[float], same_day: boo
     )
 
 
-def run_studies(panel: pd.DataFrame, n_boot: int = N_BOOT, seed: int = SEED) -> Dict[str, Any]:
+def run_studies(panel: pd.DataFrame, n_boot: int = N_BOOT, seed: int = SEED,
+                listing_dates: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Baseline + event studies (CONTRACTS §9). Written by the caller to
-    docs/data/evidence.json."""
+    docs/data/evidence.json. ``listing_dates`` (symbol → first trading day)
+    enables the IPO lock-up study for names that listed inside the data."""
     rng = np.random.default_rng(seed)
     lab = panel[_col(panel, "y_oc").notna() & _col(panel, "y_dump").notna()] if len(panel) else panel
     lab = lab.reset_index(drop=True)
+    if listing_dates and len(lab):
+        first = pd.to_datetime(lab["symbol"].map(listing_dates))
+        recent = first > pd.Timestamp("2024-01-15")
+        lab = lab.assign(days_listed=((pd.to_datetime(lab["date"]) - first).dt.days).where(recent))
     day = pd.to_datetime(lab["date"]) if len(lab) else pd.Series([], dtype="datetime64[ns]")
     codes, uniq = pd.factorize(day, sort=True)
     n_days = len(uniq)

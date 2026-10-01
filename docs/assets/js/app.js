@@ -1,37 +1,43 @@
 /**
  * GRAVITY — site controller.
  *
- * Reads the four static feeds (today, model, evidence, scorecard) written by
- * the pipeline (CONTRACTS.md §11–13), renders every section, and wires the
- * board, the dossier drawer and the private INHD calculator.
+ * Reads the static feeds written by the pipeline (CONTRACTS.md §11–14:
+ * today, model, evidence, scorecard, plus the optional live tape and the
+ * full-universe lookup), renders every section, and wires the board, the
+ * lookup table and the dossier drawer.
  *
  * Honesty: every missing value renders as "—"; nothing is imputed, rounded
  * into a different claim, or invented here. Probabilities always sit next to
- * the base rate they should be read against.
+ * the base rate they should be read against. A section whose field is absent
+ * from the feed is hidden or says so — it never fills in.
  */
 
 import {
   DASH, isNum, esc, safeUrl, extLink, pct, pctUnits, price, compact, money, fixed, signedMoney,
   parseDay, fmtDay, parseTs, fmtTimeET, fmtStamp, etDate, ago, daysBetween, marketPhaseNow,
-  CAT_LABEL, SUPPLY_CATS, humanize, ASIA, $, $$, prefersReducedMotion, fallbackLinks, store,
+  CAT_LABEL, SUPPLY_CATS, humanize, ASIA, $, $$, prefersReducedMotion, fallbackLinks,
 } from './util.js';
 import {
   sparkline, probBar, familyBars, squeezeMeter, severity, priceChart, equityChart,
-  calibrationChart, whisker, FAMILIES, FAMILY_LABEL, FAMILY_HELP,
+  calibrationChart, whisker, miniLine, intradayChart, sparkCloses, FAMILIES, FAMILY_LABEL, FAMILY_HELP,
+  ATTR_FAMILIES, ATTR_LABEL, ATTR_HELP,
 } from './charts.js';
 import { mountField } from './field.js';
 
 const LWC_URL = 'https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js';
 const LWC_SRI = 'sha384-OK7vELvjHdhUFi31JYioPIcRHTROLdcDa6ZsNWgvgLaKj+9JqhU0Ad8g4wz3CXjA';
-const CALC_KEY = 'gravity:inhd-calc:v1';
 const WIRE_SHOW = 14;
 const DAYS_SHOW = 20;
+const LOOKUP_PAGE = 50;
+const LIVE_POLL_MS = 5 * 60e3;
 
 const S = {
   today: null,
   model: null,
   evidence: null,
   scorecard: null,
+  live: null,
+  liveAt: 0,
   errors: {},
   base: null,
   sample: false,
@@ -42,7 +48,9 @@ const S = {
   filters: new Set(),
   tab: 'm0',
   field: null,
-  disposers: { record: [], position: [] },
+  disposers: { record: [], live: [] },
+  uni: { status: 'idle', rows: [], bySym: new Map(), asof: null, session: null, fallback: false },
+  look: { q: '', sort: 'prob', dir: -1, page: 0, filters: new Set() },
 };
 
 /* ── small helpers ─────────────────────────────────────────────────────── */
@@ -223,20 +231,6 @@ async function getJSON(name) {
   }
 }
 
-function refRecord(ref) {
-  const p = ref.pick ? { ...ref.pick } : {
-    symbol: ref.symbol, name: ref.name, price: ref.price, prev_close: ref.prev_close,
-    shortability: ref.borrow, flags: [], reasons: [], families: null, metrics: null,
-    links: null, premarket: null, street: null,
-  };
-  if (!arr(p.chart).length) p.chart = arr(ref.chart);
-  if (!arr(p.filings).length) p.filings = arr(ref.filings);
-  if (!arr(p.news).length) p.news = arr(ref.news);
-  if (!p.shortability) p.shortability = ref.borrow;
-  p._noModel = !ref.pick;
-  return p;
-}
-
 function indexRecords() {
   S.recs.clear();
   const t = S.today || {};
@@ -246,21 +240,24 @@ function indexRecords() {
   arr(t.board).forEach((p) => put(p, { where: 'board' }));
   if (t.top) put(t.top, { where: 'board' });
   arr(t.squeeze_zone).forEach((p) => put(p, { where: 'zone' }));
-  arr(t.twins).forEach((tw) => { if (tw && tw.pick) put(tw.pick, { where: 'twin' }); });
-  arr(t.twins).forEach((tw) => {
-    const r = tw && S.recs.get(tw.symbol);
-    if (r) r.twin = tw;
-  });
-  const ref = t.reference;
-  if (ref && ref.symbol) {
-    const r = S.recs.get(ref.symbol);
-    if (r) {
-      r.ref = ref;
-      if (!arr(r.pick.chart).length) r.pick = { ...r.pick, chart: arr(ref.chart) };
-    } else {
-      S.recs.set(ref.symbol, { pick: refRecord(ref), where: 'ref', ref });
-    }
+  arr(t.swing_board).forEach((p) => put(p, { where: 'swing' }));
+  if (twinsAnchor()) {
+    arr(t.twins).forEach((tw) => { if (tw && tw.pick) put(tw.pick, { where: 'twin' }); });
+    arr(t.twins).forEach((tw) => {
+      const r = tw && S.recs.get(tw.symbol);
+      if (r) r.twin = tw;
+    });
   }
+  arr(t.swing_board).forEach((p) => {
+    const r = p && S.recs.get(p.symbol);
+    if (r && r.where !== 'swing') r.swing = p;
+  });
+}
+
+/** The #1 the lookalikes were measured against — only feeds that say so (§14) get a twins section. */
+function twinsAnchor() {
+  const a = S.today && S.today.twins_anchor;
+  return typeof a === 'string' && a ? a : null;
 }
 
 /* ── top bar & banners ─────────────────────────────────────────────────── */
@@ -442,6 +439,9 @@ function renderHero() {
     ? 'M1 reading — uses the pre-market price as the expected open'
     : top.model_used === 'm0' ? 'M0 reading — close-only features (no pre-market print)' : 'Model version not reported';
 
+  const aboutNote = `${esc(modelLine)}. Features as of the close on ${esc(fmtDay(t.features_asof, { year: true }))}.${isNum(top.score) ? (top.score >= 100 ? (t.top_tie_count > 1 ? ` Tied with ${esc(int(t.top_tie_count - 1))} other name${t.top_tie_count > 2 ? 's' : ''} for the highest odds of the ${esc(int(scored))} scored — ties are ordered by the model's raw score.` : ` The highest odds of the ${esc(int(scored))} names scored today.`) : ` Higher odds than ${esc(top.score)}% of the ${esc(int(scored))} names scored today.`) : ''}${backtestLine(top.model_used)}${isNum(top.rank) && top.rank > 1 ? ` The ${top.rank - 1} higher-ranked board name${top.rank > 2 ? 's are' : ' is'} skipped because ${top.rank > 2 ? 'they are' : 'it is'} under the Rule 201 short-sale restriction today or trade under $300K a day — the rule the backtest measured.` : ''}`;
+  const weighed = attributionBars(top.attribution);
+
   setHTML(body, `
     <dl class="hstats reveal">
       ${stat('Squeeze odds', esc(pct(top.prob_squeeze, 0)), esc(isNum(obj(obj(S.model).base_rate).squeeze) ? `P(+20% above the open) · ${fixed(top.prob_squeeze / S.model.base_rate.squeeze, 1)}× normal — dump odds and squeeze odds rise together` : 'P(+20% above the open), same session'))}
@@ -449,6 +449,7 @@ function renderHero() {
       ${stat('Borrow', esc(sh.status === 'NONE' ? 'None' : sh.status === 'ETB' || sh.status === 'HTB' ? sh.status : DASH), shNote)}
       ${stat('Squeeze danger', squeezeMeter(top.squeeze_danger, { large: true }), esc(sqNote))}
     </dl>
+    ${heroSub(top)}
     <div class="hero-cols">
       <div class="reveal">
         <p class="eyebrow" style="margin-bottom:16px">What stands out — rule-based context, not the model's own reasoning</p>
@@ -460,13 +461,58 @@ function renderHero() {
       </div>
       <aside class="reveal" aria-label="${sym} at a glance">
         <div class="side-block"><p class="eyebrow">Flags</p>${flagChips(top.flags)}</div>
+        ${weighed ? `<div class="side-block"><p class="eyebrow">What the model weighed</p>${weighed}<p class="note" style="margin-top:8px">Share of today's reading that disappears when each family is swapped for a typical name's values. Describes the model, not the company.</p></div>` : ''}
         <div class="side-block"><p class="eyebrow">Research ${sym} elsewhere</p>${linksRow(top)}</div>
         <div class="side-block">
           <p class="eyebrow">About this reading</p>
-          <p class="note">${esc(modelLine)}. Features as of the close on ${esc(fmtDay(t.features_asof, { year: true }))}.${isNum(top.score) ? (top.score >= 100 ? (t.top_tie_count > 1 ? ` Tied with ${esc(int(t.top_tie_count - 1))} other name${t.top_tie_count > 2 ? 's' : ''} for the highest odds of the ${esc(int(scored))} scored — ties are ordered by the model's raw score.` : ` The highest odds of the ${esc(int(scored))} names scored today.`) : ` Higher odds than ${esc(top.score)}% of the ${esc(int(scored))} names scored today.`) : ''}${isNum(top.inhd_similarity) ? ` ${esc(pct(top.inhd_similarity))} similar to INHD.` : ''}${backtestLine(top.model_used)}${isNum(top.rank) && top.rank > 1 ? ` The ${top.rank - 1} higher-ranked board name${top.rank > 2 ? 's are' : ' is'} skipped because ${top.rank > 2 ? 'they are' : 'it is'} under the Rule 201 short-sale restriction today or trade under $300K a day — the rule the backtest measured.` : ''}</p>
+          <p class="note">${aboutNote}</p>
         </div>
       </aside>
     </div>`);
+}
+
+/** Base rate for a target from model.json (dump/squeeze/swing/pump), or null. */
+function baseOf(k) {
+  const b = obj(obj(S.model).base_rate)[k];
+  if (isNum(b)) return b;
+  const sw = swingReport();
+  if (k === 'swing' && isNum(sw.base_rate)) return sw.base_rate;
+  return null;
+}
+
+/** "62% of its big-move odds point down" — the downside share of the two big-move odds. */
+function skewChip(skew, { lead = '' } = {}) {
+  if (!isNum(skew)) return '';
+  const down = skew >= 0.5;
+  const title = 'skew = dump odds ÷ (dump odds + odds of a +5% open→close rise)';
+  return `<span class="chip${down ? ' chip--red' : ''}" title="${esc(title)}">${esc(`${lead}${pct(skew)} of its big-move odds point down`)}</span>`;
+}
+
+function heroSub(p) {
+  const bits = [];
+  const sw = p.prob_swing;
+  const bs = baseOf('swing');
+  if (isNum(sw)) {
+    bits.push(`<p class="hero-sub__line"><span class="eyebrow">5-session swing</span><b>${esc(pct(sw))}</b> odds it closes 15%+ below the next open five sessions from now${isNum(bs) ? ` · ${esc(liftTxt(sw / bs))} the ${esc(pct(bs, 1))} base rate` : ''}</p>`);
+  }
+  if (isNum(p.prob_pump)) {
+    bits.push(`<p class="hero-sub__line"><span class="eyebrow">Pump odds</span><b>${esc(pct(p.prob_pump))}</b> odds of a 5%+ rise open→close instead${isNum(baseOf('pump')) ? ` · base ${esc(pct(baseOf('pump'), 1))}` : ''}</p>`);
+  }
+  const chip = skewChip(p.skew);
+  if (!chip && !bits.length) return '';
+  return `<div class="hero-sub reveal">${chip ? `<div class="hero-sub__chip">${chip}</div>` : ''}${bits.join('')}</div>`;
+}
+
+/** Normalised attribution {family: 0–1} → hbars with plain labels, biggest first. */
+function attributionBars(attr, { max = 6 } = {}) {
+  const a = obj(attr);
+  const items = Object.entries(a)
+    .filter(([, v]) => isNum(v) && v > 0)
+    .sort((x, y) => y[1] - x[1])
+    .slice(0, max)
+    .map(([k, v], i) => ({ label: ATTR_LABEL[k] || humanize(k), v, hot: i === 0, fmt: (x) => pct(x), title: ATTR_HELP[k] || '' }));
+  if (!items.length) return '';
+  return hbars(items, 1, { cls: 'hbars--mini' });
 }
 
 /* ── board ─────────────────────────────────────────────────────────────── */
@@ -650,181 +696,7 @@ function renderWire() {
   root.innerHTML = html;
 }
 
-/* ── INHD position + calculator ────────────────────────────────────────── */
-function renderPosition() {
-  const root = $('#position-root');
-  if (!root) return;
-  dispose(S.disposers.position);
-  const t = S.today;
-  const ref = t && t.reference;
-  if (!ref) { root.innerHTML = empty('No reference position in this feed.'); return; }
-  const sym = esc(ref.symbol || 'INHD');
-  const pick = ref.pick;
-  const sh = obj(ref.borrow);
-  const lb = lastBar(ref.chart);
-  const chg = ref.change_since_ref;
-  const refDay = fmtDay(ref.short_ref_date, { weekday: false, year: true });
-  const odds = pick
-    ? stat('Dump odds today', esc(pct(pick.prob_dump)), esc(isNum(ref.rank) ? `Board #${ref.rank}` : 'Not on the board'))
-    : stat('Dump odds today', DASH, 'No model reading in this feed');
-  root.innerHTML = `
-    <div class="pos-grid">
-      <div class="reveal">
-        ${S.sample ? '<p class="placeholder-tag">Placeholder values — sample mode</p>' : ''}
-        <p class="pos-ticker"><button type="button" data-open="${sym}">${sym}<span class="sr-only">, open the dossier</span></button></p>
-        <p class="pos-name">${txt(ref.name)}</p>
-        <p class="pos-change">${esc(pct(chg, 0, true))}</p>
-        <p>Price change since your short reference on ${esc(refDay)} (${esc(price(ref.short_ref_price))} → ${esc(price(ref.price))}${lb ? `, close ${esc(fmtDay(lb[0], { weekday: false }))}` : ''}). A fall is a gain for a short.</p>
-      </div>
-      <div class="chart-box reveal">
-        <div class="chart" id="pos-chart"></div>
-        ${S.sample ? '<div class="ph-over" aria-hidden="true">Placeholder</div>' : ''}
-      </div>
-    </div>
-    <dl class="stats-row reveal">
-      ${stat('Last close', esc(price(ref.price)), esc(lb ? fmtDay(lb[0], { weekday: false }) : ''))}
-      ${stat('Short reference', esc(price(ref.short_ref_price)), esc(fmtDay(ref.short_ref_date, { weekday: false })))}
-      ${stat('Short gain', esc(isNum(chg) ? pct(-chg, 1, true) : DASH), 'Per share, before fees')}
-      ${stat('Borrow fee', esc(isNum(sh.fee_rate) ? `${pctUnits(sh.fee_rate, 1)}/yr` : DASH), esc(STATUS_LABEL[sh.status] || 'Status unknown'))}
-      ${stat('Available', esc(compact(sh.available)), esc(`Shares at IBKR${sh.asof ? ` · ${fmtStamp(sh.asof)}` : ''}`))}
-      ${odds}
-    </dl>
-    <div class="pos-lower">
-      <div class="reveal">
-        <div class="side-block"><p class="eyebrow">Notes</p>${arr(ref.notes).length ? `<ul class="notes">${arr(ref.notes).map((n) => `<li>${esc(n)}</li>`).join('')}</ul>` : empty('No notes this run.')}</div>
-        <div class="side-block"><p class="eyebrow">Filings</p>${filingTable(ref.filings)}</div>
-      </div>
-      <div class="reveal">
-        <div class="side-block"><p class="eyebrow">Headlines</p>${newsList(ref.news)}</div>
-        <div class="side-block"><p class="eyebrow">Research ${sym}</p>${linksRow(pick || { symbol: ref.symbol || 'INHD' })}</div>
-        <div class="side-block"><button class="btn" type="button" data-open="${sym}">Open the ${sym} dossier</button></div>
-      </div>
-    </div>
-    ${calcHTML(ref)}`;
-  const el = $('#pos-chart');
-  if (el) {
-    S.disposers.position.push(priceChart(el, ref.chart, {
-      marker: ref.short_ref_date ? { date: ref.short_ref_date, label: `Short ref ${fmtDay(ref.short_ref_date, { weekday: false })}` } : null,
-      ref: isNum(ref.short_ref_price) ? { price: ref.short_ref_price } : null,
-      height: 320,
-      label: `${ref.symbol || 'INHD'} daily closes with the short reference marked`,
-    }));
-  }
-  wireCalc(ref);
-}
-
-function calcHTML(ref) {
-  const hint = isNum(ref.short_ref_price) && ref.short_ref_date
-    ? `<button type="button" class="btn btn--quiet" data-calc="ref">Use the reference (${esc(price(ref.short_ref_price))}, ${esc(fmtDay(ref.short_ref_date, { weekday: false }))})</button>`
-    : '';
-  return `
-    <form class="calc reveal" id="calc" novalidate autocomplete="off" aria-labelledby="calc-title">
-      <div>
-        <h3 id="calc-title">Your P&amp;L</h3>
-        <p class="lede">Private. What you type stays in this browser's local storage and is never sent anywhere. Marked at the last close; the borrow cost is an estimate.</p>
-        <div class="field-row">
-          <div class="field"><label class="eyebrow" for="calc-entry">Entry price ($)</label><input id="calc-entry" name="entry" type="number" inputmode="decimal" min="0" step="any" placeholder="${esc(isNum(ref.short_ref_price) ? ref.short_ref_price.toFixed(2) : '0.00')}" aria-describedby="calc-msg"></div>
-          <div class="field"><label class="eyebrow" for="calc-shares">Shares short</label><input id="calc-shares" name="shares" type="number" inputmode="numeric" min="1" step="1" placeholder="1000" aria-describedby="calc-msg"></div>
-          <div class="field"><label class="eyebrow" for="calc-date">Entry date</label><input id="calc-date" name="date" type="date" max="${esc(etDate())}" aria-describedby="calc-msg"></div>
-        </div>
-        <div class="calc-actions">${hint}<button type="button" class="btn btn--quiet" data-calc="clear">Clear</button><p class="note" id="calc-msg" aria-live="polite"></p></div>
-      </div>
-      <dl class="calc-out" id="calc-out" aria-live="polite"></dl>
-    </form>`;
-}
-
-function wireCalc(ref) {
-  const form = $('#calc');
-  if (!form) return;
-  const f = { entry: $('#calc-entry'), shares: $('#calc-shares'), date: $('#calc-date') };
-  const saved = store.get(CALC_KEY);
-  if (saved && typeof saved === 'object') {
-    if (saved.entry != null) f.entry.value = String(saved.entry);
-    if (saved.shares != null) f.shares.value = String(saved.shares);
-    if (saved.date) f.date.value = String(saved.date);
-  }
-  const canStore = store.available();
-  const update = (persist) => {
-    const vals = { entry: f.entry.value.trim(), shares: f.shares.value.trim(), date: f.date.value };
-    if (persist && canStore) {
-      if (vals.entry || vals.shares || vals.date) store.set(CALC_KEY, vals);
-      else store.remove(CALC_KEY);
-    }
-    calcCompute(ref, f, canStore);
-  };
-  form.addEventListener('input', () => update(true));
-  form.addEventListener('submit', (e) => e.preventDefault());
-  form.addEventListener('click', (e) => {
-    const b = e.target.closest('[data-calc]');
-    if (!b) return;
-    if (b.dataset.calc === 'clear') {
-      f.entry.value = '';
-      f.shares.value = '';
-      f.date.value = '';
-      store.remove(CALC_KEY);
-      update(false);
-      f.entry.focus();
-    } else if (b.dataset.calc === 'ref') {
-      if (isNum(ref.short_ref_price)) f.entry.value = String(ref.short_ref_price);
-      if (ref.short_ref_date) f.date.value = ref.short_ref_date;
-      update(true);
-      f.shares.focus();
-    }
-  });
-  update(false);
-}
-
-function calcCompute(ref, f, canStore) {
-  const out = $('#calc-out');
-  const msg = $('#calc-msg');
-  if (!out) return;
-  const entry = f.entry.value === '' ? null : Number(f.entry.value);
-  const shares = f.shares.value === '' ? null : Number(f.shares.value);
-  const d = f.date.value || null;
-  const today = etDate();
-  const bad = {
-    entry: entry != null && !(Number.isFinite(entry) && entry > 0),
-    shares: shares != null && !(Number.isFinite(shares) && shares > 0),
-    date: d != null && (!parseDay(d) || d > today),
-  };
-  Object.entries(bad).forEach(([k, v]) => f[k].setAttribute('aria-invalid', String(v)));
-  const problems = [];
-  if (bad.entry) problems.push('entry price must be above 0');
-  if (bad.shares) problems.push('shares must be above 0');
-  if (bad.date) problems.push('entry date can’t be in the future');
-  const notes = [];
-  if (problems.length) notes.push(`Check: ${problems.join('; ')}.`);
-  if (!canStore) notes.push('Storage is blocked in this browser, so these numbers won’t be remembered.');
-  if (S.sample) notes.push('Sample mode: marked to a placeholder price, not a quote.');
-  if (msg) msg.textContent = notes.join(' ');
-
-  const mark = isNum(ref.price) ? ref.price : null;
-  const lb = lastBar(ref.chart);
-  const fee = obj(ref.borrow).fee_rate;
-  if (entry == null || shares == null || bad.entry || bad.shares) {
-    out.innerHTML = `<div class="wide"><dt class="eyebrow">Result</dt><dd class="calc-hint">Enter your entry price and share count to see the P&amp;L.</dd></div>`;
-    return;
-  }
-  if (mark == null) {
-    out.innerHTML = `<div class="wide"><dt class="eyebrow">Result</dt><dd class="calc-hint">No ${esc(ref.symbol || 'INHD')} price in this feed, so nothing can be marked.</dd></div>`;
-    return;
-  }
-  const pnl = (entry - mark) * shares;
-  const ret = (entry - mark) / entry;
-  const days = d && !bad.date ? daysBetween(d, today) : null;
-  const cost = isNum(fee) && isNum(days) ? (fee / 100) * mark * shares * (days / 360) : null;
-  const net = isNum(cost) ? pnl - cost : null;
-  const costNote = !d || !isNum(days)
-    ? 'Add a valid entry date to estimate borrow'
-    : !isNum(fee)
-      ? 'Fee not reported this run'
-      : `${pctUnits(fee, 1)}/yr × ${days} day${days === 1 ? '' : 's'} ÷ 360 on today's value. Estimate only: IBKR charges daily and the fee moves.`;
-  out.innerHTML = `
-    <div><dt class="eyebrow">P&amp;L before fees</dt><dd>${esc(signedMoney(pnl))}</dd><small>Marked at ${esc(price(mark))}${lb ? `, close ${esc(fmtDay(lb[0], { weekday: false }))}` : ''}</small></div>
-    <div><dt class="eyebrow">Return</dt><dd>${esc(pct(ret, 1, true))}</dd><small>On the ${esc(money(entry * shares))} you shorted</small></div>
-    <div><dt class="eyebrow">Est. borrow cost</dt><dd>${isNum(cost) ? esc(signedMoney(-cost)) : DASH}</dd><small>${esc(costNote)}</small></div>
-    <div><dt class="eyebrow">Net, estimated</dt><dd>${isNum(net) ? esc(signedMoney(net)) : DASH}</dd><small>P&amp;L minus estimated borrow; excludes commissions</small></div>`;
-}
+/*__NEW_SECTIONS__*/
 
 /* ── twins ─────────────────────────────────────────────────────────────── */
 function renderTwins() {
@@ -890,9 +762,10 @@ function renderSqueeze() {
 }
 
 /* ── track record ──────────────────────────────────────────────────────── */
-function hbars(items, max) {
+function hbars(items, max, { cls = '', base = null } = {}) {
   const m = max || Math.max(0.01, ...items.map((x) => x.v).filter(isNum));
-  return `<ul class="hbars">${items.map((x) => `<li class="${x.hot ? 'hot' : ''}"><span>${esc(x.label)}</span><span class="b" aria-hidden="true">${isNum(x.v) ? `<i style="width:${(Math.max(0, Math.min(1, x.v / m)) * 100).toFixed(1)}%"></i>` : ''}</span><span class="v">${esc(x.fmt ? x.fmt(x.v) : pct(x.v, 1))}</span></li>`).join('')}</ul>`;
+  const tick = isNum(base) ? `<span class="base" style="left:${(Math.max(0, Math.min(1, base / m)) * 100).toFixed(1)}%"></span>` : '';
+  return `<ul class="hbars${cls ? ` ${cls}` : ''}">${items.map((x) => `<li class="${x.hot ? 'hot' : ''}"${x.title ? ` title="${esc(x.title)}"` : ''}><span>${x.html || esc(x.label)}</span><span class="b" aria-hidden="true">${isNum(x.v) ? `<i style="width:${(Math.max(0, Math.min(1, x.v / m)) * 100).toFixed(1)}%"></i>` : ''}${tick}</span><span class="v">${esc(x.fmt ? x.fmt(x.v) : pct(x.v, 1))}</span></li>`).join('')}</ul>`;
 }
 
 function liveBlock(sc) {
@@ -939,9 +812,24 @@ function backtestBlock(m) {
         ${stat('Win rate', esc(pct(isNum(sim.pub_win_rate) ? sim.pub_win_rate : sim.win_rate)), esc(`days the short made money, after ${pct(cost, 0)} cost`))}
         ${stat('Risking 10% a day', esc(isNum(obj(sim.compounded_pub).final_multiple) ? `${fixed(sim.compounded_pub.final_multiple, 2)}×` : DASH), esc(isNum(obj(sim.compounded_pub).max_drawdown_pct) ? `compounded; worst drawdown −${pct(sim.compounded_pub.max_drawdown_pct, 0)}; worst day ${pct(sim.pub_worst_day, 0, true)}` : 'compounded equity multiple'))}
       </dl>
+      ${swingTiles()}
       ${nDays ? '<div class="chart" id="eq-chart"></div><div class="legend"><span><i></i>Published rule, net</span><span><i class="g"></i>Raw #1 (incl. Rule 201 names), net</span></div>' : empty('No simulated days in this report.')}
     </div>
   </div>`;
+}
+
+function swingTiles() {
+  const sw = swingReport();
+  if (!isNum(sw.top1_hit) && !isNum(sw.pub1_hit)) return '';
+  const sim = obj(sw.sim_pub && Object.keys(obj(sw.sim_pub)).length ? sw.sim_pub : sw.sim);
+  const bs = isNum(sw.base_rate) ? sw.base_rate : baseOf('swing');
+  return `<p class="eyebrow" style="margin:8px 0 0">5-session swing · short the swing #1 at the next open, cover at the fifth close</p>
+    <dl class="tiles">
+      ${stat('Fell 15%+', esc(pct(isNum(sw.pub1_hit) ? sw.pub1_hit : sw.top1_hit)), esc(`average name ${pct(bs, 1)}`))}
+      ${stat('Average 5-session move', esc(pct(isNum(sw.pub1_mean_c5) ? sw.pub1_mean_c5 : sw.top1_mean_c5, 1, true)), esc(`median ${pct(isNum(sw.pub1_median_c5) ? sw.pub1_median_c5 : sw.top1_median_c5, 1, true)}`))}
+      ${stat('Win rate', esc(pct(sim.win_rate)), 'non-overlapping trades, after cost')}
+      ${stat('Worst trade', esc(pct(isNum(sim.worst_trade) ? sim.worst_trade : sim.worst, 0, true)), esc(isNum(sim.n_trades) ? `${int(sim.n_trades)} trades` : 'short return'))}
+    </dl>`;
 }
 
 function modelDetail(m) {
@@ -1107,10 +995,353 @@ function renderEvidence() {
           <span><b>${esc(isBase ? '1.0×' : liftTxt(s.lift_dump))}</b>vs all names</span>
           <span><b>${esc(pct(s.median_oc, 1, true))}</b>median open→close</span>
           ${isNum(s.pct_up5) ? `<span><b>${esc(pct(s.pct_up5, 1))}</b>ran UP 5%+ instead</span>` : ''}
+          ${isNum(s.pct_swing) ? `<span><b>${esc(pct(s.pct_swing, 1))}</b>fell 15%+ within 5 sessions</span>` : ''}
           ${!isBase && s.skew ? `<span><b>${esc(s.skew === 'down' ? 'Down' : s.skew === 'up' ? 'Up' : 'Both ways')}</b>which way it tilts</span>` : ''}
         </div>
       </article>`;
     }).join('')}</div>`;
+}
+
+/* ── swing report (model.json) ─────────────────────────────────────────── */
+function swingReport() {
+  const sw = obj(obj(S.model).swing);
+  return obj(sw[S.tab] || sw.m0);
+}
+
+/* ── live tape (docs/data/live.json, ~every 15 min in session) ─────────── */
+function liveFresh() {
+  const L = S.live;
+  const t = S.today;
+  return L && t && L.session_date && L.session_date === t.session_date ? L : null;
+}
+
+function renderLive() {
+  const sec = $('#live');
+  const root = $('#live-root');
+  if (!sec || !root) return;
+  S.disposers.live.forEach((d) => { try { d(); } catch { /* ignore */ } });
+  S.disposers.live = [];
+  const L = liveFresh();
+  sec.hidden = !L;
+  if (!L) { root.innerHTML = ''; return; }
+  const top = L.top;
+  const rows = arr(L.board).filter((r) => r && r.symbol)
+    .slice().sort((a, b) => (isNum(a.oc_now) ? a.oc_now : 9) - (isNum(b.oc_now) ? b.oc_now : 9));
+  const down5 = rows.filter((r) => isNum(r.oc_now) && r.oc_now <= -0.05).length;
+  const tk = (s) => (S.recs.has(s) ? `<button type="button" class="tk" data-open="${esc(s)}">${esc(s)}</button>` : esc(s));
+  root.innerHTML = `
+    <p class="note live-note">Snapshot ${esc(fmtStamp(L.asof))}. ${esc(L.note || 'Live and unofficial.')}</p>
+    ${top ? `<dl class="tiles reveal">
+      ${stat(`#1 ${esc(top.symbol)} · open → now`, `<span class="${isNum(top.oc_now) && top.oc_now < 0 ? 'red' : ''}">${esc(pct(top.oc_now, 1, true))}</span>`, esc(`${price(top.open)} open → ${price(top.last)} last`))}
+      ${stat('High since the open', esc(pct(top.oh_now, 1, true)), 'the rip a short had to sit through')}
+      ${stat('Low since the open', esc(pct(top.ol_now, 1, true)), 'the best cover so far')}
+      ${stat('Board, open → now', esc(pct(L.board_mean_oc_now, 1, true)), esc(`${down5} of ${rows.length} down 5%+ so far`))}
+    </dl>
+    <div class="chart" id="live-chart"></div>` : empty('No live quote for the #1 in this snapshot.')}
+    ${rows.length ? `<div class="table-scroll" style="margin-top:32px"><table class="mtable"><caption class="sr-only">Board names, open to now</caption>
+      <thead><tr><th scope="col">Ticker</th><th scope="col">Open</th><th scope="col">Last</th><th scope="col">Open→now</th><th scope="col">High vs open</th><th scope="col">Low vs open</th></tr></thead>
+      <tbody>${rows.map((r) => `<tr><th scope="row">${tk(r.symbol)}</th><td>${esc(price(r.open))}</td><td>${esc(price(r.last))}</td><td class="${isNum(r.oc_now) && r.oc_now <= -0.05 ? 'red' : ''}">${esc(pct(r.oc_now, 1, true))}</td><td>${esc(pct(isNum(r.high) && r.open ? r.high / r.open - 1 : null, 1, true))}</td><td>${esc(pct(isNum(r.low) && r.open ? r.low / r.open - 1 : null, 1, true))}</td></tr>`).join('')}</tbody></table></div>` : ''}`;
+  const el = $('#live-chart');
+  if (el && top) {
+    try { S.disposers.live.push(intradayChart(el, top.points, { open: top.open, label: `${top.symbol} since the open` })); } catch (e) { console.error('[gravity] live chart', e); }
+  }
+}
+
+let livePoll = 0;
+function startLivePoll() {
+  if (livePoll) return;
+  livePoll = setInterval(async () => {
+    if (document.hidden || marketPhaseNow() !== 'open') return;
+    const L = await getJSON('live.json');
+    if (L && (!S.live || L.asof !== S.live.asof)) {
+      S.live = L;
+      safe('live', renderLive);
+    }
+  }, LIVE_POLL_MS);
+}
+
+/* ── swing board ───────────────────────────────────────────────────────── */
+function renderSwing() {
+  const root = $('#swing-root');
+  if (!root) return;
+  const sb = arr(S.today && S.today.swing_board).filter((p) => p && p.symbol);
+  if (!sb.length) { root.innerHTML = empty(S.today ? 'The swing model has not published a board yet — it appears after the next retrain.' : 'The swing board could not be loaded.'); return; }
+  const bs = baseOf('swing');
+  const max = Math.max(0.2, Math.ceil((Math.max(0, ...sb.map((p) => p.prob_swing).filter(isNum)) * 1.1) / 0.1) * 0.1);
+  const sw = swingReport();
+  const bt = isNum(sw.pub1_hit) || isNum(sw.top1_hit)
+    ? `<p class="note" style="margin-bottom:24px">Backtest (out of sample): the top swing pick fell 15%+ by the fifth close on ${esc(pct(isNum(sw.pub1_hit) ? sw.pub1_hit : sw.top1_hit))} of entries${isNum(sw.pub1_mean_c5) ? `, averaging ${esc(pct(sw.pub1_mean_c5, 1, true))}` : ''}${isNum(bs) ? ` — versus ${esc(pct(bs, 1))} for the average name` : ''}. Multi-day shorts also pay borrow every day and ride every overnight gap.</p>` : '';
+  root.innerHTML = `${bt}<div class="table-scroll reveal"><table class="mtable swing-table"><caption class="sr-only">Swing board: highest odds of a 15%+ fall over five sessions</caption>
+    <thead><tr><th scope="col">#</th><th scope="col">Ticker</th><th scope="col">Swing odds${isNum(bs) ? ` <span class="muted">· base ${esc(pct(bs, 1))}</span>` : ''}</th><th scope="col">Skew</th><th scope="col">Today's dump odds</th><th scope="col">Borrow</th><th scope="col">Board</th></tr></thead>
+    <tbody>${sb.map((p) => `<tr>
+      <td>${isNum(p.rank) ? pad2(p.rank) : DASH}</td>
+      <th scope="row" class="sw-name"><button type="button" class="tk" data-open="${esc(p.symbol)}">${esc(p.symbol)}</button><span class="nm">${txt([p.name, p.country].filter(Boolean).join(' · '))}</span>${arr(p.flags).length ? flagChips(p.flags, 3) : ''}</th>
+      <td class="c-prob"><span class="pv">${esc(pct(p.prob_swing))}</span>${probBar(p.prob_swing, bs, max)}</td>
+      <td>${esc(isNum(p.skew) ? `${pct(p.skew)} down` : DASH)}</td>
+      <td>${esc(pct(p.prob_dump))}</td>
+      <td>${borrowInline(p.shortability)}</td>
+      <td>${isNum(p.board_rank) ? `#${esc(p.board_rank)}` : DASH}</td>
+    </tr>`).join('')}</tbody></table></div>`;
+}
+
+/* ── market regime & sector heat ───────────────────────────────────────── */
+function renderMarket() {
+  const root = $('#market-root');
+  if (!root) return;
+  const m = S.today && S.today.market;
+  const secs = arr(S.today && S.today.sectors);
+  if (!m && !secs.length) { root.innerHTML = empty('No market block in this feed yet.'); return; }
+  const mm = obj(m);
+  const regime = mm.regime ? `${humanize(mm.regime)}${isNum(mm.regime_pct) ? ` · ${Math.round(mm.regime_pct)}th pct` : ''}` : DASH;
+  const tiles = `<dl class="tiles reveal">
+    ${stat('Dump-odds regime', esc(regime), 'today\'s average odds vs the last year of sessions')}
+    ${stat('Up yesterday', esc(pct(mm.breadth_up)), esc(`median name ${pct(mm.median_r1, 1, true)} · IWM ${pct(mm.iwm_r1, 1, true)}`))}
+    ${stat('Big movers', esc(`${int(mm.n_up20)} / ${int(mm.n_down20)}`), 'names up 20%+ / down 20%+ yesterday')}
+    ${stat('Realised dump rate', esc(pct(mm.universe_dump_rate_20d, 1)), 'share of names that fell 5%+ open→close, last 20 sessions')}
+  </dl>`;
+  const maxP = Math.max(0.01, ...secs.map((s) => s.mean_prob).filter(isNum));
+  const bars = secs.length ? hbars(secs.map((s, i) => ({
+    label: s.sector, v: s.mean_prob, hot: i === 0, fmt: (x) => pct(x, 1),
+    html: `${esc(s.sector)} <span class="muted mono">· ${int(s.n)} names${s.n_top100 ? ` · ${int(s.n_top100)} in top 100` : ''}${arr(s.top).length ? ` · ${arr(s.top).map((x) => (S.recs.has(x) ? `<button type="button" class="tk tk--sm" data-open="${esc(x)}">${esc(x)}</button>` : esc(x))).join(' ')}` : ''}</span>`,
+  })), maxP * 1.1, { base: S.base }) : empty('No sector breakdown in this feed.');
+  root.innerHTML = `${tiles}<div class="rec-grid rec-block reveal"><div><h3 class="rec-sub">Sector heat</h3><p class="note">Average dump odds by sector (tick = the base rate). Sectors with fewer than five names are left out.</p>${bars}</div></div>`;
+}
+
+/* ── catalyst calendar ─────────────────────────────────────────────────── */
+function renderCalendar() {
+  const root = $('#calendar-root');
+  if (!root) return;
+  const c = obj(S.today && S.today.calendar);
+  const earn = arr(c.earnings);
+  const locks = arr(c.lockups);
+  if (!S.today || (!earn.length && !locks.length && !S.today.calendar)) { root.innerHTML = empty('No calendar in this feed yet.'); return; }
+  const tk = (s) => (S.recs.has(s) ? `<button type="button" class="tk" data-open="${esc(s)}">${esc(s)}</button>` : esc(s));
+  const TIME = { 'time-pre-market': 'before the open', 'pre-market': 'before the open', 'time-after-hours': 'after the close', 'after-hours': 'after the close', 'time-not-supplied': 'time n/a', 'not-supplied': 'time n/a' };
+  const byDay = {};
+  earn.forEach((e) => { (byDay[e.date || '?'] = byDay[e.date || '?'] || []).push(e); });
+  const earnHTML = earn.length
+    ? `<div class="table-scroll"><table class="mtable"><caption class="sr-only">Earnings from names in the universe, next five sessions</caption><thead><tr><th scope="col">Ticker</th><th scope="col">When</th><th scope="col">EPS est.</th><th scope="col">Dump odds</th></tr></thead><tbody>${Object.keys(byDay).sort().map((d) => `<tr class="grp"><th scope="rowgroup" colspan="4">${esc(fmtDay(d))}</th></tr>${byDay[d].map((e) => `<tr><th scope="row">${tk(e.symbol)} <span class="nm">${txt(e.name)}</span></th><td>${esc(TIME[e.time] || humanize(e.time || '') || DASH)}</td><td>${esc(e.eps_forecast || DASH)}</td><td>${esc(pct(e.prob_dump))}</td></tr>`).join('')}`).join('')}</tbody></table></div>`
+    : empty('No universe names report in the next five sessions (or the calendar did not load).');
+  const lockHTML = locks.length
+    ? `<div class="table-scroll"><table class="mtable"><caption class="sr-only">IPO lock-up expiries around now</caption><thead><tr><th scope="col">Ticker</th><th scope="col">IPO</th><th scope="col">Lock-up ends</th><th scope="col">Days</th><th scope="col">Price vs IPO</th><th scope="col">Dump odds</th></tr></thead><tbody>${locks.map((l) => `<tr><th scope="row">${tk(l.symbol)} <span class="nm">${txt(l.name)}</span></th><td>${esc(fmtDay(l.ipo_date, { weekday: false, year: true }))} · ${esc(price(l.ipo_price))}</td><td>${esc(fmtDay(l.lockup_date, { weekday: false }))}</td><td class="${isNum(l.days_to) && l.days_to >= 0 && l.days_to <= 5 ? 'red' : ''}">${esc(isNum(l.days_to) ? (l.days_to < 0 ? `${-l.days_to} ago` : `in ${l.days_to}`) : DASH)}</td><td>${esc(pct(l.vs_ipo, 0, true))}</td><td>${esc(pct(l.prob_dump))}</td></tr>`).join('')}</tbody></table></div><p class="note" style="margin-top:8px">Lock-up dates assume the standard 180 days after pricing; the real date is in each prospectus. Insiders are free to sell after it — historically a supply event (see the Evidence Lab).</p>`
+    : empty('No IPO lock-ups expire around now among recent listings.');
+  root.innerHTML = `<div class="rec-grid rec-block reveal"><div><h3 class="rec-sub">Earnings · next five sessions</h3>${earnHTML}</div><div><h3 class="rec-sub">IPO lock-up expiries</h3>${lockHTML}</div></div>`;
+}
+
+/* ── look up any ticker (docs/data/universe.json) ─────────────────────── */
+const LK_FILTERS = [
+  { id: 'short', label: 'Borrowable', test: (r) => r.borrow_status === 'ETB' || r.borrow_status === 'HTB' },
+  { id: 'nossr', label: 'No Rule 201', test: (r) => !r.ssr },
+  { id: 'sub1', label: 'Under $1', test: (r) => isNum(r.price) && r.price < 1 },
+  { id: 'board', label: 'On the board', test: (r) => isNum(r.board_rank) },
+];
+const LK_COLS = [
+  ['symbol', 'Ticker', 1], ['price', 'Price', -1], ['market_cap', 'Mkt cap', -1], ['prob', 'Dump odds', -1],
+  ['prob_squeeze', 'Squeeze odds', -1], ['prob_swing', 'Swing odds', -1], ['skew', 'Skew', -1],
+  ['fee_rate', 'Borrow fee', 1], ['squeeze_danger', 'Sq. danger', 1],
+];
+
+async function loadUniverse() {
+  if (S.uni.status !== 'idle') return;
+  S.uni.status = 'loading';
+  drawLookup();
+  const u = await getJSON('universe.json');
+  if (!u || !Array.isArray(u.rows) || !Array.isArray(u.columns)) {
+    S.uni.status = 'error';
+  } else {
+    const cols = u.columns;
+    S.uni.rows = u.rows.map((r) => Object.fromEntries(cols.map((c, i) => [c, r[i]])));
+    S.uni.rows.forEach((r) => { r.prob = r.prob_dump; S.uni.bySym.set(r.symbol, r); });
+    S.uni.asof = u.asof;
+    S.uni.session = u.session_date;
+    S.uni.status = 'ready';
+  }
+  drawLookup();
+}
+
+function renderLookup() {
+  const root = $('#lookup-root');
+  if (!root) return;
+  const chips = LK_FILTERS.map((f) => `<button type="button" class="fchip" data-lkfilter="${f.id}" aria-pressed="${S.look.filters.has(f.id)}">${esc(f.label)}</button>`).join('');
+  root.innerHTML = `
+    <div class="board-tools">
+      <label class="lk-search"><span class="sr-only">Search by ticker or company</span><input id="lk-q" type="search" placeholder="Type a ticker or company" autocomplete="off" autocapitalize="characters" spellcheck="false" value="${esc(S.look.q)}"></label>
+      <div class="filters" role="group" aria-label="Filter the lookup">${chips}</div>
+      <p class="board-count" id="lk-count" aria-live="polite"></p>
+    </div>
+    <div id="lk-card"></div>
+    <div class="table-scroll"><table class="mtable lk-table" id="lk-table"><caption class="sr-only">Every scored name today. Select a ticker to open it.</caption><thead></thead><tbody></tbody></table></div>
+    <div class="lk-pager" id="lk-pager"></div>`;
+  const q = $('#lk-q');
+  q.addEventListener('focus', loadUniverse, { once: true });
+  q.addEventListener('input', () => { S.look.q = q.value; S.look.page = 0; drawLookup(); });
+  q.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    const hit = S.uni.bySym.get(q.value.trim().toUpperCase());
+    if (hit) showLookupCard(hit.symbol);
+  });
+  root.addEventListener('click', (e) => {
+    const f = e.target.closest('[data-lkfilter]');
+    if (f) {
+      const id = f.dataset.lkfilter;
+      if (S.look.filters.has(id)) S.look.filters.delete(id); else S.look.filters.add(id);
+      f.setAttribute('aria-pressed', String(S.look.filters.has(id)));
+      S.look.page = 0; drawLookup(); return;
+    }
+    const s = e.target.closest('[data-lksort]');
+    if (s) {
+      const k = s.dataset.lksort;
+      const def = (LK_COLS.find((c) => c[0] === k) || [0, 0, -1])[2];
+      S.look.dir = S.look.sort === k ? -S.look.dir : def;
+      S.look.sort = k; S.look.page = 0; drawLookup(); return;
+    }
+    const pg = e.target.closest('[data-lkpage]');
+    if (pg) { S.look.page = Math.max(0, S.look.page + Number(pg.dataset.lkpage)); drawLookup(); return; }
+    const row = e.target.closest('[data-lksym]');
+    if (row && !e.target.closest('[data-open]')) showLookupCard(row.dataset.lksym);
+  });
+  if ('IntersectionObserver' in window) {
+    const io = new IntersectionObserver((es) => { if (es.some((x) => x.isIntersecting)) { io.disconnect(); loadUniverse(); } }, { rootMargin: '400px' });
+    io.observe(root);
+  } else loadUniverse();
+  drawLookup();
+}
+
+function lookupRows() {
+  const q = S.look.q.trim().toLowerCase();
+  const tests = LK_FILTERS.filter((f) => S.look.filters.has(f.id));
+  let rows = S.uni.rows.filter((r) => tests.every((f) => f.test(r)));
+  if (q) {
+    rows = rows.filter((r) => String(r.symbol).toLowerCase().startsWith(q) || String(r.name || '').toLowerCase().includes(q));
+    rows.sort((a, b) => (String(a.symbol).toLowerCase() === q ? -1 : 0) - (String(b.symbol).toLowerCase() === q ? -1 : 0));
+  }
+  const k = S.look.sort;
+  const d = S.look.dir;
+  if (!q) {
+    rows = rows.slice().sort((a, b) => {
+      const va = a[k];
+      const vb = b[k];
+      if (va == null && vb == null) return 0;
+      if (va == null) return 1;
+      if (vb == null) return -1;
+      return (typeof va === 'string' ? va.localeCompare(vb) : va - vb) * d;
+    });
+  }
+  return rows;
+}
+
+function drawLookup() {
+  const table = $('#lk-table');
+  const cnt = $('#lk-count');
+  const pager = $('#lk-pager');
+  if (!table) return;
+  if (S.uni.status !== 'ready') {
+    setHTML($('tbody', table), `<tr class="board-empty"><td colspan="${LK_COLS.length + 1}">${S.uni.status === 'error' ? `The full-universe file could not be loaded (${esc(S.errors['universe.json'] || 'unknown error')}).` : 'Loading every scored name…'}</td></tr>`);
+    return;
+  }
+  const th = LK_COLS.map(([k, label]) => {
+    const active = S.look.sort === k;
+    return `<th scope="col"${active ? ` aria-sort="${S.look.dir > 0 ? 'ascending' : 'descending'}"` : ''}><button type="button" data-lksort="${k}">${esc(label)}<span class="dir" aria-hidden="true">${active ? (S.look.dir > 0 ? '↑' : '↓') : ''}</span></button></th>`;
+  }).join('');
+  setHTML($('thead', table), `<tr>${th}<th scope="col">30 sessions</th></tr>`);
+  const rows = lookupRows();
+  const pages = Math.max(1, Math.ceil(rows.length / LOOKUP_PAGE));
+  S.look.page = Math.min(S.look.page, pages - 1);
+  const slice = rows.slice(S.look.page * LOOKUP_PAGE, (S.look.page + 1) * LOOKUP_PAGE);
+  setHTML($('tbody', table), slice.length ? slice.map((r) => {
+    const sym = esc(r.symbol);
+    const tk = S.recs.has(r.symbol) ? `<button type="button" class="tk" data-open="${sym}">${sym}</button>` : `<button type="button" class="tk tk--quiet">${sym}</button>`;
+    return `<tr data-lksym="${sym}"><th scope="row">${tk}<span class="nm">${txt(r.name)}</span>${r.ssr ? '<span class="chip chip--red">SSR</span>' : ''}</th>
+      <td>${esc(price(r.price))}</td><td>${esc(money(r.market_cap))}</td><td class="${r.board_rank ? 'red' : ''}">${esc(pct(r.prob_dump))}</td>
+      <td>${esc(pct(r.prob_squeeze))}</td><td>${esc(pct(r.prob_swing))}</td><td>${esc(isNum(r.skew) ? pct(r.skew) : DASH)}</td>
+      <td>${esc(isNum(r.fee_rate) ? `${pctUnits(r.fee_rate, 0)}` : (r.borrow_status === 'NONE' ? 'none' : DASH))}</td><td>${esc(isNum(r.squeeze_danger) ? r.squeeze_danger : DASH)}</td>
+      <td>${sparkCloses(r.spark)}</td></tr>`;
+  }).join('') : `<tr class="board-empty"><td colspan="${LK_COLS.length + 1}">No scored name matches “${esc(S.look.q)}”. Names outside the small/micro-cap universe (or that did not trade last session) are not scored.</td></tr>`);
+  if (cnt) cnt.textContent = `${int(rows.length)} of ${int(S.uni.rows.length)} names · as of ${S.uni.asof ? fmtStamp(S.uni.asof) : DASH}`;
+  if (pager) {
+    pager.innerHTML = pages > 1
+      ? `<button type="button" class="btn btn--quiet" data-lkpage="-1"${S.look.page === 0 ? ' disabled' : ''}>Previous</button><span class="mono">Page ${S.look.page + 1} of ${pages}</span><button type="button" class="btn btn--quiet" data-lkpage="1"${S.look.page >= pages - 1 ? ' disabled' : ''}>Next</button>`
+      : '';
+  }
+}
+
+function showLookupCard(sym) {
+  if (S.recs.has(sym)) { openDossier(sym, { opener: document.activeElement }); return; }
+  const r = S.uni.bySym.get(sym);
+  const el = $('#lk-card');
+  if (!el || !r) return;
+  const links = fallbackLinks(sym);
+  el.innerHTML = `<article class="card lk-card">
+    <div class="card__top"><div><p class="card__sym">${esc(sym)}</p><p class="card__name">${txt([r.name, r.sector, r.country].filter(Boolean).join(' · '))}</p></div>
+      <span class="eyebrow">${isNum(r.board_rank) ? `Board #${esc(r.board_rank)}` : 'Not on today\'s boards'}</span></div>
+    <dl class="tiles">
+      ${stat('Dump odds', `<span class="red">${esc(pct(r.prob_dump))}</span>`, esc(isNum(S.base) ? `base ${pct(S.base, 1)}${isNum(r.score) ? ` · higher than ${r.score}% of names` : ''}` : ''))}
+      ${stat('Squeeze odds', esc(pct(r.prob_squeeze)), 'P(+20% above the open)')}
+      ${stat('Swing odds', esc(pct(r.prob_swing)), '15%+ lower five sessions out')}
+      ${stat('Borrow', esc(r.borrow_status || DASH), esc(isNum(r.fee_rate) ? `${pctUnits(r.fee_rate, 1)}/yr · ${compact(r.available)} sh` : 'IBKR'))}
+    </dl>
+    <div class="lk-card__row">${sparkCloses(r.spark, { w: 220, h: 44 })}<span class="mono">${esc(price(r.price))} · ${esc(money(r.market_cap))}</span></div>
+    ${arr(r.flags).length ? flagChips(r.flags) : ''}
+    <p class="note" style="margin-top:16px">A compact card: full dossiers (filings, news, borrow history, dilution) are built for the board, swing board, squeeze zone and lookalikes. ${r.ssr ? 'Rule 201 short-sale restriction likely in effect today. ' : ''}</p>
+    <div class="links">${Object.entries(links).map(([k, u]) => extLink(u, k)).join('')}</div>
+  </article>`;
+  el.scrollIntoView({ block: 'nearest', behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
+}
+
+/* ── dossier add-ons (§14.3) ───────────────────────────────────────────── */
+function dilutionHTML(d) {
+  if (!d) return '';
+  const lo = obj(d.last_offering);
+  const rows = [
+    ['Shares outstanding', esc(compact(d.shares_now)), d.shares_asof ? `SEC, ${fmtDay(d.shares_asof, { weekday: false, year: true })}` : ''],
+    ['Change in a year', esc(isNum(d.shares_growth_1y) ? `${fixed(d.shares_growth_1y, 1)}×` : DASH), isNum(d.shares_1y_ago) ? `from ${compact(d.shares_1y_ago)}` : ''],
+    ['Cash', esc(money(d.cash)), d.cash_date ? fmtDay(d.cash_date, { weekday: false, year: true }) : ''],
+    ['Quarterly burn', esc(money(d.quarterly_burn)), 'operating cash flow'],
+    ['Runway', esc(isNum(d.runway_q) ? `${fixed(d.runway_q, 1)} quarters` : DASH), isNum(d.runway_q) && d.runway_q < 2 ? 'short — a raise is likely' : ''],
+  ];
+  if (lo.date) {
+    rows.push(['Last offering', esc(`${humanize(lo.type || 'offering')} · ${lo.form || ''}`), fmtDay(lo.date, { weekday: false, year: true })]);
+    if (isNum(lo.price)) rows.push(['Offering price', esc(price(lo.price)), isNum(lo.shares) ? `${compact(lo.shares)} shares` : '']);
+    if (isNum(lo.gross)) rows.push(['Gross proceeds', esc(money(lo.gross))]);
+  }
+  if (isNum(d.atm_capacity)) rows.push(['At-the-market program', esc(`up to ${money(d.atm_capacity)}`), 'shares can be sold into the market at any time']);
+  const w = obj(d.warrants);
+  if (isNum(w.shares)) rows.push(['Warrants', esc(`${compact(w.shares)} sh`), isNum(w.exercise_price) ? `exercise ${price(w.exercise_price)}` : '']);
+  const src = arr(d.sources).filter(safeUrl).slice(0, 3).map((u, i) => extLink(u, `Filing ${i + 1} ↗`)).join(' ');
+  return kv(rows) + (src ? `<p class="note" style="margin-top:8px">${src}</p>` : '');
+}
+
+function insiderHTML(ins) {
+  if (!ins) return '';
+  if (ins.fpi) return '<p class="note">Foreign private issuers don\'t file Form 4, so insider sales aren\'t disclosed this way. Form 144 notices still appear in the filings list when filed.</p>';
+  const tr = arr(ins.trades).slice(0, 8);
+  return kv([
+    ['Open-market sales', esc(int(ins.n_sales)), isNum(ins.value_sold) ? `${money(ins.value_sold)} sold` : ''],
+    ['Open-market buys', esc(int(ins.n_buys)), isNum(ins.value_bought) ? `${money(ins.value_bought)} bought` : ''],
+    ['Form 144 notices', esc(int(ins.n_144)), 'intent to sell restricted stock'],
+  ]) + (tr.length ? `<ul class="lst" style="margin-top:16px">${tr.map((x) => `<li><span class="meta">${esc(fmtDay(x.date, { weekday: false, year: true }))} · ${txt(x.name)}${x.title ? ` · ${esc(x.title)}` : ''}</span>${esc(x.code === 'P' ? 'Bought' : 'Sold')} ${esc(compact(x.shares))} sh${isNum(x.price) ? ` at ${esc(price(x.price))}` : ''}${safeUrl(x.url) ? ` ${extLink(x.url, '↗')}` : ''}</li>`).join('')}</ul>` : '');
+}
+
+function chatterHTML(c) {
+  if (!c) return '';
+  const tot = (c.bull || 0) + (c.bear || 0);
+  return kv([
+    ['Messages a day', esc(isNum(c.msgs_per_day) ? fixed(c.msgs_per_day, c.msgs_per_day < 10 ? 1 : 0) : DASH), 'Stocktwits, from the latest 30'],
+    ['Bullish / bearish tags', esc(tot ? `${c.bull || 0} / ${c.bear || 0}` : DASH), tot ? `${pct((c.bear || 0) / tot)} bearish` : 'few tagged posts'],
+    ['Watchers', esc(compact(c.watchers))],
+  ]) + (safeUrl(c.url) ? `<p class="note" style="margin-top:8px">${extLink(c.url, 'Open the stream ↗')} · Chatter is crowd noise; spikes often accompany pumps.</p>` : '');
+}
+
+function historyHTML(p) {
+  const ph = arr(p.prob_history);
+  const bh = arr(p.borrow_history);
+  const bits = [];
+  if (ph.length >= 2) bits.push(`<div class="hist-row"><span class="eyebrow">Dump odds, last ${ph.length} sessions</span>${miniLine(ph, { label: `${p.symbol} dump odds history` })}<span class="mono">${esc(pct(ph[0][1]))} → ${esc(pct(ph[ph.length - 1][1]))}</span></div>`);
+  if (bh.length >= 2) {
+    bits.push(`<div class="hist-row"><span class="eyebrow">Borrow fee</span>${miniLine(bh.map((r) => [r[0], r[1]]), { label: `${p.symbol} borrow fee history` })}<span class="mono">${esc(isNum(bh[0][1]) ? pctUnits(bh[0][1], 0) : DASH)} → ${esc(isNum(bh[bh.length - 1][1]) ? pctUnits(bh[bh.length - 1][1], 0) : DASH)}</span></div>`);
+    bits.push(`<div class="hist-row"><span class="eyebrow">Shares to borrow</span>${miniLine(bh.map((r) => [r[0], r[2]]), { label: `${p.symbol} lendable shares history` })}<span class="mono">${esc(compact(bh[0][2]))} → ${esc(compact(bh[bh.length - 1][2]))}</span></div>`);
+  }
+  return bits.join('');
 }
 
 /* ── method & footer ───────────────────────────────────────────────────── */
@@ -1135,8 +1366,11 @@ function renderFooter() {
     ['evidence.json', S.evidence && S.evidence.generated_at ? fmtStamp(S.evidence.generated_at, { year: true }) : (S.errors['evidence.json'] ? 'not loaded' : DASH)],
     ['Universe', t.universe ? `${int(t.universe.listed)} listed · ${int(t.universe.eligible)} eligible · ${int(t.universe.scored)} scored` : DASH],
   ];
+  if (S.live && S.live.asof) rows.push(['live.json', `${fmtStamp(S.live.asof, { year: true })}${liveFresh() ? '' : ' (previous session)'}`]);
+  if (S.uni.asof) rows.push(['universe.json', fmtStamp(S.uni.asof, { year: true })]);
   if (S.sample) rows.push(['Mode', 'SAMPLE DATA — placeholder numbers']);
-  setHTML('#foot-times', rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join(''));
+  setHTML('#foot-times', rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('')
+    + '<dt>Follow</dt><dd><a href="feed.xml">RSS feed of each day\'s #1</a> · on a phone, Share → Add to Home Screen installs GRAVITY as an app</dd>');
   if (t.disclaimer) { const d = $('#foot-disclaimer'); if (d) d.textContent = t.disclaimer; }
 }
 
@@ -1179,16 +1413,16 @@ function dossierHTML(rec) {
   let where = 'Dossier';
   if (rec.where === 'board') where = `Board #${isNum(p.rank) ? p.rank : DASH}`;
   else if (rec.where === 'zone') where = 'Squeeze zone — held off the board';
-  else if (rec.where === 'twin') where = 'INHD twin';
-  else if (rec.where === 'ref') where = 'Your reference short';
-  if (rec.twin && rec.where !== 'twin') where += ` · INHD twin`;
+  else if (rec.where === 'twin') where = `Lookalike of ${twinsAnchor() || 'the #1'}`;
+  else if (rec.where === 'swing') where = `Swing board #${isNum(p.rank) ? p.rank : DASH}`;
+  if (rec.twin && rec.where !== 'twin') where += ` · lookalike of ${twinsAnchor() || 'the #1'}`;
   const sub = [p.name, p.exchange, p.country, p.industry || p.sector].filter(Boolean).map(esc).join(' · ');
 
   const pre = p.premarket;
   const gap = pre && isNum(pre.gap_pct) ? pct(pre.gap_pct, 0, true) : DASH;
   const keys = `<dl class="dz-keys">
     <div><dt class="eyebrow">Dump odds</dt><dd class="${isNum(p.prob_dump) ? 'red' : ''}">${esc(pct(p.prob_dump))}<small>${esc(isNum(base) ? `base ${pct(base, 1)} · ${liftTxt(p.lift)}` : 'base rate not reported')}</small></dd></div>
-    <div><dt class="eyebrow">Exp. open→close</dt><dd>${esc(pct(p.exp_oc, 1, true))}<small>model average</small></dd></div>
+    <div><dt class="eyebrow">Swing odds</dt><dd>${esc(pct(p.prob_swing))}<small>${esc(isNum(p.skew) ? `15%+ lower in 5 sessions · ${pct(p.skew)} of big-move odds down` : '15%+ lower in 5 sessions')}</small></dd></div>
     <div><dt class="eyebrow">Pre-market</dt><dd>${esc(gap)}<small>${esc(pre ? `${price(pre.price)} at ${fmtTimeET(pre.asof)} ET` : 'no print reported')}</small></dd></div>
     <div><dt class="eyebrow">Squeeze danger</dt><dd>${squeezeMeter(p.squeeze_danger)}<small>${esc(sqWord(p.squeeze_danger))}</small></dd></div>
   </dl>`;
@@ -1196,20 +1430,19 @@ function dossierHTML(rec) {
   const chartRows = arr(p.chart).filter((r) => Array.isArray(r) && isNum(r[4]));
   const lb = chartRows.length ? chartRows[chartRows.length - 1] : null;
   const chart = dzSec(`Price${chartRows.length ? ` — ${chartRows.length} sessions to ${fmtDay(lb[0], { weekday: false })}` : ''}`,
-    `<div class="lwc" id="dz-chart" role="img" aria-label="${esc(`${p.symbol} daily candles and volume${lb ? ` to ${fmtDay(lb[0], { weekday: false, year: true })}` : ''}`)}"></div><p class="note" style="margin-top:8px">Split-adjusted daily bars. Hollow = closed up, red = closed down; volume along the bottom.${rec.ref ? ' Arrow = your short reference date.' : ''}</p>`);
+    `<div class="lwc" id="dz-chart" role="img" aria-label="${esc(`${p.symbol} daily candles and volume${lb ? ` to ${fmtDay(lb[0], { weekday: false, year: true })}` : ''}`)}"></div><p class="note" style="margin-top:8px">Split-adjusted daily bars. Hollow = closed up, red = closed down; volume along the bottom.</p>`);
 
   const parts = [];
   if (p._noModel) parts.push(`<p class="dz-note">No model reading for ${sym} in this feed${S.sample ? ' (sample mode never scores a real company)' : ''}. Price, borrow, filings and news are shown where available.</p>`);
   if (rec.where === 'zone' && p.zone_reason) parts.push(`<p class="dz-warn"><b>Why it's off the board</b>${esc(p.zone_reason)}</p>`);
-  if (rec.ref) {
-    const r = rec.ref;
-    parts.push(dzSec('Your reference', kv([
-      ['Short reference', esc(price(r.short_ref_price)), fmtDay(r.short_ref_date, { weekday: false, year: true })],
-      ['Last close', esc(price(r.price))],
-      ['Change since reference', esc(pct(r.change_since_ref, 1, true)), 'a fall is a short gain'],
-    ]) + (arr(r.notes).length ? `<ul class="notes" style="margin-top:16px">${arr(r.notes).map((n) => `<li>${esc(n)}</li>`).join('')}</ul>` : '')));
-  }
   if (arr(p.reasons).length) parts.push(dzSec('Why it is on the radar', reasonsList(p.reasons)));
+  const weighed = attributionBars(p.attribution);
+  if (weighed) parts.push(dzSec('What the model weighed', `${weighed}<p class="note" style="margin-top:8px">Share of this reading that disappears when each family of inputs is swapped for a typical name's values. It describes the model, not the company.</p>`));
+  const hist = historyHTML(p);
+  if (hist) parts.push(dzSec('Over time', `${hist}<p class="note" style="margin-top:8px">Recorded by GRAVITY each session since it started; nothing back-filled.</p>`));
+  if (p.dilution) parts.push(dzSec('Dilution & cash', dilutionHTML(p.dilution)));
+  if (p.insider) parts.push(dzSec('Insider activity · 90 days', insiderHTML(p.insider)));
+  if (p.chatter) parts.push(dzSec('Chatter', chatterHTML(p.chatter)));
   parts.push(dzSec('Flags', flagChips(p.flags)));
   if (p.families) {
     parts.push(dzSec('Signal families', `<ul class="famrows">${FAMILIES.map((k) => {
@@ -1270,7 +1503,8 @@ function dossierHTML(rec) {
       ['Model', esc(p.model_used === 'm1' ? 'M1 · uses pre-market' : p.model_used === 'm0' ? 'M0 · close only' : DASH)],
       ['Odds of a 15%+ drop', esc(pct(p.prob_bigdump, 1)), 'open→close'],
       ['Higher odds than', esc(isNum(p.score) ? (p.score >= 100 ? 'every other name' : `${p.score}% of names`) : DASH), 'scored today'],
-      ['Similarity to INHD', esc(pct(p.inhd_similarity))],
+      ['Odds of a +5% rise instead', esc(pct(p.prob_pump, 1)), 'open→close'],
+      ['Expected open→close', esc(pct(p.exp_oc, 1, true)), 'weak on its own — see the Record'],
       ['Features as of', esc(fmtDay(t.features_asof, { weekday: false, year: true }))],
     ])));
   }
@@ -1345,7 +1579,7 @@ function candleChart(el, LWC, rows, rec) {
   vol.setData(rows.map((r) => (isNum(r[5])
     ? { time: r[0], value: r[5], color: r[4] >= r[1] ? 'rgba(180, 188, 198, 0.28)' : 'rgba(255, 46, 77, 0.4)' }
     : { time: r[0] })));
-  const ref = rec.ref;
+  const ref = null;
   if (ref && ref.short_ref_date) {
     let idx = -1;
     for (let i = 0; i < rows.length; i++) if (rows[i][0] <= ref.short_ref_date) idx = i;
@@ -1596,9 +1830,11 @@ function watchFreshness() {
 /* ── boot ──────────────────────────────────────────────────────────────── */
 async function init() {
   wireGlobal();
-  const [today, model, evidence, scorecard] = await Promise.all(
-    ['today.json', 'model.json', 'evidence.json', 'scorecard.json'].map(getJSON),
+  const [today, model, evidence, scorecard, live] = await Promise.all(
+    ['today.json', 'model.json', 'evidence.json', 'scorecard.json', 'live.json'].map(getJSON),
   );
+  delete S.errors['live.json'];  // optional feed: absent outside the session
+  S.live = live && typeof live === 'object' ? live : null;
   S.today = today && typeof today === 'object' ? today : null;
   S.model = model && typeof model === 'object' ? model : null;
   S.evidence = evidence && typeof evidence === 'object' ? evidence : null;
@@ -1614,10 +1850,14 @@ async function init() {
   safe('banners', renderBanners);
   safe('hero', renderHero);
   safe('board', renderBoard);
+  safe('live', renderLive);
   safe('wire', renderWire);
-  safe('position', renderPosition);
+  safe('swing', renderSwing);
   safe('twins', renderTwins);
   safe('squeeze', renderSqueeze);
+  safe('market', renderMarket);
+  safe('calendar', renderCalendar);
+  safe('lookup', renderLookup);
   safe('record', renderRecord);
   safe('evidence', renderEvidence);
   safe('method', renderMethod);
@@ -1625,6 +1865,7 @@ async function init() {
   observeReveal();
   route();
   watchFreshness();
+  startLivePoll();
   document.documentElement.classList.add('is-ready');
 }
 

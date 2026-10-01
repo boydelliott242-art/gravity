@@ -70,7 +70,7 @@ def test_schema_ids_and_strict_json():
         assert k in res
     ids = [s["id"] for s in res["studies"]]
     for want in ("baseline", "up20", "up50", "up100", "up200", "run3_100", "gap30", "rs_5", "rs_30", "offer_1",
-                 "reg_30", "delist_90", "sub1", "dd90", "rsi85", "asia_ipo2y", "inhd_profile"):
+                 "reg_30", "delist_90", "sub1", "dd90", "rsi85", "asia_ipo2y", "serial_rs"):
         assert want in ids
     for s in res["studies"] + [res["baseline"]]:
         assert STUDY_KEYS <= set(s), s["id"]
@@ -182,11 +182,11 @@ def test_profiles():
     df.loc[inhd, ["asia", "rs_count_2y", "dd_52w", "ipo_age", "price"]] = [1.0, 3.0, -0.95, 1.0, 0.5]
     relabel(df)
     st = by_id(E.run_studies(df, n_boot=100))
-    assert st["inhd_profile"]["n"] == int(inhd.sum())
+    assert st["serial_rs"]["n"] == int(inhd.sum())
     assert st["asia_ipo2y"]["n"] == int(inhd.sum())
     assert st["sub1"]["n"] == int(inhd.sum())
     assert st["dd90"]["n"] == int(inhd.sum())
-    assert st["inhd_profile"]["n_symbols"] == 1
+    assert st["serial_rs"]["n_symbols"] == 1
 
 
 def test_deterministic_and_empty_panel():
@@ -197,3 +197,21 @@ def test_deterministic_and_empty_panel():
     empty = E.run_studies(df.iloc[0:0], n_boot=50)
     assert empty["n_rows"] == 0 and empty["baseline"]["n"] == 0
     assert all(s["n"] == 0 for s in empty["studies"])
+
+
+def test_lockup_study_uses_listing_dates():
+    import numpy as np
+    import pandas as pd
+    from gravity import evidence as EV
+    days = pd.bdate_range("2024-06-03", periods=260)
+    rows = []
+    for sym, listed in (("NEWC", "2024-06-03"), ("OLDC", "2020-01-02")):
+        for d in days:
+            rows.append({"date": d, "symbol": sym, "y_oc": -0.06 if sym == "NEWC" else 0.0,
+                         "y_dump": 1.0 if sym == "NEWC" else 0.0, "y_squeeze": 0.0, "y_bigdump": 0.0})
+    panel = pd.DataFrame(rows)
+    res = EV.run_studies(panel, n_boot=50, listing_dates={"NEWC": pd.Timestamp("2024-06-03"), "OLDC": pd.Timestamp("2020-01-02")})
+    st = {s["id"]: s for s in res["studies"]}["lockup_180"]
+    assert st["n"] > 0 and st["n_symbols"] == 1        # only the name that listed inside the data
+    res2 = EV.run_studies(panel, n_boot=50)
+    assert {s["id"]: s for s in res2["studies"]}["lockup_180"]["n"] == 0   # no listing dates → nothing measured

@@ -74,6 +74,7 @@ COVERAGE_SLACK_DAYS = 7         # a cache may start this much later than asked a
 FRESH_AFTER_CLOSE_MIN = 30      # a cache written ≥ this long after the last close is current…
 LATE_BAR_RECHECK_H = 3          # …unless it lacks that session's bar and was written < this long after
 RATE_LIMIT_BACKOFF_S = (60.0, 180.0)   # sleeps before re-trying rate-limited symbols
+STRAGGLERS = 3                         # ≤ this many refusals in a batch = bad tickers, not throttling
 NASDAQ_FALLBACK_MAX = 250       # cap on Nasdaq history fallbacks per call (3 req/s host)
 SPLITS_CACHE_S = 20 * 3600      # split lists fetched outside load_history
 PREMARKET_WORKERS = 8
@@ -553,6 +554,12 @@ def _download_with_backoff(symbols: List[str], start: Optional[date], run: _Run,
         return {}, list(symbols)
     frames, errors = _yf_download(symbols, start, None, max_workers, now)
     limited = [s for s, e in errors.items() if _is_rate_limit(e)]
+    if 0 < len(limited) <= STRAGGLERS and len(symbols) >= 20:
+        # One or two refusals is usually a bad/odd ticker, not throttling —
+        # don't stall the whole run for minutes over it.
+        log.info("prices: %d straggler(s) refused by Yahoo (%s) — skipping without back-off",
+                 len(limited), ", ".join(limited))
+        limited = []
     for wait in RATE_LIMIT_BACKOFF_S:
         if not limited:
             break
@@ -890,7 +897,49 @@ def benchmark_history(period: str = config.HISTORY_PERIOD) -> pd.DataFrame:
     ``load_history``. Empty frame if unavailable."""
     got = load_history([BENCHMARK], period=period, refresh=True, max_workers=1, report=False)
     df = got.get(BENCHMARK)
-    return df if df is not None else empty_frame()
+    if df is None:
+        df = empty_frame()
+    attrs = dict(df.attrs)
+    # Yahoo sometimes publishes the latest IWM bar without a close (it is then
+    # dropped). Market features for that session would go blank in live
+    # scoring, so fill any missing completed session from Nasdaq.
+    now = now_et()
+    last_done = now.date() if (is_trading_day(now.date()) and now.time() >= dtime(16, 15)) else prev_trading_day(now.date())
+    have = df.index.max().date() if len(df) else None
+    if have is None or have < last_done:
+        start = (have + timedelta(days=1)) if have else last_done - timedelta(days=10)
+        extra = _nasdaq_history_raw(BENCHMARK, start, now.date(), now)
+        if len(extra):
+            extra = extra[extra.index.date <= last_done]
+            df = pd.concat([df, extra[~extra.index.isin(df.index)]]).sort_index()
+            log.info("benchmark: filled %d missing IWM bar(s) from Nasdaq (Yahoo had none through %s)", len(extra), have)
+    have = df.index.max().date() if len(df) else None
+    if have is None or have < last_done:
+        bar = _benchmark_close_bar(last_done)
+        if bar is not None:
+            df = pd.concat([df, bar]).sort_index()
+            log.info("benchmark: IWM %s bar built from Nasdaq's official close (history not published yet)", last_done)
+    df.attrs = attrs
+    return df
+
+
+def _benchmark_close_bar(day: date) -> Optional[pd.DataFrame]:
+    """One IWM bar for ``day`` from Nasdaq's quote (official 4 PM close). Only
+    the close feeds GRAVITY's market features; open/high/low are set to it."""
+    d = net.get_json(f"{NASDAQ_API}/{BENCHMARK}/info", headers=net.NASDAQ_HEADERS, params={"assetclass": "etf"})
+    try:
+        sec = d["data"]["secondaryData"] or {}
+        prim = d["data"]["primaryData"] or {}
+    except (TypeError, KeyError):
+        return None
+    ts = parse_nasdaq_timestamp(sec.get("lastTradeTimestamp"))
+    close = num(sec.get("lastSalePrice"))
+    if ts is None or close is None or ts.date() != day:
+        return None
+    vol = num(prim.get("volume"))
+    return pd.DataFrame({"open": [close], "high": [close], "low": [close], "close": [close],
+                         "volume": [vol if vol is not None else float("nan")]},
+                        index=pd.DatetimeIndex([pd.Timestamp(day)]))
 
 
 # ── Pre-market snapshot ──────────────────────────────────────────────────

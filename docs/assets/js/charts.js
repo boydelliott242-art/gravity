@@ -6,7 +6,7 @@
  * Measured charts re-render on container resize so text never scales.
  */
 
-import { DASH, esc, fmtDay, isNum, pct, price } from './util.js';
+import { DASH, esc, fmtDay, fmtTimeET, isNum, pct, price } from './util.js';
 
 const NS = 'http://www.w3.org/2000/svg';
 
@@ -72,6 +72,43 @@ export const FAMILY_HELP = {
   street: 'Analyst stance and downgrades',
   news: 'Tone of recent headlines',
 };
+
+/** Model feature families used by the per-pick attribution (§14.2), in plain words. */
+export const ATTR_FAMILIES = ['structure', 'exhaustion', 'decay', 'dilution', 'flow', 'market'];
+export const ATTR_LABEL = {
+  structure: 'Volatility & structure', exhaustion: 'Exhaustion', decay: 'Decay',
+  dilution: 'Dilution', flow: 'Flow', market: 'Market',
+};
+export const ATTR_HELP = {
+  structure: 'How volatile, small and cheap the name is — the model is partly a volatility forecast',
+  exhaustion: 'Size of the recent run-up, gap and stretch',
+  decay: 'Reverse splits, drawdown, distance below long averages',
+  dilution: 'Offerings, ATMs, shelf and resale registrations',
+  flow: 'Volume, short-sale share, liquidity',
+  market: 'Small-cap tape: breadth and the Russell 2000',
+};
+
+/** Sparkline from a bare list of closes (the universe file ships 30 of them). */
+export function sparkCloses(values, opts) {
+  return sparkline((values || []).map((c) => [null, null, null, null, c]), opts);
+}
+
+/**
+ * Tiny line for a dated history series: pts = [[date, value], ...] oldest → newest.
+ * Same marks as the sparkline; the caller prints first/last values beside it.
+ */
+export function miniLine(pts, { w = 160, h = 32, label = 'History' } = {}) {
+  const v = (pts || []).filter((r) => Array.isArray(r) && isNum(r[1]));
+  if (v.length < 2) return '';
+  const vals = v.map((r) => r[1]);
+  const lo = Math.min(...vals);
+  const hi = Math.max(...vals);
+  const x = linear(0, v.length - 1, 1, w - 3);
+  const y = linear(lo, hi === lo ? lo + 1 : hi, h - 2, 2);
+  let d = '';
+  vals.forEach((val, i) => { d += `${i ? 'L' : 'M'}${x(i).toFixed(1)} ${y(val).toFixed(1)}`; });
+  return `<svg class="spark spark--hist" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" role="img" aria-label="${esc(label)}"><path d="${d}" fill="none" stroke="#858e99" stroke-width="1" vector-effect="non-scaling-stroke"/><circle cx="${x(v.length - 1).toFixed(1)}" cy="${y(vals[vals.length - 1]).toFixed(1)}" r="2" fill="#ff2e4d"/></svg>`;
+}
 
 /** Six tiny vertical bars, one per signal family (0–100, null = dashed). */
 export function familyBars(fams) {
@@ -302,4 +339,56 @@ export function whisker(p, ci, base, max) {
   if (isNum(p)) s += `<line class="pt" x1="${x(p).toFixed(1)}" x2="${x(p).toFixed(1)}" y1="8" y2="28"/>`;
   s += '</svg>';
   return s;
+}
+
+/**
+ * Intraday line since the open: points = [[epoch_ms, price], ...]. The dashed
+ * line is the official open; times are US Eastern.
+ */
+export function intradayChart(el, points, { open = null, label = 'Intraday price since the open' } = {}) {
+  const pts = (points || []).filter((r) => Array.isArray(r) && isNum(r[0]) && isNum(r[1]));
+  if (pts.length < 2) {
+    el.innerHTML = '<p class="empty">No intraday points in this snapshot yet.</p>';
+    return () => {};
+  }
+  return responsive(el, (W) => {
+    const H = W < 520 ? 180 : 220;
+    const m = { t: 12, r: 56, b: 24, l: 4 };
+    const vals = pts.map((r) => r[1]);
+    let lo = Math.min(...vals);
+    let hi = Math.max(...vals);
+    if (isNum(open)) { lo = Math.min(lo, open); hi = Math.max(hi, open); }
+    const pad = (hi - lo) * 0.08 || hi * 0.02 || 0.01;
+    const t0 = pts[0][0];
+    const t1 = pts[pts.length - 1][0];
+    const x = linear(t0, t1 === t0 ? t0 + 1 : t1, m.l, W - m.r);
+    const y = linear(lo - pad, hi + pad, H - m.b, m.t);
+    let s = svgOpen(W, H, label);
+    for (const t of niceTicks(lo, hi, 3)) {
+      const yy = y(t).toFixed(1);
+      s += `<line class="grid" x1="${m.l}" x2="${W - m.r}" y1="${yy}" y2="${yy}"/><text x="${W - m.r + 8}" y="${+yy + 3}">${esc(price(t))}</text>`;
+    }
+    let d = '';
+    pts.forEach((r, i) => { d += `${i ? 'L' : 'M'}${x(r[0]).toFixed(1)} ${y(r[1]).toFixed(1)}`; });
+    const area = `${d}L${x(t1).toFixed(1)} ${H - m.b}L${x(t0).toFixed(1)} ${H - m.b}Z`;
+    s += `<path class="a-px" d="${area}"/>`;
+    if (isNum(open)) {
+      const yy = y(open).toFixed(1);
+      s += `<line class="zero" x1="${m.l}" x2="${W - m.r}" y1="${yy}" y2="${yy}" stroke-dasharray="3 3"/>`;
+      s += `<text class="lbl" x="${m.l + 2}" y="${(+yy - 5).toFixed(1)}">open ${esc(price(open))}</text>`;
+    }
+    s += `<path class="l-px" d="${d}"/>`;
+    s += `<line class="ax" x1="${m.l}" x2="${W - m.r}" y1="${H - m.b}" y2="${H - m.b}"/>`;
+    const n = W < 520 ? 3 : 5;
+    for (let i = 0; i < n; i++) {
+      const tt = t0 + ((t1 - t0) * i) / (n - 1);
+      const anchor = i === 0 ? 'start' : i === n - 1 ? 'end' : 'middle';
+      s += `<text x="${x(tt).toFixed(1)}" y="${H - 6}" text-anchor="${anchor}">${esc(fmtTimeET(new Date(tt).toISOString()))}</text>`;
+    }
+    const last = pts[pts.length - 1];
+    const below = isNum(open) && last[1] < open;
+    s += `<circle class="${below ? 'dot-red' : 'dot'}" cx="${x(last[0]).toFixed(1)}" cy="${y(last[1]).toFixed(1)}" r="3"/>`;
+    s += '</svg>';
+    el.innerHTML = s;
+  });
 }

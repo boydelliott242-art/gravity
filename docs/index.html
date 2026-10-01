@@ -9,6 +9,12 @@
   <meta name="color-scheme" content="dark">
   <meta name="referrer" content="strict-origin-when-cross-origin">
   <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="assets/img/icon-180.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="GRAVITY">
+  <link rel="alternate" type="application/rss+xml" title="GRAVITY — daily #1" href="feed.xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter+Tight:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600;700&display=swap">
@@ -24,7 +30,7 @@
     <div class="sample-banner" id="sample-banner" role="status" hidden>
       <div class="wrap">
         <strong>Sample data — pipeline has not published yet</strong>
-        <span>Every number below is placeholder. Tickers with digits are fictional; INHD figures are round placeholders, not quotes.</span>
+        <span>Every number below is placeholder. Tickers with digits are fictional.</span>
       </div>
     </div>
     <div class="stale-banner" id="stale-banner" role="status" hidden><div class="wrap"></div></div>
@@ -33,9 +39,12 @@
       <nav class="bar-nav" aria-label="Sections">
         <a href="#board">Board</a>
         <a href="#wire">Wire</a>
-        <a href="#position">INHD</a>
-        <a href="#twins">Twins</a>
+        <a href="#swing">Swing</a>
+        <a href="#twins">Lookalikes</a>
         <a href="#squeeze">Squeeze</a>
+        <a href="#market">Market</a>
+        <a href="#calendar">Calendar</a>
+        <a href="#lookup">Lookup</a>
         <a href="#record">Record</a>
         <a href="#evidence">Evidence</a>
         <a href="#method">Method</a>
@@ -75,6 +84,18 @@
       <div class="hero-body wrap" id="hero-body"></div>
     </section>
 
+    <!-- Live · LIVE -->
+    <section class="section" id="live" aria-labelledby="live-title" hidden>
+      <div class="wrap">
+        <header class="sec-head reveal">
+          <p class="sec-num">Live</p>
+          <h2 class="sec-title" id="live-title">Live <em>Tape</em></h2>
+          <p class="sec-dek">How today's #1 and the board are trading versus their open. Live and unofficial — refreshed about every 15 minutes during the session; the official grade comes from completed bars after the close.</p>
+        </header>
+        <div id="live-root"></div>
+      </div>
+    </section>
+
     <!-- 02 · BOARD -->
     <section class="section" id="board" aria-labelledby="board-title">
       <div class="wrap">
@@ -99,15 +120,15 @@
       </div>
     </section>
 
-    <!-- 04 · INHD -->
-    <section class="section" id="position" aria-labelledby="position-title">
+    <!-- 04 · SWING -->
+    <section class="section" id="swing" aria-labelledby="swing-title">
       <div class="wrap">
         <header class="sec-head reveal">
           <p class="sec-num">04</p>
-          <h2 class="sec-title" id="position-title">Your INHD <em>short</em></h2>
-          <p class="sec-dek">The reference position: what it has done since you shorted it, what it costs to hold, and what the filings say.</p>
+          <h2 class="sec-title" id="swing-title">Swing <em>Board</em></h2>
+          <p class="sec-dek">Highest modeled odds of falling 15% or more from the next open to the close five sessions later — for shorts held a week, not a day. Borrowable names only.</p>
         </header>
-        <div id="position-root"></div>
+        <div id="swing-root"></div>
       </div>
     </section>
 
@@ -116,8 +137,8 @@
       <div class="wrap">
         <header class="sec-head reveal">
           <p class="sec-num">05</p>
-          <h2 class="sec-title" id="twins-title">INHD <em>Twins</em></h2>
-          <p class="sec-dek">Names whose profile looks like INHD's — size, price, reverse-split habit, drawdown, dilution cadence, geography. Structurally similar, not guaranteed to behave the same.</p>
+          <h2 class="sec-title" id="twins-title">Lookalikes of <em>#1</em></h2>
+          <p class="sec-dek">Names whose profile resembles today's #1 — size, price, reverse-split habit, drawdown, dilution cadence, geography. Structurally similar, not guaranteed to behave the same.</p>
         </header>
         <div id="twins-root"></div>
       </div>
@@ -135,11 +156,47 @@
       </div>
     </section>
 
+    <!-- 07 · MARKET -->
+    <section class="section" id="market" aria-labelledby="market-title">
+      <div class="wrap">
+        <header class="sec-head reveal">
+          <p class="sec-num">07</p>
+          <h2 class="sec-title" id="market-title">Market <em>Regime</em></h2>
+          <p class="sec-dek">The tape everyone is trading in: breadth, yesterday's extremes, and how today's dump odds compare with the last year of sessions — then which sectors carry the most risk.</p>
+        </header>
+        <div id="market-root"></div>
+      </div>
+    </section>
+
+    <!-- 08 · CALENDAR -->
+    <section class="section" id="calendar" aria-labelledby="calendar-title">
+      <div class="wrap">
+        <header class="sec-head reveal">
+          <p class="sec-num">08</p>
+          <h2 class="sec-title" id="calendar-title">Catalyst <em>Calendar</em></h2>
+          <p class="sec-dek">Earnings from names in the universe over the next five sessions, and IPO lock-ups expiring around now (assumes the standard 180-day lock-up — check the prospectus).</p>
+        </header>
+        <div id="calendar-root"></div>
+      </div>
+    </section>
+
+    <!-- 09 · LOOKUP -->
+    <section class="section" id="lookup" aria-labelledby="lookup-title">
+      <div class="wrap">
+        <header class="sec-head reveal">
+          <p class="sec-num">09</p>
+          <h2 class="sec-title" id="lookup-title">Look up <em>any ticker</em></h2>
+          <p class="sec-dek">Every one of today's scored names — search, sort, and open any of them. Full dossiers exist for the board, swing board, squeeze zone and lookalikes; everything else gets a compact card.</p>
+        </header>
+        <div id="lookup-root"></div>
+      </div>
+    </section>
+
     <!-- 07 · TRACK RECORD -->
     <section class="section" id="record" aria-labelledby="record-title">
       <div class="wrap">
         <header class="sec-head reveal">
-          <p class="sec-num">07</p>
+          <p class="sec-num">10</p>
           <h2 class="sec-title" id="record-title">Track <em>Record</em></h2>
           <p class="sec-dek">Every published #1 is graded after the close against what actually happened — and against every other eligible name that day. Nothing is edited after grading.</p>
         </header>
@@ -151,7 +208,7 @@
     <section class="section" id="evidence" aria-labelledby="evidence-title">
       <div class="wrap">
         <header class="sec-head reveal">
-          <p class="sec-num">08</p>
+          <p class="sec-num">11</p>
           <h2 class="sec-title" id="evidence-title">Evidence <em>Lab</em></h2>
           <p class="sec-dek">How often each setup actually dumped the next session, measured on three years of small/micro-cap history. The whisker is a 95% interval; the dashed line is the base rate.</p>
         </header>
@@ -163,7 +220,7 @@
     <section class="section" id="method" aria-labelledby="method-title">
       <div class="wrap">
         <header class="sec-head reveal">
-          <p class="sec-num">09</p>
+          <p class="sec-num">12</p>
           <h2 class="sec-title" id="method-title">How it works <em>&amp; limits</em></h2>
           <p class="sec-dek">Read once. The short version: a probability, not a promise.</p>
         </header>
@@ -177,12 +234,12 @@
           <div>
             <h3>What goes in</h3>
             <ul>
-              <li><b>Nasdaq</b> — universe, quotes, pre-market prints, short interest</li>
-              <li><b>SEC EDGAR</b> — offerings, shelf and resale registrations, deficiency notices, reverse splits</li>
-              <li><b>FINRA</b> — daily short-sale volume</li>
-              <li><b>IBKR</b> — borrow availability and fee</li>
+              <li><b>Nasdaq</b> — universe, quotes, pre-market prints, intraday tape, short interest, earnings and IPO calendars</li>
+              <li><b>SEC EDGAR</b> — offerings (with deal price and ATM size from the prospectus), shelf and resale registrations, deficiency notices, reverse splits, share counts, cash runway, insider Form 4 sales</li>
+              <li><b>FINRA</b> — daily short-sale volume, back to 2024</li>
+              <li><b>IBKR</b> — borrow availability and fee, recorded every run</li>
               <li><b>Yahoo Finance</b> — split-adjusted daily history, float</li>
-              <li><b>Google News</b> — headlines, tagged</li>
+              <li><b>Google News &amp; Stocktwits</b> — headlines (tagged) and crowd chatter</li>
             </ul>
             <p style="margin-top:16px">Zacks, Bloomberg and Danelfin ratings are proprietary, so they are one-click links — never scraped or republished.</p>
           </div>

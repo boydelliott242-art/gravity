@@ -106,6 +106,7 @@ def test_twins_prefers_structurally_similar_names():
     assert "Asia-linked issuer" in out[0]["reasons"]
     assert all(t["symbol"] != "INHD" for t in out)
     assert twins.find_twins(rows, ref="NOPE") == []
+    assert twins.find_twins(rows) == []
 
 
 # ── scorecard ────────────────────────────────────────────────────────────

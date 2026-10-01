@@ -84,14 +84,18 @@ def assert_features_equal(a: pd.DataFrame, b: pd.DataFrame, cols: List[str] = FE
 
 # ── contract shape ───────────────────────────────────────────────────────
 def test_column_contract():
-    assert len(FEAT) == len(set(FEAT)) == 75
+    assert len(FEAT) == len(set(FEAT)) == 75 + (len(F.FINRA_FEATURES) if F.USE_FINRA else 0)
     assert F.M1_EXTRA == ["gap_open"]
-    assert F.LABELS == ["y_oc", "y_co", "y_gap", "y_ol", "y_oh", "y_c5", "y_dump", "y_bigdump", "y_squeeze"]
-    assert set(F.FEATURE_DOCS) == set(FEAT) | set(F.M1_EXTRA)
+    assert F.LABELS == ["y_oc", "y_co", "y_gap", "y_ol", "y_oh", "y_c5", "y_dump", "y_bigdump", "y_squeeze",
+                        "y_swing", "y_pump", "y_h5"]
+    assert F.PANEL_FEATURES[:len(FEAT)] == FEAT and set(F.FINRA_FEATURES) <= set(F.PANEL_FEATURES)
+    assert set(F.FEATURE_DOCS) == set(F.PANEL_FEATURES) | set(F.M1_EXTRA)
+    assert all(F.FEATURE_DOCS[c][0] == "flow" for c in F.FINRA_FEATURES)
     assert all(fam in F.FAMILIES and desc for fam, desc in F.FEATURE_DOCS.values())
     assert "gap_open" not in FEAT  # M0 must never see the open
     p = build(universe(), {s: [] for s in SYMS})
-    assert list(p.columns) == F.INFO_COLUMNS + FEAT + F.M1_EXTRA + F.LABELS
+    assert list(p.columns) == F.INFO_COLUMNS + F.PANEL_FEATURES + F.M1_EXTRA + F.LABELS == F.PANEL_COLUMNS
+    assert p[F.FINRA_FEATURES].isna().all().all()     # no short_vol passed → unknown, not zero
     assert not p.duplicated(["date", "symbol"]).any()
     X = p[FEAT].to_numpy(float)
     assert not np.isinf(X).any()
@@ -283,12 +287,18 @@ def test_labels_describe_next_session_exactly():
         assert r["y_dump"] == float(C1 / O1 - 1 <= config.DUMP_THRESHOLD)
         assert r["y_bigdump"] == float(C1 / O1 - 1 <= config.BIG_DUMP_THRESHOLD)
         assert r["y_squeeze"] == float(H1 / O1 - 1 >= config.SQUEEZE_THRESHOLD)
+        assert r["y_swing"] == float(np.float32(df.loc[t5, "close"] / O1 - 1) <= F.SWING_THRESHOLD)
+        assert r["y_pump"] == float(np.float32(C1 / O1 - 1) >= F.PUMP_THRESHOLD)
+        np.testing.assert_allclose(r["y_h5"], df["high"].iloc[t_i + 1:t_i + 6].max() / O1 - 1, rtol=1e-5)
         # features at t use t's own bar
         np.testing.assert_allclose(r["r1"], C0 / df["close"].iloc[t_i - 1] - 1, rtol=1e-5)
         np.testing.assert_allclose(r["intraday"], C0 / df.loc[t, "open"] - 1, rtol=1e-5)
     last = p.xs("CCC", level="symbol").iloc[-1]
     assert np.isnan(last[F.LABELS].to_numpy(float)).all() and np.isnan(last["gap_open"])
     assert np.isnan(p.xs("CCC", level="symbol").iloc[-3]["y_c5"])
+    # y_swing / y_h5 need t+5; y_pump only needs t+1
+    r3 = p.xs("CCC", level="symbol").iloc[-3]
+    assert np.isnan(r3["y_swing"]) and np.isnan(r3["y_h5"]) and np.isfinite(r3["y_pump"])
 
 
 def test_threshold_edges():
@@ -303,6 +313,32 @@ def test_threshold_edges():
     assert r["y_dump"] == 1.0 and r["y_bigdump"] == 0.0 and r["y_squeeze"] == 1.0
     r2 = p.loc[(t1, "AAA")]
     assert r2["y_dump"] == 1.0 and r2["y_bigdump"] == 1.0 and r2["y_squeeze"] == 0.0
+    assert r["y_pump"] == 0.0 and r2["y_pump"] == 0.0
+
+
+def test_swing_and_pump_label_edges():
+    hist = universe()
+    df = hist["AAA"]
+    t_i = 100
+    o1 = float(df["open"].iloc[t_i + 1])
+    # close 5 sessions later exactly −15% from the next open → swing; +5% open→close next day → pump
+    df.iloc[t_i + 5, df.columns.get_loc("close")] = o1 * 0.85
+    df.iloc[t_i + 5, df.columns.get_loc("low")] = min(df["low"].iloc[t_i + 5], o1 * 0.85)
+    df.iloc[t_i + 1, df.columns.get_loc("close")] = o1 * 1.05
+    df.iloc[t_i + 1, df.columns.get_loc("high")] = max(df["high"].iloc[t_i + 1], o1 * 1.05)
+    df.iloc[t_i + 3, df.columns.get_loc("high")] = o1 * 1.60          # adverse excursion inside the window
+    p = keyed(build(hist))
+    r = p.loc[(DATES[t_i], "AAA")]
+    assert r["y_swing"] == 1.0 and r["y_pump"] == 1.0
+    np.testing.assert_allclose(r["y_h5"], 0.60, rtol=1e-5)
+    # one cent less of a drop → not a swing
+    df.iloc[t_i + 5, df.columns.get_loc("close")] = o1 * 0.86
+    r = keyed(build(hist)).loc[(DATES[t_i], "AAA")]
+    assert r["y_swing"] == 0.0
+    # a halted session at t+5 → no swing label, pump still known
+    df.iloc[t_i + 5, df.columns.get_loc("volume")] = 0.0
+    r = keyed(build(hist)).loc[(DATES[t_i], "AAA")]
+    assert np.isnan(r["y_swing"]) and np.isnan(r["y_h5"]) and r["y_pump"] == 1.0
 
 
 @pytest.mark.parametrize("how", ["zero_volume", "nan_prices", "missing_row", "bad_print"])
@@ -407,3 +443,115 @@ def test_live_row_equals_training_row():
     full = build(hist)
     live = F.latest_rows(build({s: df[df.index <= t] for s, df in hist.items()}))
     assert_features_equal(live, full[full["date"] == t])
+
+
+# ── FINRA short volume (family "flow") ───────────────────────────────────
+def finra_frame(hist: Dict[str, pd.DataFrame], seed: int = 3, share: float = 0.4,
+                drop: Optional[set] = None) -> pd.DataFrame:
+    """Synthetic FINRA history for every bar: total = share × volume, short ~ 30–70 %."""
+    rng = np.random.default_rng(seed)
+    rows = []
+    for s, df in hist.items():
+        for d, v in df["volume"].items():
+            if drop and (s, d) in drop:
+                continue
+            tot = share * float(v)
+            rows.append((d, s, tot * rng.uniform(0.3, 0.7), tot))
+    return pd.DataFrame(rows, columns=["date", "symbol", "short_volume", "total_volume"])
+
+
+def build_sv(hist, sv, splits=None):
+    return F.build_panel(hist, {}, splits or {}, STATIC, bench(), short_vol=sv)
+
+
+def test_finra_features_exact_values():
+    hist = universe()
+    sv = finra_frame(hist)
+    p = keyed(build_sv(hist, sv))
+    g = sv[sv["symbol"] == "BBB"].set_index("date").sort_index()
+    ratio = g["short_volume"] / g["total_volume"]
+    for t_i in (80, 121):
+        t = DATES[t_i]
+        r = p.loc[(t, "BBB")]
+        np.testing.assert_allclose(r["sv_ratio_1"], ratio.loc[t], rtol=1e-5)
+        w5 = g.iloc[t_i - 4:t_i + 1]
+        np.testing.assert_allclose(r["sv_ratio_5"], w5["short_volume"].sum() / w5["total_volume"].sum(), rtol=1e-5)
+        w20 = g.iloc[t_i - 19:t_i + 1]
+        np.testing.assert_allclose(r["sv_ratio_20"], w20["short_volume"].sum() / w20["total_volume"].sum(), rtol=1e-5)
+        prior = ratio.iloc[t_i - 20:t_i]
+        z = (ratio.loc[t] - prior.mean()) / max(prior.std(ddof=1), F.FINRA_Z_SD_FLOOR)
+        np.testing.assert_allclose(r["sv_ratio_z"], z, rtol=1e-4)
+        np.testing.assert_allclose(r["finra_share"], 0.4, rtol=1e-5)
+
+
+def test_finra_future_rows_invisible_and_same_day_visible():
+    hist = universe()
+    t_i = 110
+    t = DATES[t_i]
+    sv = finra_frame(hist)
+    p0 = build_sv(hist, sv)
+    # rewrite, add and drop every FINRA row dated after t
+    sv1 = sv.copy()
+    after = pd.to_datetime(sv1["date"]) > t
+    sv1.loc[after, "short_volume"] = sv1.loc[after, "total_volume"] * 0.99
+    sv1 = sv1[~(after & (sv1["symbol"] == "CCC"))]
+    extra = pd.DataFrame({"date": [DATES[t_i + 1]], "symbol": ["ZZZ"], "short_volume": [1.0], "total_volume": [2.0]})
+    p1 = build_sv(hist, pd.concat([sv1, extra], ignore_index=True))
+    cols = F.PANEL_FEATURES
+    assert_features_equal(p0[p0["date"] <= t], p1[p1["date"] <= t], cols)
+    fa, fb = keyed(p0[p0["date"] > t]), keyed(p1[p1["date"] > t])
+    assert not np.allclose(fa["sv_ratio_1"].to_numpy(float), fb["sv_ratio_1"].to_numpy(float), equal_nan=True)
+    # a FINRA row dated t is visible at t (published after t's close, used for t+1)
+    sv2 = sv.copy()
+    on_t = (pd.to_datetime(sv2["date"]) == t) & (sv2["symbol"] == "AAA")
+    sv2.loc[on_t, "short_volume"] = sv2.loc[on_t, "total_volume"] * 0.95
+    p2 = keyed(build_sv(hist, sv2))
+    assert p2.loc[(t, "AAA"), "sv_ratio_1"] == pytest.approx(0.95, rel=1e-5)
+    assert keyed(p0).loc[(DATES[t_i - 1], "AAA"), "sv_ratio_1"] == pytest.approx(
+        p2.loc[(DATES[t_i - 1], "AAA"), "sv_ratio_1"], rel=1e-7)
+
+
+def test_finra_missing_is_nan_not_zero():
+    hist = universe()
+    t = DATES[100]
+    drop = {("AAA", d) for d in DATES[90:101]}
+    p = keyed(build_sv(hist, finra_frame(hist, drop=drop)))
+    r = p.loc[(t, "AAA")]
+    assert np.isnan(r["sv_ratio_1"]) and np.isnan(r["sv_ratio_5"]) and np.isnan(r["finra_share"])
+    assert np.isnan(r["sv_ratio_20"])                           # only 9 of the last 20 known (< 12)
+    a = p.xs("AAA", level="symbol")
+    assert np.isnan(a.loc[DATES[102], "sv_ratio_5"])            # 2 known of 5 (< 3)
+    assert np.isfinite(a.loc[DATES[103], "sv_ratio_5"])         # 3 known
+    assert np.isnan(a.loc[DATES[111], "sv_ratio_20"])           # 11 known
+    assert np.isfinite(a.loc[DATES[112], "sv_ratio_20"])        # 12 known
+    assert np.isnan(a.loc[DATES[101], "sv_ratio_z"])            # < 10 known in the prior 20
+    assert np.isfinite(p.loc[(t, "BBB"), "sv_ratio_1"])
+
+
+def test_finra_share_uses_as_traded_volume_after_future_split():
+    """Yahoo scales pre-split volume by the split; FINRA reports as-traded
+    shares. A 1-for-10 reverse split after t must not change finra_share at t."""
+    hist = universe()
+    s_i = 130
+    sd = DATES[s_i]
+    raw = hist["DDD"].copy()                          # as traded: price ×1 before, ×10 after
+    raw.loc[raw.index >= sd, ["open", "high", "low", "close"]] *= 10.0
+    raw.loc[raw.index >= sd, "volume"] /= 10.0
+    sv = finra_frame({"DDD": raw})                    # FINRA shares = 0.4 × as-traded volume
+    adj = raw.copy()                                  # Yahoo-adjusted history
+    adj.loc[adj.index < sd, ["open", "high", "low", "close"]] *= 10.0
+    adj.loc[adj.index < sd, "volume"] /= 10.0
+    h = {**universe(), "DDD": adj}
+    p = keyed(build_sv(h, sv, splits={"DDD": [{"date": str(sd.date()), "ratio": 0.1}]}))
+    for t_i in (100, 129, 140):
+        np.testing.assert_allclose(p.loc[(DATES[t_i], "DDD"), "finra_share"], 0.4, rtol=1e-5)
+
+
+def test_finra_live_row_equals_training_row():
+    hist = universe()
+    sv = finra_frame(hist)
+    t = DATES[120]
+    full = build_sv(hist, sv)
+    live = F.latest_rows(build_sv({s: df[df.index <= t] for s, df in hist.items()},
+                                  sv[pd.to_datetime(sv["date"]) <= t]))
+    assert_features_equal(live, full[full["date"] == t], F.PANEL_FEATURES)

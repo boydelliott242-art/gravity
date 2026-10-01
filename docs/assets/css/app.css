@@ -675,7 +675,7 @@ table { border-collapse: collapse; width: 100%; }
 .sev i.on { background: var(--red); }
 .more { margin-top: var(--s3); }
 
-/* ── Position (INHD) ──────────────────────────────────────────────────── */
+/* ── Position panel (retired; kept for older feeds) ───────────────────────────────────────────────────────────────────────── */
 .pos-grid {
   display: grid;
   grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.4fr);
@@ -1222,3 +1222,45 @@ button.hero-ticker:hover { opacity: 0.86; }
   .masthead, .hero-art, .dossier, body::after { display: none !important; }
   body { background: #fff; color: #000; }
 }
+
+/* ── add-ons (§14): same tokens, same hairlines ─────────────────────────── */
+.hero-sub { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--s1) var(--s4); padding: var(--s2) 0; margin-bottom: var(--s4); border-bottom: 1px solid var(--line); }
+.hero-sub__line { font-size: 13px; color: var(--fg-2); display: flex; flex-wrap: wrap; gap: var(--s1); align-items: baseline; }
+.hero-sub__line b { font: 500 14px/1 var(--mono); color: var(--fg); }
+.hbars--mini li { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 44px; padding-block: 6px; font-size: 12px; }
+.hbars--mini .b { height: 6px; }
+.hbars .base { position: absolute; top: -3px; bottom: -3px; width: 1px; background: var(--fg); opacity: 0.6; }
+.tk--sm { font: 500 12px/1.2 var(--mono); color: var(--fg-2); }
+.tk--sm:hover, .mtable .tk:hover { color: var(--fg); text-decoration: underline; text-underline-offset: 3px; text-decoration-thickness: 1px; }
+.mtable .tk { font: 500 13px/1.3 var(--mono); color: var(--fg); letter-spacing: 0.02em; }
+.mtable .tk--quiet { color: var(--fg-2); }
+.mtable .nm { display: block; color: var(--fg-3); font: 400 12px/1.4 var(--sans); margin-top: 2px; max-width: 34ch; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mtable tr.grp th { padding-top: var(--s3); font: 500 10.5px/1.2 var(--mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--fg-3); }
+.mtable td.red { color: var(--red); }
+.mtable .chip { margin: 4px 4px 0 0; }
+.mtable .c-prob { min-width: 150px; }
+.mtable .c-prob .pv { display: block; font: 500 13px/1.2 var(--mono); margin-bottom: 4px; }
+.swing-table .sw-name .chips, .swing-table .sw-name .flags { margin-top: 4px; }
+.live-note { margin-bottom: var(--s3); }
+.lk-search { flex: 1 1 280px; max-width: 420px; }
+.lk-search input { width: 100%; background: var(--bg-1); color: var(--fg); border: 1px solid var(--line-2); border-radius: 0; padding: 12px 14px; font: 500 15px/1.2 var(--mono); letter-spacing: 0.02em; }
+.lk-search input::placeholder { color: var(--fg-4); font-family: var(--sans); letter-spacing: 0; }
+.lk-search input:focus-visible { outline: 1px solid var(--fg-3); outline-offset: 2px; border-color: var(--line-3); }
+.lk-table tbody tr { cursor: pointer; }
+.lk-table tbody tr:hover th, .lk-table tbody tr:hover td { background: var(--bg-1); }
+.lk-table th button[data-lksort] { font: inherit; color: inherit; letter-spacing: inherit; text-transform: inherit; }
+.lk-pager { display: flex; align-items: center; justify-content: flex-end; gap: var(--s2); margin-top: var(--s2); color: var(--fg-3); font-size: 12px; }
+.lk-pager button[disabled] { opacity: 0.35; pointer-events: none; }
+.lk-card { margin: var(--s2) 0 var(--s4); }
+.lk-card .tiles { margin: var(--s2) 0; }
+.lk-card__row { display: flex; align-items: center; gap: var(--s2); margin-bottom: var(--s2); color: var(--fg-3); font-size: 12px; }
+.hist-row { display: grid; grid-template-columns: minmax(0, 190px) 160px auto; gap: var(--s2); align-items: center; padding-block: 10px; border-top: 1px solid var(--line); }
+.hist-row:last-of-type { border-bottom: 1px solid var(--line); }
+.hist-row .mono { font-size: 12px; color: var(--fg-2); }
+@media (max-width: 760px) {
+  .hist-row { grid-template-columns: 1fr; gap: var(--s1); }
+  .mtable .nm { max-width: 22ch; }
+  .lk-search { max-width: none; }
+}
+.swing-table th:nth-child(2), .swing-table td:nth-child(2) { text-align: left; font-family: var(--sans); }
+.swing-table .sw-name .tk { display: inline-block; }

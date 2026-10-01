@@ -81,6 +81,8 @@ def exclusion_reason(symbol: str, name: str, sector: str = "", industry: str = "
         return "test"
     if "^" in sym:
         return "preferred"
+    if sym.endswith(("/WS", ".WS", "-WS")) or "/WS/" in sym or sym.endswith(("/W", ".W")):
+        return "warrant"          # NYSE-style warrant tickers ("RAC/WS") with unhelpful names
     if _TEST_SYMBOL.match(sym):
         return "test"
     if _PREFERRED.search(nm):
