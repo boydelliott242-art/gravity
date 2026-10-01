@@ -35,7 +35,8 @@ def build(limit: int = 40) -> str:
         if not sym:
             continue
         p = top.get("prob_dump")
-        title = f"{rec['session_date']} · #1 {sym}" + (f" — {p * 100:.0f}% odds of a 5%+ open→close drop" if p else "")
+        label = "pre-market #1" if rec.get("run") == "morning" else "watchlist #1 (evening before)"
+        title = f"{rec['session_date']} · {label}: {sym}" + (f" — {p * 100:.0f}% odds of a 5%+ open→close drop" if p else "")
         out = (rec.get("outcome") or {}).get("top") or {}
         if out.get("missing"):
             result = "Result: halted / no regular-session trades."
@@ -50,8 +51,8 @@ def build(limit: int = 40) -> str:
             "<item>"
             f"<title>{escape(title)}</title>"
             f"<link>{escape(SITE)}#/{escape(sym)}</link>"
-            f"<guid isPermaLink=\"false\">gravity-{escape(rec['session_date'])}</guid>"
-            f"<pubDate>{_rfc822(rec.get('first_published_at') or rec.get('published_at') or '')}</pubDate>"
+            f"<guid isPermaLink=\"false\">gravity-{escape(rec['session_date'])}-{escape(str(rec.get('run')))}-{escape(sym)}</guid>"
+            f"<pubDate>{_rfc822(rec.get('published_at') or rec.get('first_published_at') or '')}</pubDate>"
             f"<description>{escape(desc)}</description>"
             "</item>"
         )

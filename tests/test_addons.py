@@ -65,3 +65,30 @@ def test_live_row_math():
 def test_live_skips_outside_session(monkeypatch):
     monkeypatch.setattr(live, "market_phase", lambda: "closed")
     assert live.run(push=False) == 0
+
+
+def test_live_rejects_quotes_from_another_session():
+    q = {"open": 2.0, "last": 1.6, "high": 2.1, "low": 1.5, "session_date": "2026-09-30", "points_session": "regular"}
+    assert live._row("AAA", q, "2026-10-01") is None            # yesterday's tape for a halted name
+    assert live._row("AAA", dict(q, session_date="2026-10-01"), "2026-10-01")["oc_now"] == pytest.approx(-0.2)
+    assert live._row("AAA", dict(q, session_date="2026-10-01", points_session="pre"), "2026-10-01") is None
+
+
+def test_with_point_appends_or_replaces_today():
+    from gravity.cli import _with_point
+    assert _with_point([["2026-09-30", 0.2]], ["2026-10-01", 0.3]) == [["2026-09-30", 0.2], ["2026-10-01", 0.3]]
+    assert _with_point([["2026-10-01", 0.1]], ["2026-10-01", 0.3]) == [["2026-10-01", 0.3]]
+    assert _with_point([["2026-09-30", 0.2]], None) == [["2026-09-30", 0.2]]
+    assert _with_point([["2026-09-30", 0.2]], ["2026-10-01", None]) == [["2026-09-30", 0.2]]
+
+
+def test_rss_guid_changes_when_the_morning_pick_differs(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "PICK_LOG", tmp_path)
+    rec = {"session_date": "2026-10-01", "run": "evening", "published_at": "2026-10-01T00:00:00+00:00",
+           "top": {"symbol": "AAA", "prob_dump": 0.3}, "board": []}
+    (tmp_path / "2026-10-01.json").write_text(json.dumps(rec))
+    g1 = ET_.fromstring(feed.build()).find("./channel/item/guid").text
+    (tmp_path / "2026-10-01.json").write_text(json.dumps(dict(rec, run="morning", top={"symbol": "BBB", "prob_dump": 0.3})))
+    root = ET_.fromstring(feed.build())
+    assert root.find("./channel/item/guid").text != g1
+    assert "pre-market #1: BBB" in root.find("./channel/item/title").text

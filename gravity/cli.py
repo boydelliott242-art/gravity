@@ -285,6 +285,7 @@ def _publish_today(today: dict, args: argparse.Namespace, message: str) -> int:
         log.info("run is after the open — keeping the pre-open page for %s", today["session_date"])
         return 0
     publish.write_json("today.json", today)
+    _flush_side()
     if not today["late"]:
         scorecard.log_picks(today)
         from . import feed
@@ -294,6 +295,8 @@ def _publish_today(today: dict, args: argparse.Namespace, message: str) -> int:
     if args.no_push:
         return 0
     if publish.push(message):
+        if not today["late"] and _is_late(today["session_date"]):
+            scorecard.mark_unverified(today["session_date"], "push confirmed only after the 9:30 ET open")
         return 0
     if not today["late"]:
         scorecard.mark_unverified(today["session_date"], "push to GitHub not confirmed at publish time")
@@ -340,7 +343,11 @@ def cmd_morning(args: argparse.Namespace) -> int:
         if st is None:
             return True
         d = pd.to_datetime(st["latest"]["date"])
-        return d.max().date() < prev_trading_day(session) or (d == d.max()).mean() < 0.9
+        if d.max().date() < prev_trading_day(session) or (d == d.max()).mean() < 0.9:
+            return True
+        # the evening ran before IWM's bar existed → market features blank: refresh once
+        iw = st["latest"].get("iwm_r1")
+        return iw is not None and bool(pd.isna(iw[d == d.max()]).all())
 
     try:
         if stale(state):
@@ -364,8 +371,8 @@ def cmd_morning(args: argparse.Namespace) -> int:
     rc = _publish_today(today, args, f"morning: {today['session_date']} #1 {top}")
     if rc == 0 and not args.no_push and today.get("top") and not today.get("late"):
         tp = today["top"]
-        publish._notify(f"Today's #1: {tp['symbol']} — {tp['prob_dump'] * 100:.0f}% odds of a 5%+ open→close drop "
-                        f"(squeeze odds {tp.get('prob_squeeze', 0) * 100:.0f}%). Research, not advice.")
+        publish._notify(f"Today's #1: {tp['symbol']} — {(tp.get('prob_dump') or 0) * 100:.0f}% odds of a 5%+ open→close drop "
+                        f"(squeeze odds {(tp.get('prob_squeeze') or 0) * 100:.0f}%). Research, not advice.")
     return rc
 
 
@@ -535,6 +542,7 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
         if c not in latest.columns:
             latest[c] = np.nan
     latest["model_used"] = "m0"
+    latest["prob_dump_m0"] = latest["prob_dump"]
 
     # 3) shortlist → pre-market snapshot → M1 where we have a gap proxy
     order = latest.sort_values("prob_dump", ascending=False)
@@ -587,9 +595,7 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
     else:
         latest["short_ratio_5d"] = np.nan
     latest["borrow_status"] = [score.shortability(s, borrow, borrow_ok)["status"] for s in latest.index]
-    _safe(history.save_probs, session.isoformat(), last_date.date().isoformat(), latest["prob_dump"])
-    if borrow_ok:
-        _safe(history.save_borrow, now_et().date().isoformat(), borrow, list(latest.index))
+    today_iso, run_day = session.isoformat(), now_et().date().isoformat()
 
     # 6) families (descriptive) + model attribution (what the model actually weighed)
     feature_docs = getattr(features, "FEATURE_DOCS", {})
@@ -666,7 +672,9 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
         nws = E["news"].get(sym, [])[:8]
         reasons, flags = score.build_reasons(
             m, pre.get(sym), filings, splits.get(sym, []), nws, short, session, notes.get(sym))
-        tight = history.borrow_tightening(sym)
+        b_now = borrow.get(sym) if borrow_ok else None
+        b_pt = [run_day, b_now.get("fee_rate"), b_now.get("available")] if b_now else None
+        tight = history.borrow_tightening(sym, b_pt)
         if tight:
             reasons.append({"family": "flow", "text": tight, "strength": 2, "url": None})
             flags.append("BORROW TIGHTENING")
@@ -712,7 +720,8 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
             "filings": filings, "news": nws,
             "street": {"analyst": a, "danelfin": danel.get(sym)},
             "dilution": dil, "insider": E["insider"].get(sym), "chatter": E["chatter"].get(sym),
-            "borrow_history": history.borrow_history(sym), "prob_history": history.prob_history(sym),
+            "borrow_history": _with_point(history.borrow_history(sym), b_pt),
+            "prob_history": _with_point(history.prob_history(sym), [today_iso, m.get("prob_dump")] if m.get("prob_dump") is not None else None),
             "links": _safe(street.deep_links, sym, cik, default={}) or {},
             "chart": score.chart_rows(hist.get(sym)) if with_chart else [],
         }
@@ -809,10 +818,40 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
         "sources": [st for st in net.STATUS.values() if "(optional)" not in str(st.get("detail", ""))],
         "disclaimer": DISCLAIMER,
     }
-    # side files: full-universe lookup + history stores
-    _safe(_write_universe, latest, hist, borrow, borrow_ok, events, splits, rank_of, session, pre, notes)
+    # side files (full-universe lookup + history stores) are written only when
+    # this page is actually published — see _publish_today / _flush_side
+    pick_sqd = {p["symbol"]: p["squeeze_danger"] for p in board + swing_board + squeeze_zone + [t["pick"] for t in twin_cards]}
+    _PENDING_SIDE.clear()
+    _PENDING_SIDE.update({
+        "universe": (latest, hist, borrow, borrow_ok, events, splits, rank_of, session, pre, notes, pick_sqd),
+        "probs": (today_iso, last_date.date().isoformat(), latest["prob_dump"].copy()),
+        "borrow": (run_day, borrow, list(latest.index)) if borrow_ok else None,
+    })
     log.info("built today (%s run) for %s in %.0fs — #1 %s", run, session, time.time() - t0, (top or {}).get("symbol"))
     return clean(today)
+
+
+_PENDING_SIDE: Dict[str, Any] = {}
+
+
+def _with_point(series: List[list], pt: Optional[list]) -> List[list]:
+    """History + today's not-yet-saved point (replacing a same-day entry)."""
+    if not pt or pt[1] is None:
+        return series
+    return [r for r in series if r[0] != pt[0]] + [pt]
+
+
+def _flush_side() -> None:
+    """Write the deferred side files of the page that was just published."""
+    from . import history
+    side = dict(_PENDING_SIDE)
+    _PENDING_SIDE.clear()
+    if side.get("universe"):
+        _safe(_write_universe, *side["universe"])
+    if side.get("probs"):
+        _safe(history.save_probs, *side["probs"])
+    if side.get("borrow"):
+        _safe(history.save_borrow, *side["borrow"])
 
 
 def _market_block(latest: pd.DataFrame, state: dict) -> dict:
@@ -822,7 +861,7 @@ def _market_block(latest: pd.DataFrame, state: dict) -> dict:
         return pd.to_numeric(latest[c], errors="coerce") if c in latest.columns else pd.Series(dtype=float)
 
     r1 = col("r1")
-    mean_p = float(col("prob_dump").mean()) if len(latest) else None
+    mean_p = float(col("prob_dump_m0").mean()) if len(latest) else None
     regime_pct, regime = None, None
     try:
         hist_means = json.loads(REGIME_PATH.read_text())
@@ -880,7 +919,7 @@ def _calendar_block(session: date, latest: pd.DataFrame, hist: dict) -> dict:
     return {"earnings": [e for e in earn if e["in_universe"]][:80], "lockups": locks[:40]}
 
 
-def _write_universe(latest, hist, borrow, borrow_ok, events, splits, rank_of, session, pre, notes) -> None:
+def _write_universe(latest, hist, borrow, borrow_ok, events, splits, rank_of, session, pre, notes, pick_sqd=None) -> None:
     cols = ["symbol", "name", "price", "market_cap", "prob_dump", "prob_squeeze", "prob_swing", "skew", "score",
             "board_rank", "ssr", "publishable", "borrow_status", "fee_rate", "available", "squeeze_danger",
             "sector", "country", "flags", "spark"]
@@ -888,7 +927,10 @@ def _write_universe(latest, hist, borrow, borrow_ok, events, splits, rank_of, se
     for s, r in latest.iterrows():
         m = {k: (None if (not isinstance(v, (list, dict)) and pd.isna(v)) else v) for k, v in r.items()}
         short = score.shortability(s, borrow, borrow_ok)
-        sqd, _ = score.squeeze_danger(m.get("sq_pct"), short, None, None, None, m.get("short_ratio_5d"))
+        if pick_sqd and s in pick_sqd:
+            sqd = pick_sqd[s]          # the full score shown on the board/dossier
+        else:                          # partial: no short-interest / float lookups for the long tail
+            sqd, _ = score.squeeze_danger(m.get("sq_pct"), short, None, None, None, m.get("short_ratio_5d"))
         _, flags = score.build_reasons(m, pre.get(s), _filings_for(s, events, {})[:8], splits.get(s, []),
                                        [], short, session, notes.get(s))
         df = hist.get(s)

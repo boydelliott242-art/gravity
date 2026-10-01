@@ -1045,6 +1045,7 @@ function renderLive() {
   if (el && top) {
     try { S.disposers.live.push(intradayChart(el, top.points, { open: top.open, label: `${top.symbol} since the open` })); } catch (e) { console.error('[gravity] live chart', e); }
   }
+  revealAll(root);  // re-rendered nodes must not stay at opacity 0
 }
 
 let livePoll = 0;
@@ -1072,7 +1073,7 @@ function renderSwing() {
   const bt = isNum(sw.pub1_hit) || isNum(sw.top1_hit)
     ? `<p class="note" style="margin-bottom:24px">Backtest (out of sample): the top swing pick fell 15%+ by the fifth close on ${esc(pct(isNum(sw.pub1_hit) ? sw.pub1_hit : sw.top1_hit))} of entries${isNum(sw.pub1_mean_c5) ? `, averaging ${esc(pct(sw.pub1_mean_c5, 1, true))}` : ''}${isNum(bs) ? ` — versus ${esc(pct(bs, 1))} for the average name` : ''}. Multi-day shorts also pay borrow every day and ride every overnight gap.</p>` : '';
   root.innerHTML = `${bt}<div class="table-scroll reveal"><table class="mtable swing-table"><caption class="sr-only">Swing board: highest odds of a 15%+ fall over five sessions</caption>
-    <thead><tr><th scope="col">#</th><th scope="col">Ticker</th><th scope="col">Swing odds${isNum(bs) ? ` <span class="muted">· base ${esc(pct(bs, 1))}</span>` : ''}</th><th scope="col">Skew</th><th scope="col">Today's dump odds</th><th scope="col">Borrow</th><th scope="col">Board</th></tr></thead>
+    <thead><tr><th scope="col">#</th><th scope="col">Ticker</th><th scope="col">Swing odds${isNum(bs) ? ` <span class="muted">· base ${esc(pct(bs, 1))}</span>` : ''}</th><th scope="col">Today's skew</th><th scope="col">Today's dump odds</th><th scope="col">Borrow</th><th scope="col">Board</th></tr></thead>
     <tbody>${sb.map((p) => `<tr>
       <td>${isNum(p.rank) ? pad2(p.rank) : DASH}</td>
       <th scope="row" class="sw-name"><button type="button" class="tk" data-open="${esc(p.symbol)}">${esc(p.symbol)}</button><span class="nm">${txt([p.name, p.country].filter(Boolean).join(' · '))}</span>${arr(p.flags).length ? flagChips(p.flags, 3) : ''}</th>
@@ -1085,6 +1086,10 @@ function renderSwing() {
 }
 
 /* ── market regime & sector heat ───────────────────────────────────────── */
+function ordinal(n) {
+  const v = n % 100;
+  return `${n}${v >= 11 && v <= 13 ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' })[n % 10] || 'th'}`;
+}
 function renderMarket() {
   const root = $('#market-root');
   if (!root) return;
@@ -1092,7 +1097,7 @@ function renderMarket() {
   const secs = arr(S.today && S.today.sectors);
   if (!m && !secs.length) { root.innerHTML = empty('No market block in this feed yet.'); return; }
   const mm = obj(m);
-  const regime = mm.regime ? `${humanize(mm.regime)}${isNum(mm.regime_pct) ? ` · ${Math.round(mm.regime_pct)}th pct` : ''}` : DASH;
+  const regime = mm.regime ? `${humanize(mm.regime)}${isNum(mm.regime_pct) ? ` · ${ordinal(Math.round(mm.regime_pct))} pct` : ''}` : DASH;
   const tiles = `<dl class="tiles reveal">
     ${stat('Dump-odds regime', esc(regime), 'today\'s average odds vs the last year of sessions')}
     ${stat('Up yesterday', esc(pct(mm.breadth_up)), esc(`median name ${pct(mm.median_r1, 1, true)} · IWM ${pct(mm.iwm_r1, 1, true)}`))}
@@ -1123,9 +1128,16 @@ function renderCalendar() {
     ? `<div class="table-scroll"><table class="mtable"><caption class="sr-only">Earnings from names in the universe, next five sessions</caption><thead><tr><th scope="col">Ticker</th><th scope="col">When</th><th scope="col">EPS est.</th><th scope="col">Dump odds</th></tr></thead><tbody>${Object.keys(byDay).sort().map((d) => `<tr class="grp"><th scope="rowgroup" colspan="4">${esc(fmtDay(d))}</th></tr>${byDay[d].map((e) => `<tr><th scope="row">${tk(e.symbol)} <span class="nm">${txt(e.name)}</span></th><td>${esc(TIME[e.time] || humanize(e.time || '') || DASH)}</td><td>${esc(e.eps_forecast || DASH)}</td><td>${esc(pct(e.prob_dump))}</td></tr>`).join('')}`).join('')}</tbody></table></div>`
     : empty('No universe names report in the next five sessions (or the calendar did not load).');
   const lockHTML = locks.length
-    ? `<div class="table-scroll"><table class="mtable"><caption class="sr-only">IPO lock-up expiries around now</caption><thead><tr><th scope="col">Ticker</th><th scope="col">IPO</th><th scope="col">Lock-up ends</th><th scope="col">Days</th><th scope="col">Price vs IPO</th><th scope="col">Dump odds</th></tr></thead><tbody>${locks.map((l) => `<tr><th scope="row">${tk(l.symbol)} <span class="nm">${txt(l.name)}</span></th><td>${esc(fmtDay(l.ipo_date, { weekday: false, year: true }))} · ${esc(price(l.ipo_price))}</td><td>${esc(fmtDay(l.lockup_date, { weekday: false }))}</td><td class="${isNum(l.days_to) && l.days_to >= 0 && l.days_to <= 5 ? 'red' : ''}">${esc(isNum(l.days_to) ? (l.days_to < 0 ? `${-l.days_to} ago` : `in ${l.days_to}`) : DASH)}</td><td>${esc(pct(l.vs_ipo, 0, true))}</td><td>${esc(pct(l.prob_dump))}</td></tr>`).join('')}</tbody></table></div><p class="note" style="margin-top:8px">Lock-up dates assume the standard 180 days after pricing; the real date is in each prospectus. Insiders are free to sell after it — historically a supply event (see the Evidence Lab).</p>`
+    ? `<div class="table-scroll"><table class="mtable"><caption class="sr-only">IPO lock-up expiries around now</caption><thead><tr><th scope="col">Ticker</th><th scope="col">IPO</th><th scope="col">Lock-up ends</th><th scope="col">Days</th><th scope="col">Price vs IPO</th><th scope="col">Dump odds</th></tr></thead><tbody>${locks.map((l) => `<tr><th scope="row">${tk(l.symbol)} <span class="nm">${txt(l.name)}</span></th><td>${esc(fmtDay(l.ipo_date, { weekday: false, year: true }))} · ${esc(price(l.ipo_price))}</td><td>${esc(fmtDay(l.lockup_date, { weekday: false }))}</td><td class="${isNum(l.days_to) && l.days_to >= 0 && l.days_to <= 5 ? 'red' : ''}">${esc(isNum(l.days_to) ? (l.days_to < 0 ? `${-l.days_to} ago` : `in ${l.days_to}`) : DASH)}</td><td>${esc(pct(l.vs_ipo, 0, true))}</td><td>${esc(pct(l.prob_dump))}</td></tr>`).join('')}</tbody></table></div><p class="note" style="margin-top:8px">Lock-up dates assume the standard 180 days after pricing; the real date is in each prospectus. Insiders are free to sell after it.${lockupEvidence()}</p>`
     : empty('No IPO lock-ups expire around now among recent listings.');
   root.innerHTML = `<div class="rec-grid rec-block reveal"><div><h3 class="rec-sub">Earnings · next five sessions</h3>${earnHTML}</div><div><h3 class="rec-sub">IPO lock-up expiries</h3>${lockHTML}</div></div>`;
+}
+
+/** What the Evidence Lab actually measured around day ~180 — never more. */
+function lockupEvidence() {
+  const st = arr(obj(S.evidence).studies).find((x) => x && x.id === 'lockup_180');
+  if (!st || !isNum(st.pct_dump) || !isNum(st.ref_pct_dump)) return '';
+  return ` In this data, names in the day-170–190 window fell 5%+ open→close ${pct(st.pct_dump, 1)} of the time vs ${pct(st.ref_pct_dump, 1)} for comparable names (${liftTxt(st.lift_dump)}, n = ${int(st.n)})${isNum(st.lift_dump) && st.lift_dump < 1.2 ? ' — not a meaningful edge on its own' : ''}.`;
 }
 
 /* ── look up any ticker (docs/data/universe.json) ─────────────────────── */
@@ -1422,7 +1434,7 @@ function dossierHTML(rec) {
   const gap = pre && isNum(pre.gap_pct) ? pct(pre.gap_pct, 0, true) : DASH;
   const keys = `<dl class="dz-keys">
     <div><dt class="eyebrow">Dump odds</dt><dd class="${isNum(p.prob_dump) ? 'red' : ''}">${esc(pct(p.prob_dump))}<small>${esc(isNum(base) ? `base ${pct(base, 1)} · ${liftTxt(p.lift)}` : 'base rate not reported')}</small></dd></div>
-    <div><dt class="eyebrow">Swing odds</dt><dd>${esc(pct(p.prob_swing))}<small>${esc(isNum(p.skew) ? `15%+ lower in 5 sessions · ${pct(p.skew)} of big-move odds down` : '15%+ lower in 5 sessions')}</small></dd></div>
+    <div><dt class="eyebrow">Swing odds</dt><dd>${esc(pct(p.prob_swing))}<small>15%+ lower five sessions out</small></dd></div>
     <div><dt class="eyebrow">Pre-market</dt><dd>${esc(gap)}<small>${esc(pre ? `${price(pre.price)} at ${fmtTimeET(pre.asof)} ET` : 'no print reported')}</small></dd></div>
     <div><dt class="eyebrow">Squeeze danger</dt><dd>${squeezeMeter(p.squeeze_danger)}<small>${esc(sqWord(p.squeeze_danger))}</small></dd></div>
   </dl>`;
@@ -1504,6 +1516,7 @@ function dossierHTML(rec) {
       ['Odds of a 15%+ drop', esc(pct(p.prob_bigdump, 1)), 'open→close'],
       ['Higher odds than', esc(isNum(p.score) ? (p.score >= 100 ? 'every other name' : `${p.score}% of names`) : DASH), 'scored today'],
       ['Odds of a +5% rise instead', esc(pct(p.prob_pump, 1)), 'open→close'],
+      ['Skew', esc(isNum(p.skew) ? `${pct(p.skew)} down` : DASH), 'share of this session\'s ±5% odds pointing down'],
       ['Expected open→close', esc(pct(p.exp_oc, 1, true)), 'weak on its own — see the Record'],
       ['Features as of', esc(fmtDay(t.features_asof, { weekday: false, year: true }))],
     ])));

@@ -16,8 +16,12 @@ from .util import market_phase
 log = logging.getLogger(__name__)
 
 
-def _row(sym: str, q: Optional[dict]) -> Optional[dict]:
+def _row(sym: str, q: Optional[dict], session: Optional[str] = None) -> Optional[dict]:
+    """open→now for ``sym`` — only from a quote of THIS session's regular
+    hours (a halted name's chart can still show yesterday's session)."""
     if not q or not q.get("open") or not q.get("last"):
+        return None
+    if session is not None and (q.get("session_date") != session or q.get("points_session") not in (None, "regular")):
         return None
     o, last = float(q["open"]), float(q["last"])
     hi = float(q.get("high") or last)
@@ -40,7 +44,8 @@ def snapshot(today: dict) -> Optional[dict]:
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=6) as ex:
         quotes: Dict[str, Any] = dict(zip(syms, ex.map(lambda s: _safe_intraday(intel, s), syms)))
-    rows = {s: _row(s, quotes.get(s)) for s in syms}
+    session = today.get("session_date")
+    rows = {s: _row(s, quotes.get(s), session) for s in syms}
     board = [rows[p["symbol"]] for p in today.get("board", []) if rows.get(p["symbol"])]
     top_row = rows.get(top) if top else None
     if top_row is not None:

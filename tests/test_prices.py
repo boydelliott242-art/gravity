@@ -746,3 +746,31 @@ def test_live_premarket_and_benchmark(live_cache):
     assert_contract_frame(bench)
     assert len(bench) > 200
     print(f"live IWM: {len(bench)} bars, last {bench.index.max().date()} close {bench['close'].iloc[-1]:.2f}")
+
+
+def test_benchmark_close_bar_handles_every_quote_state(monkeypatch):
+    """The official close moves between secondaryData / primaryData through the
+    evening; live after-hours or pre-market prints must never be used."""
+    from datetime import date as _d
+    from gravity import net as _net
+    day = _d(2026, 9, 30)
+    states = {
+        "after-hours": {"marketStatus": "After-Hours",
+                        "primaryData": {"lastSalePrice": "$278.82", "lastTradeTimestamp": "Sep 30, 2026 7:59 PM ET"},
+                        "secondaryData": {"lastSalePrice": "$277.86", "lastTradeTimestamp": "Closed at Sep 30, 2026 4:00 PM ET"}},
+        "closed": {"marketStatus": "Closed",
+                   "primaryData": {"lastSalePrice": "$277.89", "lastTradeTimestamp": "Sep 30, 2026"},
+                   "secondaryData": None},
+        "pre-market-next-day": {"marketStatus": "Pre-Market",
+                                "primaryData": {"lastSalePrice": "$279.10", "lastTradeTimestamp": "Oct 1, 2026 8:01 AM ET"},
+                                "secondaryData": {"lastSalePrice": "$277.86", "lastTradeTimestamp": "Closed at Sep 30, 2026 4:00 PM ET"}},
+        "live-only": {"marketStatus": "After-Hours",
+                      "primaryData": {"lastSalePrice": "$278.82", "lastTradeTimestamp": "Sep 30, 2026 7:59 PM ET"},
+                      "secondaryData": None},
+    }
+    want = {"after-hours": 277.86, "closed": 277.89, "pre-market-next-day": 277.86, "live-only": None}
+    for name, payload in states.items():
+        monkeypatch.setattr(_net, "get_json", lambda *a, _p=payload, **k: {"data": _p})
+        bar = P._benchmark_close_bar(day)
+        got = None if bar is None else float(bar["close"].iloc[0])
+        assert got == (pytest.approx(want[name]) if want[name] else None), name

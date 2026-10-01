@@ -72,9 +72,12 @@ def borrow_history(sym: str, n: int = 30) -> List[list]:
     return [[day, m[sym][0], m[sym][1]] for day, m in _recent("borrow", n) if m and sym in m]
 
 
-def borrow_tightening(sym: str) -> Optional[str]:
-    """Plain-English warning when lendable shares collapse or the fee jumps."""
+def borrow_tightening(sym: str, extra: Optional[list] = None) -> Optional[str]:
+    """Plain-English warning when lendable shares collapse or the fee jumps.
+    ``extra`` = today's not-yet-saved [date, fee, available] point."""
     h = borrow_history(sym, 6)
+    if extra and (not h or h[-1][0] != extra[0]):
+        h = (h + [extra])[-6:]
     if len(h) < 2:
         return None
     (_, f0, a0), (_, f1, a1) = h[0], h[-1]

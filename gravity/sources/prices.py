@@ -919,27 +919,41 @@ def benchmark_history(period: str = config.HISTORY_PERIOD) -> pd.DataFrame:
         if bar is not None:
             df = pd.concat([df, bar]).sort_index()
             log.info("benchmark: IWM %s bar built from Nasdaq's official close (history not published yet)", last_done)
+        else:
+            net.record_status("IWM benchmark", False, f"no IWM bar for {last_done} yet — market features blank for that session")
     df.attrs = attrs
     return df
 
 
 def _benchmark_close_bar(day: date) -> Optional[pd.DataFrame]:
-    """One IWM bar for ``day`` from Nasdaq's quote (official 4 PM close). Only
-    the close feeds GRAVITY's market features; open/high/low are set to it."""
+    """One IWM bar for ``day`` from Nasdaq's quote. Only the close feeds
+    GRAVITY's market features; open/high/low are set to it.
+
+    The quote changes shape through the evening: during after-hours the
+    regular close sits in ``secondaryData`` ("Closed at <date> 4:00 PM ET");
+    once the market status is "Closed" it moves to ``primaryData`` with a
+    date-only timestamp; next morning in pre-market it is ``secondaryData``
+    again. Live after-hours/pre-market prints are never used."""
     d = net.get_json(f"{NASDAQ_API}/{BENCHMARK}/info", headers=net.NASDAQ_HEADERS, params={"assetclass": "etf"})
     try:
-        sec = d["data"]["secondaryData"] or {}
-        prim = d["data"]["primaryData"] or {}
+        data = d["data"]
     except (TypeError, KeyError):
         return None
-    ts = parse_nasdaq_timestamp(sec.get("lastTradeTimestamp"))
-    close = num(sec.get("lastSalePrice"))
-    if ts is None or close is None or ts.date() != day:
-        return None
-    vol = num(prim.get("volume"))
-    return pd.DataFrame({"open": [close], "high": [close], "low": [close], "close": [close],
-                         "volume": [vol if vol is not None else float("nan")]},
-                        index=pd.DatetimeIndex([pd.Timestamp(day)]))
+    status = str(data.get("marketStatus") or "")
+    cands = [(data.get("secondaryData") or {}, False), (data.get("primaryData") or {}, status == "Closed")]
+    for blk, closed_primary in cands:
+        raw = str(blk.get("lastTradeTimestamp") or "")
+        if not ("Closed at" in raw or closed_primary):
+            continue
+        ts = parse_nasdaq_timestamp(raw)
+        close = num(blk.get("lastSalePrice"))
+        if ts is None or close is None or ts.date() != day:
+            continue
+        vol = num(blk.get("volume"))
+        return pd.DataFrame({"open": [close], "high": [close], "low": [close], "close": [close],
+                             "volume": [vol if vol is not None else float("nan")]},
+                            index=pd.DatetimeIndex([pd.Timestamp(day)]))
+    return None
 
 
 # ── Pre-market snapshot ──────────────────────────────────────────────────
