@@ -57,10 +57,54 @@ def impact(q, dvx, sigma):
     return Y_IMPACT * sig * np.sqrt(np.asarray(q, float) / np.maximum(np.asarray(dvx, float), 1.0))
 
 
+def tick_floor(price) -> float:
+    """One tick relative to the price — the narrowest possible spread.
+    US equities quote in $0.0001 below $1 and in $0.01 at or above $1."""
+    try:
+        pr = float(price)
+    except (TypeError, ValueError):
+        return 0.001
+    if not pr > 0:
+        return 0.001
+    return max(0.0005, (0.0001 if pr < 1 else 0.01) / pr)
+
+
+def spread_cap(dv20) -> float:
+    """Upper bound on the assumed spread by liquidity tier. The close-high-low
+    estimator confuses volatility with spread on very volatile names (it reads
+    ~5% for hot stocks trading $5M+/day), so it is only trusted inside
+    [tick, cap]."""
+    try:
+        v = float(dv20)
+    except (TypeError, ValueError):
+        return 0.03
+    return 0.03 if not v >= 1e6 else (0.02 if v < 5e6 else 0.01)
+
+
+def spread_used(estimate, price, dv20) -> float:
+    """The spread the cost model assumes: the estimate clipped to
+    [one tick, liquidity cap]; the midpoint of that band when the estimator
+    can't read a spread."""
+    lo, hi = tick_floor(price), spread_cap(dv20)
+    hi = max(hi, lo)
+    try:
+        e = float(estimate)
+    except (TypeError, ValueError):
+        e = float("nan")
+    if not (e >= 0.001):
+        return (lo + hi) / 2
+    return min(max(e, lo), hi)
+
+
+def fallback_spread(price) -> float:  # kept for callers without volume data
+    return spread_used(None, price, None)
+
+
 def round_trip_cost(q, dvx, sigma, spread, hold_days: int = 0, borrow_fee_pct: Optional[float] = None):
     """Impact on both legs + one full spread + borrow for ``hold_days``
-    trading days (IBKR annual % fee; intraday round trips pay no borrow)."""
-    spr = np.clip(np.nan_to_num(np.asarray(spread, float), nan=0.005), 0.001, 0.02)
+    trading days (IBKR annual % fee; intraday round trips pay no borrow).
+    The spread is never capped from above — a cost is at least its spread."""
+    spr = np.maximum(np.nan_to_num(np.asarray(spread, float), nan=0.005), 0.001)
     cost = 2 * impact(q, dvx, sigma) + spr
     if hold_days and borrow_fee_pct is not None:
         cost = cost + (borrow_fee_pct / 100.0) * hold_days / 252.0
@@ -107,8 +151,8 @@ def breakeven_size(avg_move: float, dvx, sigma, spread) -> float:
     """Largest position whose estimated round-trip cost (2·impact + spread)
     still fits inside ``avg_move`` (a positive fraction, e.g. 0.018).
     0 when the spread alone already eats the move."""
-    spr = float(np.clip(np.nan_to_num(spread, nan=0.005), 0.001, 0.02))
-    sig = max(float(np.nan_to_num(sigma, nan=0.05)), SIGMA_FLOOR)
+    spr = max(float(np.nan_to_num(np.nan if spread is None else spread, nan=0.005)), 0.001)
+    sig = max(float(np.nan_to_num(np.nan if sigma is None else sigma, nan=0.05)), SIGMA_FLOOR)
     room = avg_move - spr
     if room <= 0 or not np.isfinite(dvx) or dvx <= 0:
         return 0.0
@@ -124,14 +168,29 @@ def size_block(price, dv20, dv1, sigma, high, low, close, available, avg_move: O
     cap_mkt = float(market_capacity(dvx, sigma))
     cap_b = borrow_capacity(available, price)
     cap = min(cap_mkt, cap_b) if cap_b is not None else cap_mkt
-    spr = ar_spread(high, low, close)
+    est = ar_spread(high, low, close)
+    estimated = est is not None and est >= 0.001
+    spr = spread_used(est, price, dv20)
     limit = "borrow" if (cap_b is not None and cap_b < cap_mkt) else (
         "volume" if MAX_PART * dvx <= cap_mkt + 1e-9 else "impact")
-    costs = {str(q): float(round_trip_cost(q, dvx, sigma, spr if spr is not None else np.nan)) for q in SIZES}
+    costs = {str(q): float(round_trip_cost(q, dvx, sigma, spr)) for q in SIZES}
     part = {str(q): (q / dvx if dvx > 0 else None) for q in SIZES}
-    be = breakeven_size(avg_move, dvx, sigma, spr if spr is not None else np.nan) if avg_move else None
-    floor = spr is None or spr < 0.001          # estimator failed or at its floor → 0.1% (or 0.5% if unknown) used
+    be = breakeven_size(avg_move, dvx, sigma, spr) if avg_move else None
     return {"capacity": cap, "cap_market": cap_mkt, "cap_borrow": cap_b, "limit": limit, "exp_dvol": dvx,
-            "spread": (0.005 if spr is None else max(spr, 0.001)), "spread_floor": floor,
+            "spread": spr, "spread_estimated": estimated, "spread_raw": est,
+            "spread_band": [tick_floor(price), max(spread_cap(dv20), tick_floor(price))],
             "tier": tier_of(cap), "costs": costs, "participation": part,
             "breakeven": be, "avg_move": avg_move}
+
+
+def spread_used_vec(estimate, price, dv20) -> np.ndarray:
+    """Vectorised ``spread_used`` for backtests (same rule, row by row)."""
+    est = np.asarray(estimate, float)
+    pr = np.asarray(price, float)
+    dv = np.asarray(dv20, float)
+    tick = np.where(pr < 1, 0.0001, 0.01)
+    lo = np.maximum(0.0005, np.where(pr > 0, tick / np.where(pr > 0, pr, 1.0), 0.001))
+    hi = np.where(dv >= 5e6, 0.01, np.where(dv >= 1e6, 0.02, 0.03))
+    hi = np.maximum(hi, lo)
+    ok = np.isfinite(est) & (est >= 0.001)
+    return np.where(ok, np.clip(est, lo, hi), (lo + hi) / 2)

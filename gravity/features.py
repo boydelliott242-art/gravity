@@ -93,7 +93,7 @@ PUMP_THRESHOLD = float(getattr(config, "PUMP_THRESHOLD", 0.05))
 # raw dollar volume, static attributes, and the live-row marker).
 INFO_COLUMNS: List[str] = [
     "date", "symbol", "open", "high", "low", "close", "volume",
-    "price", "dvol20", "ipo_year", "is_last_bar",
+    "price", "dvol20", "spread_est", "ipo_year", "is_last_bar",
 ]
 PANEL_COLUMNS: List[str] = INFO_COLUMNS + PANEL_FEATURES + M1_EXTRA + LABELS
 
@@ -806,6 +806,13 @@ def build_panel(
     f["rvol5"] = _safe_div(B.roll(vol, 5, "mean"), B.roll(vol, 60, "mean"))
     dv = c * vol                                     # adjusted close × adjusted volume = as-traded $
     dvol20 = B.roll(dv, 20, "median")
+    # Abdi–Ranaldo effective-spread estimate (20 sessions, bars ≤ t): an
+    # info column for cost modelling, not a model input
+    with np.errstate(divide="ignore", invalid="ignore"):
+        _lc = np.log(c)
+        _eta = (np.log(hf) + np.log(lf)) / 2
+    _prod = B.lag(_lc - _eta, 1) * (B.lag(_lc, 1) - _eta)
+    spread_est = 2 * np.sqrt(np.maximum(B.roll(_prod, 20, "mean", minp=10), 0.0))
     f["dvol1_log"] = _log10_pos(dv)
     f["dvol20_log"] = _log10_pos(dvol20)
     f["dvol_trend"] = np.log10(_safe_div(B.roll(dv, 5, "mean") + 1.0, B.roll(dv, 60, "mean") + 1.0))
@@ -898,7 +905,7 @@ def build_panel(
         "date": dates[sel],
         "symbol": sym_arr[codes[sel]],
         "open": o[sel], "high": h[sel], "low": l[sel], "close": c[sel], "volume": vol[sel],
-        "price": price[sel], "dvol20": dvol20[sel], "ipo_year": ipo_year[sel],
+        "price": price[sel], "dvol20": dvol20[sel], "spread_est": spread_est[sel], "ipo_year": ipo_year[sel],
         "is_last_bar": (B.idx == B.end_of)[sel],
     }
     for k in PANEL_FEATURES:
@@ -912,7 +919,7 @@ def build_panel(
     # 11) cross-sectional (per date, over the eligible universe that day)
     _cross_sectional(panel)
 
-    for k in PANEL_FEATURES + M1_EXTRA + LABELS + ["open", "high", "low", "close", "volume", "price", "dvol20", "ipo_year"]:
+    for k in PANEL_FEATURES + M1_EXTRA + LABELS + ["open", "high", "low", "close", "volume", "price", "dvol20", "spread_est", "ipo_year"]:
         panel[k] = panel[k].astype(np.float32)
     panel = panel[PANEL_COLUMNS]
     panel.attrs["built_seconds"] = round(time.time() - t0, 2)

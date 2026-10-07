@@ -92,3 +92,16 @@ def test_rss_guid_changes_when_the_morning_pick_differs(tmp_path, monkeypatch):
     root = ET_.fromstring(feed.build())
     assert root.find("./channel/item/guid").text != g1
     assert "pre-market #1: BBB" in root.find("./channel/item/title").text
+
+
+def test_quoted_spread_regular_session_only(monkeypatch):
+    from gravity import net as _net
+    payload = {"data": {"marketStatus": "Market Open", "primaryData": {"bidPrice": "$1.98", "askPrice": "$2.02"}}}
+    monkeypatch.setattr(_net, "get_json", lambda *a, **k: payload)
+    q = live.quoted_spread("AAA")
+    assert q["bid"] == 1.98 and q["ask"] == 2.02 and q["spread"] == pytest.approx(0.04 / 2.0)
+    payload["data"]["marketStatus"] = "After-Hours"
+    assert live.quoted_spread("AAA") is None                 # after-hours quotes are not representative
+    payload["data"]["marketStatus"] = "Market Open"
+    payload["data"]["primaryData"]["askPrice"] = "N/A"
+    assert live.quoted_spread("AAA") is None

@@ -1687,3 +1687,41 @@ __all__ = [
     "events_from_submissions", "profile_from_submissions", "shares_from_facts",
     "runway_from_facts", "classify_text", "html_to_text",
 ]
+
+
+# ── point-in-time share counts for every filer (XBRL frames) ─────────────
+FRAMES_URL = "https://data.sec.gov/api/xbrl/frames/dei/EntityCommonStockSharesOutstanding/shares/CY{y}Q{q}I.json"
+NS_FRAMES = "sec_frames"
+
+
+def shares_frames(first_year: int = 2023, today: Optional[date] = None) -> List[Dict[str, Any]]:
+    """Cover-page share counts (dei:EntityCommonStockSharesOutstanding) for
+    every filer, one SEC "frames" call per calendar quarter — ~600 KB each
+    instead of one multi-MB companyfacts download per company.
+
+    Returns [{"cik", "end" (YYYY-MM-DD as-of date), "shares"}]. As reported,
+    NOT split-adjusted. Past quarters are cached for a year, the current one
+    for 20 h."""
+    if not net.sec_enabled():
+        _disabled()
+        return []
+    today = today or datetime.now(timezone.utc).date()
+    out: List[Dict[str, Any]] = []
+    n_ok = 0
+    for y in range(first_year, today.year + 1):
+        for q in range(1, 5):
+            if date(y, 3 * q - 2, 1) > today:
+                break
+            current = (y, (today.month - 1) // 3 + 1) == (y, q) and y == today.year
+            url = FRAMES_URL.format(y=y, q=q)
+            data = net.cached(NS_FRAMES, url, 20 * 3600 if current else 365 * 86400,
+                              lambda u=url: _sec_json(u, missing_ok=True, timeout=60.0))
+            rows = (data or {}).get("data") or []
+            if rows:
+                n_ok += 1
+            for r in rows:
+                v = r.get("val")
+                if r.get("cik") and r.get("end") and isinstance(v, (int, float)) and v > 0:
+                    out.append({"cik": int(r["cik"]), "end": str(r["end"]), "shares": float(v)})
+    net.record_status("SEC share counts (frames)", n_ok > 0, f"{n_ok} quarterly frames, {len(out):,} share counts")
+    return out

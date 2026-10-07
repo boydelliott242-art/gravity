@@ -94,7 +94,7 @@ def test_report_schema_and_files(trained):
             assert k in sim, (m, k)
         assert sim["cost_assumption"] == 0.01
         assert len(sim["daily"]) == met["days"] > 0
-        assert all(len(r) == 5 and isinstance(r[0], str) for r in sim["daily"])
+        assert all(len(r) == 6 and isinstance(r[0], str) for r in sim["daily"])
         cal = rep["calibration"][m]
         assert [b["bin"] for b in cal] == list(range(1, 11))
         assert sum(b["n"] for b in cal) == rep["walk_forward"]["oos_rows"]
@@ -263,7 +263,7 @@ def test_daily_metrics_and_sim_math():
     assert sim["max_drawdown"] == pytest.approx(0.06)             # day 2: −0.05 − 0.01
     assert sim["worst_day"] == pytest.approx(-0.05)
     assert sim["daily"][0] == ["2025-01-02", -0.10, pytest.approx(np.mean([-0.10, 0.02, 0.01])),
-                               pytest.approx(np.mean([-0.10, 0.02, 0.01])), -0.10]  # no rule mask → pub #1 = #1
+                               pytest.approx(np.mean([-0.10, 0.02, 0.01])), -0.10, None]  # no rule mask → pub #1 = #1; no cost column
     assert M._max_drawdown(np.array([0.1, -0.3, 0.1, -0.1])) == pytest.approx(0.3)
 
 

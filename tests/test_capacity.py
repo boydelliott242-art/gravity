@@ -63,3 +63,29 @@ def test_size_block_fields():
     assert set(b["costs"]) == {"10000", "50000", "100000", "500000", "1000000"}
     assert b["costs"]["1000000"] > b["costs"]["10000"]
     assert b["breakeven"] is not None
+
+
+def test_spread_assumption_band():
+    assert C.tick_floor(0.20) == pytest.approx(0.0005)        # $0.0001 tick under $1 → floor 0.05%
+    assert C.tick_floor(0.50) == pytest.approx(0.0005)
+    assert C.tick_floor(2.00) == pytest.approx(0.005)         # $0.01 / $2
+    assert C.spread_cap(5e5) == 0.03 and C.spread_cap(2e6) == 0.02 and C.spread_cap(2e7) == 0.01
+    assert C.spread_used(0.05, 3.0, 2e7) == pytest.approx(0.01)       # noisy 5% read on a liquid name → capped
+    assert C.spread_used(0.002, 3.0, 2e7) == pytest.approx(0.01 / 3)   # readable but below one tick → tick
+    assert C.spread_used(0.0002, 3.0, 2e7) == pytest.approx((0.01 / 3 + 0.01) / 2)  # ~0 = estimator failed → midpoint
+    assert C.spread_used(None, 3.0, 2e7) == pytest.approx((0.01 / 3 + 0.01) / 2)  # unreadable → band midpoint
+    wide = float(C.round_trip_cost(1e3, 1e9, 0.02, 0.06))
+    assert wide >= 0.06                                   # round_trip_cost never caps the spread it is given
+    assert C.breakeven_size(0.05, 1e7, None, 0.06) == 0.0  # spread alone eats the move; sigma None is fine
+    flat = np.full(40, 2.0)                               # estimator can't read a spread here
+    b = C.size_block(2.0, 5e6, 5e6, 0.03, flat, flat, flat, 1e6, 0.03)
+    assert b["spread_estimated"] is False and b["spread"] == pytest.approx(C.spread_used(None, 2.0, 5e6))
+
+
+def test_vectorised_spread_matches_scalar():
+    est = [0.05, 0.002, np.nan, 0.0002]
+    price = [3.0, 3.0, 0.4, 12.0]
+    dv = [2e7, 2e6, 5e5, 8e6]
+    v = C.spread_used_vec(est, price, dv)
+    for i in range(4):
+        assert v[i] == pytest.approx(C.spread_used(est[i], price[i], dv[i]))

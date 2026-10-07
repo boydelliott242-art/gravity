@@ -177,3 +177,28 @@ def test_coverage_gate():
     assert not healthy({**good, "features_asof": "2026-09-28"})[0]                    # stale
     assert healthy({**good, "session_date": "2026-10-05", "features_asof": "2026-10-02"})[0]  # Mon uses Fri
     assert not healthy({**good, "board": []})[0]
+
+
+# ── point-in-time market cap (serial diluters must not be dropped) ───────
+def test_pit_market_cap_uses_shares_as_reported_then():
+    from gravity.cli import _pit_market_cap
+    panel = pd.DataFrame({
+        "symbol": ["DIL"] * 3 + ["RS"] * 2 + ["NOSEC"],
+        "date": pd.to_datetime(["2025-01-10", "2025-07-10", "2026-03-10", "2025-05-01", "2025-07-01", "2025-05-01"]),
+        "price": [2.0, 1.0, 0.5, 0.10, 2.00, 4.0],
+    })
+    frames = [
+        {"cik": 1, "end": "2024-12-31", "shares": 10e6},      # diluter: 10M → 1B shares
+        {"cik": 1, "end": "2026-01-31", "shares": 1e9},
+        {"cik": 2, "end": "2025-03-31", "shares": 400e6},     # 1:20 reverse split on 2025-06-01
+    ]
+    cmap = {"DIL": {"cik": 1}, "RS": {"cik": 2}}
+    splits = {"RS": [{"date": "2025-06-01", "ratio": 0.05}]}
+    shares_today = pd.Series({"DIL": 1e9, "RS": 20e6, "NOSEC": 1e6})
+    cap = _pit_market_cap(panel, frames, cmap, splits, shares_today)
+    assert cap.iloc[0] == pytest.approx(2.0 * 10e6)      # 2025: $20M (today's count would claim $2B)
+    assert cap.iloc[1] == pytest.approx(1.0 * 10e6)
+    assert cap.iloc[2] == pytest.approx(0.5 * 1e9)       # after the 2026 report
+    assert cap.iloc[3] == pytest.approx(0.10 * 400e6)    # before the reverse split
+    assert cap.iloc[4] == pytest.approx(2.00 * 20e6)     # after it: 400M × 0.05 = 20M shares
+    assert cap.iloc[5] == pytest.approx(4.0 * 1e6)       # no SEC data → today's share count

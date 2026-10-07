@@ -10,8 +10,40 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from . import publish
-from .util import market_phase
+import json
+
+from . import config, net, publish
+from .util import market_phase, now_et, num
+
+SPREAD_LOG = config.DATA / "spreads"          # private: real quotes to calibrate the cost model later
+
+
+def quoted_spread(sym: str) -> Optional[dict]:
+    """Live bid/ask from Nasdaq's quote (regular session only)."""
+    d = net.get_json(f"https://api.nasdaq.com/api/quote/{sym}/info", headers=net.NASDAQ_HEADERS,
+                     params={"assetclass": "stocks"}, timeout=15.0, retries=1)
+    try:
+        data = d["data"]
+        prim = data["primaryData"] or {}
+    except (TypeError, KeyError):
+        return None
+    if str(data.get("marketStatus") or "") not in ("Market Open", "Open"):
+        return None
+    bid, ask = num(prim.get("bidPrice")), num(prim.get("askPrice"))
+    if not bid or not ask or ask <= bid:
+        return None
+    mid = (bid + ask) / 2
+    return {"bid": bid, "ask": ask, "spread": (ask - bid) / mid}
+
+
+def _log_spreads(rows: Dict[str, dict]) -> None:
+    if not rows:
+        return
+    SPREAD_LOG.mkdir(parents=True, exist_ok=True)
+    stamp = now_et().isoformat(timespec="seconds")
+    with open(SPREAD_LOG / f"{now_et().date().isoformat()}.jsonl", "a") as f:
+        for sym, q in rows.items():
+            f.write(json.dumps({"ts": stamp, "symbol": sym, **q}) + "\n")
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +78,13 @@ def snapshot(today: dict) -> Optional[dict]:
         quotes: Dict[str, Any] = dict(zip(syms, ex.map(lambda s: _safe_intraday(intel, s), syms)))
     session = today.get("session_date")
     rows = {s: _row(s, quotes.get(s), session) for s in syms}
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        sp = dict(zip(syms, ex.map(lambda s: _safe_spread(s), syms)))
+    sp = {k: v for k, v in sp.items() if v}
+    _log_spreads(sp)
+    for s, r in rows.items():
+        if r is not None and s in sp:
+            r["spread_now"] = sp[s]["spread"]
     board = [rows[p["symbol"]] for p in today.get("board", []) if rows.get(p["symbol"])]
     top_row = rows.get(top) if top else None
     if top_row is not None:
@@ -61,6 +100,14 @@ def snapshot(today: dict) -> Optional[dict]:
         "board_mean_oc_now": sum(oc) / len(oc) if oc else None,
         "note": "Live and unofficial — the official grade uses completed daily bars after the close.",
     }
+
+
+def _safe_spread(sym: str) -> Optional[dict]:
+    try:
+        return quoted_spread(sym)
+    except Exception as e:  # noqa: BLE001
+        log.warning("spread %s failed: %s", sym, e)
+        return None
 
 
 def _safe_intraday(intel, sym: str) -> Optional[dict]:

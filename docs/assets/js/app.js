@@ -74,7 +74,9 @@ function backtestLine(which) {
   const sqr = isNum(m.pub1_squeeze_rate) ? m.pub1_squeeze_rate : m.top1_squeeze_rate;
   const avg = isNum(m.pub1_mean_oc) ? m.pub1_mean_oc : m.top1_mean_oc;
   if (!isNum(hit)) return '';
-  return ` Backtest of this exact rule (no Rule-201 names, ≥$300K daily volume): the #1 fell 5%+ open→close on ${Math.round(hit * 100)}% of sessions${isNum(sqr) ? `, spiked 20%+ above the open on ${Math.round(sqr * 100)}%` : ''}${isNum(avg) ? `, averaging ${pct(avg, 1, true)} open→close` : ''} — a tilt in the odds, never a sure thing.`;
+  const r10 = obj(obj(obj(obj(S.model).sim).m0).realistic)['10000'];
+  const net = r10 && isNum(r10.net_mean) ? ` — after each pick's own estimated cost at $10K that is ${Math.abs(r10.net_mean) < 0.0005 ? 'roughly breakeven' : `${pct(r10.net_mean, 1, true)} per trade`}` : '';
+  return ` Backtest of this exact rule (point-in-time universe, no Rule-201 names, ≥$300K daily volume): the #1 fell 5%+ open→close on ${Math.round(hit * 100)}% of sessions${isNum(sqr) ? `, spiked 20%+ above the open on ${Math.round(sqr * 100)}%` : ''}${isNum(avg) ? `, averaging ${pct(avg, 1, true)} open→close before costs` : ''}${net}. A tilt in the odds, never a sure thing.`;
 }
 
 function host(u) {
@@ -828,13 +830,25 @@ function backtestBlock(m) {
       <dl class="tiles">
         ${stat('Published #1 dumped', esc(pct(isNum(oos.pub1_hit) ? oos.pub1_hit : oos.top1_hit)), esc(`raw #1 ${pct(oos.top1_hit)} · average name ${pct(base, 1)}`))}
         ${stat('…and spiked 20%+', esc(pct(isNum(oos.pub1_squeeze_rate) ? oos.pub1_squeeze_rate : oos.top1_squeeze_rate)), 'above the open, same session — the move that stops shorts out')}
-        ${stat('Win rate', esc(pct(isNum(sim.pub_win_rate) ? sim.pub_win_rate : sim.win_rate)), esc(`days the short made money, after ${pct(cost, 0)} cost`))}
-        ${stat('Risking 10% a day', esc(isNum(obj(sim.compounded_pub).final_multiple) ? `${fixed(sim.compounded_pub.final_multiple, 2)}×` : DASH), esc(isNum(obj(sim.compounded_pub).max_drawdown_pct) ? `compounded; worst drawdown −${pct(sim.compounded_pub.max_drawdown_pct, 0)}; worst day ${pct(sim.pub_worst_day, 0, true)}` : 'compounded equity multiple'))}
+        ${realisticTiles(sim, cost)}
       </dl>
       ${swingTiles()}
-      ${nDays ? '<div class="chart" id="eq-chart"></div><div class="legend"><span><i></i>Published rule, net</span><span><i class="g"></i>Raw #1 (incl. Rule 201 names), net</span></div>' : empty('No simulated days in this report.')}
+      ${nDays ? '<div class="chart" id="eq-chart"></div><div class="legend"><span><i></i>Published rule, net of each pick\'s own est. cost at $10K</span><span><i class="g"></i>Raw #1 (incl. Rule 201 names), flat 1% cost</span></div>' : empty('No simulated days in this report.')}
     </div>
   </div>`;
+}
+
+/** Net of each pick's own estimated cost (capacity model) at $10K / $50K, flat-1% beside it. */
+function realisticTiles(sim, cost) {
+  const re = obj(sim.realistic);
+  const r10 = obj(re['10000']);
+  const r50 = obj(re['50000']);
+  if (!isNum(r10.net_mean)) {
+    return `${stat('Win rate', esc(pct(isNum(sim.pub_win_rate) ? sim.pub_win_rate : sim.win_rate)), esc(`after a flat ${pct(cost, 0)} cost`))}
+      ${stat('Risking 10% a day', esc(isNum(obj(sim.compounded_pub).final_multiple) ? `${fixed(sim.compounded_pub.final_multiple, 2)}×` : DASH), 'flat-cost compounded multiple')}`;
+  }
+  return `${stat('Net per trade at $10K', `<span class="${r10.net_mean < 0 ? 'red' : ''}">${esc(pct(r10.net_mean, 1, true))}</span>`, esc(`after each pick's own est. cost (avg ${pct(r10.mean_cost, 1)}); at $50K ${pct(r50.net_mean, 1, true)} (cost ${pct(r50.mean_cost, 1)})`))}
+      ${stat('Win rate at $10K', esc(pct(r10.win_rate)), esc(`compounded 10%/day ×${fixed(r10.compounded, 2)}; flat-1% version ×${isNum(obj(sim.compounded_pub).final_multiple) ? fixed(sim.compounded_pub.final_multiple, 2) : DASH}`))}`;
 }
 
 function swingTiles() {
@@ -966,7 +980,7 @@ function mountRecordCharts() {
     const net = [];
     daily.forEach((r) => {
       if (isNum(r[1])) g += -r[1] - cost;               // raw #1, net
-      if (isNum(r[4])) n += -r[4] - cost;               // published rule, net
+      if (isNum(r[4])) n += -r[4] - (isNum(r[5]) ? r[5] : cost);   // published rule, net of its own est. cost at $10K
       else if (r.length < 5 && isNum(r[1])) n += -r[1] - cost;
       gross.push(g);
       net.push(n);
@@ -1058,8 +1072,8 @@ function renderLive() {
     </dl>
     <div class="chart" id="live-chart"></div>` : empty('No live quote for the #1 in this snapshot.')}
     ${rows.length ? `<div class="table-scroll" style="margin-top:32px"><table class="mtable"><caption class="sr-only">Board names, open to now</caption>
-      <thead><tr><th scope="col">Ticker</th><th scope="col">Open</th><th scope="col">Last</th><th scope="col">Open→now</th><th scope="col">High vs open</th><th scope="col">Low vs open</th></tr></thead>
-      <tbody>${rows.map((r) => `<tr><th scope="row">${tk(r.symbol)}</th><td>${esc(price(r.open))}</td><td>${esc(price(r.last))}</td><td class="${isNum(r.oc_now) && r.oc_now <= -0.05 ? 'red' : ''}">${esc(pct(r.oc_now, 1, true))}</td><td>${esc(pct(isNum(r.high) && r.open ? r.high / r.open - 1 : null, 1, true))}</td><td>${esc(pct(isNum(r.low) && r.open ? r.low / r.open - 1 : null, 1, true))}</td></tr>`).join('')}</tbody></table></div>` : ''}`;
+      <thead><tr><th scope="col">Ticker</th><th scope="col">Open</th><th scope="col">Last</th><th scope="col">Open→now</th><th scope="col">High vs open</th><th scope="col">Low vs open</th><th scope="col">Spread now</th></tr></thead>
+      <tbody>${rows.map((r) => `<tr><th scope="row">${tk(r.symbol)}</th><td>${esc(price(r.open))}</td><td>${esc(price(r.last))}</td><td class="${isNum(r.oc_now) && r.oc_now <= -0.05 ? 'red' : ''}">${esc(pct(r.oc_now, 1, true))}</td><td>${esc(pct(isNum(r.high) && r.open ? r.high / r.open - 1 : null, 1, true))}</td><td>${esc(pct(isNum(r.low) && r.open ? r.low / r.open - 1 : null, 1, true))}</td><td>${esc(isNum(r.spread_now) ? pct(r.spread_now, 2) : DASH)}</td></tr>`).join('')}</tbody></table></div>` : ''}`;
   const el = $('#live-chart');
   if (el && top) {
     try { S.disposers.live.push(intradayChart(el, top.points, { open: top.open, label: `${top.symbol} since the open` })); } catch (e) { console.error('[gravity] live chart', e); }
@@ -1412,7 +1426,7 @@ function sizeLine(p) {
   const sz = obj(p.size);
   if (!isNum(sz.capacity)) return '';
   const be = isNum(sz.breakeven) ? (sz.breakeven >= 1e4 ? money(sz.breakeven) : 'under $10K') : null;
-  return `<p class="hero-sub__line"><span class="eyebrow">Size</span>Absorbs about <b>${esc(money(sz.capacity))}</b> before moving the price (limit: ${esc(LIMIT_TXT[sz.limit] || sz.limit || DASH)})${be ? ` · breakeven ≈ <b>${esc(be)}</b> — above that, estimated costs exceed the #1's historical average move` : ''} · at ${esc(sizeLabel(S.size))}: <b>${esc(pct(costAt(p), 1))}</b> round-trip</p>`;
+  return `<p class="hero-sub__line"><span class="eyebrow">Size</span>Absorbs about <b>${esc(money(sz.capacity))}</b> before moving the price (limit: ${esc(LIMIT_TXT[sz.limit] || sz.limit || DASH)})${be ? ` · breakeven ≈ <b>${esc(be)}</b> — above that, estimated costs exceed ${sz.move_basis === '#1' ? "the historical #1's" : "a historical top-10 pick's"} average move` : ''} · at ${esc(sizeLabel(S.size))}: <b>${esc(pct(costAt(p), 1))}</b> round-trip</p>`;
 }
 
 function sizeDossier(p) {
@@ -1429,8 +1443,8 @@ function sizeDossier(p) {
     ['Max size without moving the price', esc(money(sz.capacity)), `limit: ${LIMIT_TXT[sz.limit] || sz.limit || DASH}`],
     ['Expected session $ volume', esc(money(sz.exp_dvol)), 'conservative estimate'],
     ['IBKR lendable value', esc(isNum(sz.cap_borrow) ? money(sz.cap_borrow) : DASH)],
-    ['Spread estimate', esc(isNum(sz.spread) ? pct(sz.spread, 2) : DASH), sz.spread_floor ? 'estimator floor used — real spread unknown' : 'Abdi–Ranaldo, 20 sessions'],
-    ['Breakeven size', esc(isNum(sz.breakeven) ? money(sz.breakeven) : DASH), isNum(sz.avg_move) ? `where costs reach the #1's ${pct(sz.avg_move, 1)} average move` : ''],
+    ['Spread used in costs', esc(isNum(sz.spread) ? pct(sz.spread, 2) : DASH), sz.spread_estimated === false ? 'estimator could not read it — conservative fallback (≥ 0.5% or one cent)' : 'Abdi–Ranaldo estimate, 20 sessions'],
+    ['Breakeven size', esc(isNum(sz.breakeven) ? money(sz.breakeven) : DASH), isNum(sz.avg_move) ? `where costs reach ${sz.move_basis === '#1' ? "the historical #1's" : "a historical top-10 pick's"} ${pct(sz.avg_move, 1)} average move — a point estimate with wide uncertainty` : ''],
   ]) + `<div class="table-scroll" style="margin-top:16px"><table class="mtable"><caption class="sr-only">Estimated cost by position size</caption><thead><tr><th scope="col">Size</th><th scope="col">Round-trip cost</th><th scope="col">Share of volume</th><th scope="col">Within capacity</th><th scope="col">Below breakeven</th></tr></thead><tbody>${rows}</tbody></table></div><p class="note" style="margin-top:8px">Square-root impact model (Y = 0.7 × daily volatility × √(size ÷ volume)) on both legs plus one spread. Planning estimates — real costs depend on how the order is worked.</p>`;
 }
 
@@ -1441,33 +1455,34 @@ function renderSizeLab() {
   const r = S.sizeLab;
   if (!r) { root.innerHTML = empty('The size research file has not been published.'); return; }
   const dc = (o, f) => `${esc(f(obj(o).dev))} <span class="muted">/</span> ${esc(f(obj(o).confirm))}`;
-  const intr = arr(r.intraday).map((t) => `<tr><th scope="row">${esc(t.tier)} <span class="nm">tested at ${esc(t.size_tested)}</span></th><td>${dc(t.names_per_day, (v) => int(v))}</td><td>${dc(t.base_dump, (v) => pct(v, 1))}</td><td>${dc(t.top1_hit, (v) => pct(v, 0))}</td><td>${dc(t.top1_mean_oc, (v) => pct(v, 1, true))}</td><td>${dc(t.cost, (v) => pct(v, 1))}</td><td class="red">${dc(t.net, (v) => pct(v, 1, true))}</td></tr>`).join('');
+  const sp = (v) => pct(v, 1, true);
+  const intr = arr(r.intraday).map((t) => `<tr><th scope="row">${esc(t.tier)} <span class="nm">tested at ${esc(t.size_tested)}</span></th><td>${dc(t.names_per_day, (v) => int(v))}</td><td>${dc(t.base_dump, (v) => pct(v, 1))}</td><td>${dc(t.top1_hit, (v) => pct(v, 0))}</td><td>${dc(t.top1_mean_oc, sp)}</td><td>${dc(t.cost, (v) => pct(v, 1))}</td><td>${dc(t.net, sp)}</td><td>${dc(t.net_tight, sp)}</td></tr>`).join('');
   const md = obj(r.multi_day_20);
   const mdRows = ['$500K', '$1M'].map((t) => {
-    const b = obj(obj(md.biased)[t]);
-    const p = obj(obj(md.pit)[t]);
-    return `<tr><th scope="row">${esc(t)}</th><td>${dc(b.net, (v) => pct(v, 1, true))}</td><td>${dc(b.tier_mean_r, (v) => pct(v, 1, true))}</td><td class="red">${dc(p.net, (v) => pct(v, 1, true))}</td><td>${dc(p.tier_mean_r, (v) => pct(v, 1, true))}</td></tr>`;
+    const x = obj(md[t]);
+    return `<tr><th scope="row">${esc(t)}</th><td>${dc(x.biased_net, sp)}</td><td>${dc(x.biased_tier, sp)}</td><td>${dc(x.pit_net, sp)}</td><td>${dc(x.pit_tier, sp)}</td><td>${dc(x.pit_t, (v) => fixed(v, 1))}</td><td>${dc(x.indep, (v) => int(v))}</td></tr>`;
   }).join('');
-  const mp = obj(r.main_pit);
-  const mpRow = (k, label) => `<tr><th scope="row">${esc(label)}</th><td>${dc({ dev: obj(obj(mp[k]).dev).hit, confirm: obj(obj(mp[k]).confirm).hit }, (v) => pct(v, 0))}</td><td>${dc({ dev: obj(obj(mp[k]).dev).mean_oc, confirm: obj(obj(mp[k]).confirm).mean_oc }, (v) => pct(v, 1, true))}</td><td>${dc({ dev: obj(obj(mp[k]).dev).auc, confirm: obj(obj(mp[k]).confirm).auc }, (v) => fixed(v, 3))}</td></tr>`;
+  const mp = obj(obj(r.main_pit).pit);
+  const g = (k) => ({ dev: obj(mp.dev)[k], confirm: obj(mp.confirm)[k] });
   const ss = obj(S.today && S.today.size_summary);
   const today = isNum(ss.deployable) ? `<dl class="tiles reveal">
       ${stat('Deployable today, top 10', esc(money(ss.deployable)), esc(`spread across ${int(ss.names)} names, each within its capacity and breakeven`))}
       ${stat('#1 capacity', esc(money(ss.top_capacity)), 'before moving the price')}
-      ${stat('#1 breakeven size', esc(isNum(ss.top_breakeven) ? money(ss.top_breakeven) : DASH), esc(isNum(ss.avg_move_top1) ? `costs reach its ${pct(ss.avg_move_top1, 1)} average move` : ''))}
-      ${stat('Avg move, a top-10 pick', esc(pct(-ss.avg_move_top10, 1, true)), 'open→close, walk-forward backtest')}
+      ${stat('#1 breakeven size', esc(isNum(ss.top_breakeven) ? money(ss.top_breakeven) : DASH), esc(isNum(ss.avg_move_top1) ? `costs reach the historical #1's ${pct(ss.avg_move_top1, 1)} average move` : ''))}
+      ${stat('Avg move, a top-10 pick', esc(pct(-ss.avg_move_top10, 1, true)), 'open→close before costs, walk-forward backtest')}
     </dl>` : '';
   root.innerHTML = `
     ${today}
     <p class="sec-q reveal">${esc(r.question || '')}</p>
     <ul class="notes verdict reveal">${arr(r.verdict).map((v) => `<li>${esc(v)}</li>`).join('')}</ul>
-    <div class="rec-block reveal"><h3 class="rec-sub">Same-day shorts by size</h3><p class="note">Each cell: development / confirmation period. Measured on today's small-cap list; the point-in-time correction lowered the comparable numbers elsewhere.</p>
-      <div class="table-scroll"><table class="mtable"><thead><tr><th scope="col">Tier</th><th scope="col">Names/day</th><th scope="col">Base dump</th><th scope="col">#1 dumped</th><th scope="col">#1 avg open→close</th><th scope="col">Est. cost</th><th scope="col">Net / trade</th></tr></thead><tbody>${intr}</tbody></table></div></div>
-    <div class="rec-block reveal"><h3 class="rec-sub">20-session shorts in liquid names — before and after the point-in-time fix</h3>
-      <div class="table-scroll"><table class="mtable"><thead><tr><th scope="col">Tier</th><th scope="col">Net / trade (biased list)</th><th scope="col">Tier average (biased)</th><th scope="col">Net / trade (point-in-time)</th><th scope="col">Tier average (point-in-time)</th></tr></thead><tbody>${mdRows}</tbody></table></div>
-      <p class="note" style="margin-top:8px">On today's list the tier itself drifted down 2–4% per 20 sessions — the signature of stocks that had already collapsed into small-cap range. Measured point-in-time, the same tier rose, and the edge vanished.</p></div>
-    <div class="rec-block reveal"><h3 class="rec-sub">The daily #1 — before and after the point-in-time fix</h3>${r.main_pit_note ? `<p class="note">${esc(r.main_pit_note)}</p>` : ''}
-      <div class="table-scroll"><table class="mtable"><thead><tr><th scope="col">Universe</th><th scope="col">#1 dumped 5%+</th><th scope="col">#1 avg open→close</th><th scope="col">AUC</th></tr></thead><tbody>${mpRow('published', "Today's small-cap list (old)")}${mpRow('pit', 'Point-in-time (now used)')}</tbody></table></div></div>
+    <div class="rec-block reveal"><h3 class="rec-sub">The daily #1 on a point-in-time universe</h3><p class="note">Development / confirmation period. Net uses each pick's own estimated cost at $10K; "tight" assumes spreads near one tick.</p>
+      <div class="table-scroll"><table class="mtable"><thead><tr><th scope="col">Period</th><th scope="col">Base dump</th><th scope="col">#1 dumped</th><th scope="col">#1 avg open→close</th><th scope="col">Median</th><th scope="col">Est. cost $10K</th><th scope="col">Net $10K</th><th scope="col">Net, tight spread</th><th scope="col">AUC</th></tr></thead>
+      <tbody><tr><th scope="row">Dev / confirm</th><td>${dc(g('base'), (v) => pct(v, 1))}</td><td>${dc(g('hit'), (v) => pct(v, 0))}</td><td>${dc(g('mean_oc'), sp)}</td><td>${dc(g('median_oc'), sp)}</td><td>${dc(g('cost10k'), (v) => pct(v, 1))}</td><td>${dc(g('net10k'), sp)}</td><td>${dc(g('net10k_tight'), sp)}</td><td>${dc(g('auc'), (v) => fixed(v, 3))}</td></tr></tbody></table></div></div>
+    <div class="rec-block reveal"><h3 class="rec-sub">Same-day shorts by size</h3><p class="note">Point-in-time universe, production cost model. Each cell: development / confirmation.</p>
+      <div class="table-scroll"><table class="mtable"><thead><tr><th scope="col">Tier</th><th scope="col">Names/day</th><th scope="col">Base dump</th><th scope="col">#1 dumped</th><th scope="col">#1 avg open→close</th><th scope="col">Est. cost</th><th scope="col">Net / trade</th><th scope="col">Net, tight spread</th></tr></thead><tbody>${intr}</tbody></table></div></div>
+    <div class="rec-block reveal"><h3 class="rec-sub">20-session shorts in liquid names — today's list vs point-in-time</h3>
+      <div class="table-scroll"><table class="mtable"><thead><tr><th scope="col">Tier</th><th scope="col">Net / trade, today's list</th><th scope="col">Tier avg, today's list</th><th scope="col">Net / trade, point-in-time</th><th scope="col">Tier avg, point-in-time</th><th scope="col">t-stat</th><th scope="col">Independent trades</th></tr></thead><tbody>${mdRows}</tbody></table></div>
+      <p class="note" style="margin-top:8px">On today's list the tier itself drifted down — the signature of stocks that had already collapsed into small-cap range. Point-in-time, the result is mixed and within noise.</p></div>
     <details class="rec-block reveal"><summary class="rec-sub">How this was tested</summary><ul class="caveats">${arr(r.method).map((m) => `<li>${esc(m)}</li>`).join('')}</ul></details>`;
 }
 

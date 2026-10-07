@@ -232,18 +232,29 @@ def build_training_panel() -> tuple:
     """Point-in-time training panel (survivorship / selection fix).
 
     Today's "≤ $2B" list over-represents stocks that *shrank* into small-cap
-    range and leaves out the ones that grew out of it — which flatters any
-    short backtest. Training therefore loads every name up to $20B today and
-    keeps a row only while that stock's market cap at the time (that day's
-    close × today's share count) was ≤ $2B. Delisted names are still missing
-    (no free history for them)."""
+    range and leaves out the ones that grew out of it. Training therefore
+    loads every listed common stock (no upper cap) and keeps a row only while
+    that stock's market cap AT THE TIME was ≤ $2B:
+
+        cap_t = as-traded price_t × shares outstanding as reported on the
+                latest SEC cover page on or before t (XBRL frames), adjusted
+                for any split between that report and t.
+
+    Using today's share count instead would wildly overstate the past cap of
+    serial diluters (the names that dump most) and wrongly drop them. Names in
+    today's ≤ $2B universe with no SEC share count keep all their rows;
+    others without one fall back to today's share count. Delisted names are
+    still missing (no free history for them). Cross-sectional features are
+    recomputed on the kept rows so they match live scoring."""
     from .sources import prices, sec, universe
     from . import features
 
     t0 = time.time()
+    saved_status = dict(net.STATUS)            # keep today's feed health for the site
     uni = universe.load_universe(max_cap=config.TRAIN_MAX_CAP)
-    uni = uni[(uni["market_cap"] > 0) & (uni["price"] > 0)].drop_duplicates("symbol")
-    shares_now = (uni.set_index("symbol")["market_cap"] / uni.set_index("symbol")["price"])
+    uni = uni.drop_duplicates("symbol")
+    small_today = set(uni.loc[uni["market_cap"] <= config.MAX_MARKET_CAP, "symbol"])
+    shares_today = (uni.set_index("symbol")["market_cap"] / uni.set_index("symbol")["price"]).replace([np.inf, -np.inf], np.nan)
     syms = uni["symbol"].tolist()
     hist = prices.load_history(syms, refresh=True)
     hist = {s: df for s, df in hist.items() if df is not None and len(df) >= 30}
@@ -260,13 +271,54 @@ def build_training_panel() -> tuple:
     except Exception as e:  # noqa: BLE001
         log.warning("finra history unavailable: %s", e)
     panel = features.build_panel(hist, events, splits, static, bench, short_vol=short_vol)
-    pit = panel["close"] * panel["symbol"].map(shares_now)
-    keep = pit <= config.MAX_MARKET_CAP
-    log.info("training panel: %d names ≤ $%.0fB today → %d of %d rows were ≤ $%.0fB at the time (%.0fs)",
-             len(hist), config.TRAIN_MAX_CAP / 1e9, int(keep.sum()), len(panel), config.MAX_MARKET_CAP / 1e9,
-             time.time() - t0)
-    panel = panel[keep.fillna(False)].reset_index(drop=True)
+
+    pit = _pit_market_cap(panel, sec.shares_frames(), cmap, splits, shares_today)
+    keep = (pit <= config.MAX_MARKET_CAP) | (pit.isna() & panel["symbol"].isin(small_today))
+    log.info("training panel: %d names → %d of %d rows were ≤ $%.0fB at the time (%d with SEC point-in-time "
+             "shares) (%.0fs)", len(hist), int(keep.sum()), len(panel), config.MAX_MARKET_CAP / 1e9,
+             int(panel.attrs.get("pit_sec_rows", 0)), time.time() - t0)
+    panel = panel[keep.to_numpy()].reset_index(drop=True)
+    features._cross_sectional(panel)           # ranks / breadth over the kept universe, as live
+    net.STATUS.clear()
+    net.STATUS.update(saved_status)
     return panel, hist
+
+
+def _pit_market_cap(panel: pd.DataFrame, frames: List[dict], cmap: dict, splits: dict,
+                    shares_today: pd.Series) -> pd.Series:
+    """Market cap at each row's date (NaN when unknown)."""
+    cap = pd.Series(np.nan, index=panel.index)
+    fr = pd.DataFrame(frames)
+    by_cik = {c: g.sort_values("end") for c, g in fr.groupby("cik")} if len(fr) else {}
+    sec_rows = 0
+    for sym, idx in panel.groupby("symbol").groups.items():
+        rows = panel.loc[idx, ["date", "price"]]
+        dates = pd.to_datetime(rows["date"])
+        cik = (cmap.get(sym) or {}).get("cik")
+        g = by_cik.get(int(cik)) if cik else None
+        if g is not None and len(g):
+            ends = pd.to_datetime(g["end"]).to_numpy()
+            vals = g["shares"].to_numpy(float)
+            # latest report on/before t (fall back to the first report for earlier rows)
+            k = np.searchsorted(ends, dates.to_numpy(), side="right") - 1
+            k_eff = np.where(k < 0, 0, k)
+            sh = vals[k_eff]
+            rep_dates = ends[k_eff]
+            # splits between the report date and t change the share count
+            sp = sorted(splits.get(sym, []), key=lambda x: x["date"])
+            if sp:
+                sd = pd.to_datetime([x["date"] for x in sp]).to_numpy()
+                cum = np.cumprod([float(x["ratio"]) for x in sp])
+                def factor(t):
+                    j = np.searchsorted(sd, t, side="right") - 1
+                    return np.where(j >= 0, cum[np.clip(j, 0, None)], 1.0)
+                sh = sh * factor(dates.to_numpy()) / factor(rep_dates)
+            cap.loc[idx] = rows["price"].to_numpy(float) * sh
+            sec_rows += len(idx)
+        elif sym in shares_today.index and np.isfinite(shares_today.get(sym, np.nan)):
+            cap.loc[idx] = rows["price"].to_numpy(float) * float(shares_today[sym])
+    panel.attrs["pit_sec_rows"] = sec_rows
+    return cap
 
 
 def _static_frame(uni: pd.DataFrame, cmap: dict) -> pd.DataFrame:
@@ -657,17 +709,23 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
     today_iso, run_day = session.isoformat(), now_et().date().isoformat()
     _pub = ((bundle.get("report") or {}).get("oos") or {}).get("m0") or {}
     _mv = _pub.get("pub1_mean_oc")
-    avg_move = (-float(_mv)) if (_mv is not None and _mv < 0) else None   # the #1's historical average drop
+    avg_move = (-float(_mv)) if (_mv is not None and _mv < 0) else None   # the published #1's historical average drop
+    _m10 = _pub.get("top10_mean_oc")
+    avg_move_10 = (-float(_m10)) if (_m10 is not None and _m10 < 0) else None  # a top-10 pick's
 
-    def size_of(sym: str, m: dict) -> Optional[dict]:
+    def size_of(sym: str, m: dict, move: Optional[float] = None, basis: str = "top-10") -> Optional[dict]:
         df = hist.get(sym)
         if df is None or len(df) < 12:
             return None
         b = borrow.get(sym) if borrow_ok else None
         avail = b.get("available") if b else (0 if borrow_ok else None)
         dv1 = (m.get("close") or 0) * (m.get("volume") or 0)
-        return _safe(CAP.size_block, m.get("close"), m.get("dvol20") or 0.0, dv1, m.get("vol20"),
-                     df["high"].to_numpy(), df["low"].to_numpy(), df["close"].to_numpy(), avail, avg_move)
+        blk = _safe(CAP.size_block, m.get("close"), m.get("dvol20") or 0.0, dv1, m.get("vol20"),
+                    df["high"].to_numpy(), df["low"].to_numpy(), df["close"].to_numpy(), avail,
+                    avg_move_10 if move is None else move)
+        if blk is not None:
+            blk["move_basis"] = basis
+        return blk
 
     # 6) families (descriptive) + model attribution (what the model actually weighed)
     feature_docs = getattr(features, "FEATURE_DOCS", {})
@@ -813,6 +871,10 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
     # The #1 follows the publication rule the backtest measured: no Rule 201
     # restriction and ≥ $300k median daily volume (plus borrow + squeeze < 70).
     top = next((p for p in board if p.get("publishable")), None)
+    if top is not None and avg_move is not None:
+        # the published #1 is measured against the #1's own historical move
+        _row = {k: (None if (not isinstance(v, (list, dict)) and pd.isna(v)) else v) for k, v in latest.loc[top["symbol"]].items()}
+        top["size"] = size_of(top["symbol"], _row, avg_move, "#1") or top.get("size")
     tie_n = 0
     if top is not None:
         tie_n = int((np.abs(latest["prob_dump"].to_numpy(float) - float(top["prob_dump"])) < 1e-4).sum())
@@ -829,22 +891,7 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
     # how much could be spread across today's top 10 before estimated costs
     # exceed the historical average move of a top-10 pick (each name capped
     # at its own capacity)
-    _t10 = _pub.get("top10_mean_oc")
-    size_summary = None
-    if _t10 is not None and _t10 < 0:
-        tot, used = 0.0, 0
-        for p in board[:10]:
-            sz = p.get("size") or {}
-            if not sz.get("exp_dvol"):
-                continue
-            be = CAP.breakeven_size(-float(_t10), sz["exp_dvol"], (p.get("metrics") or {}).get("vol20"),
-                                    sz["spread"] if sz.get("spread") is not None else np.nan)
-            tot += min(be, sz.get("capacity") or 0.0)
-            used += 1
-        size_summary = {"names": used, "deployable": tot, "avg_move_top10": -float(_t10),
-                        "avg_move_top1": avg_move,
-                        "top_capacity": ((top or {}).get("size") or {}).get("capacity"),
-                        "top_breakeven": ((top or {}).get("size") or {}).get("breakeven")}
+    size_summary = _safe(_size_summary, board, top, avg_move, avg_move_10, CAP)
     twin_cards = []
     for t in tw:
         s = t["symbol"]
@@ -1038,6 +1085,25 @@ def _write_universe(latest, hist, borrow, borrow_ok, events, splits, rank_of, se
     rows.sort(key=lambda x: -(x[4] or 0))
     publish.write_json("universe.json", {"asof": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                                          "session_date": session.isoformat(), "columns": cols, "rows": rows})
+
+
+def _size_summary(board: list, top: Optional[dict], avg_move: Optional[float], avg_move_10: Optional[float], CAP) -> Optional[dict]:
+    """How much could be spread across today's top 10 before estimated costs
+    exceed a top-10 pick's historical average move (each name capped at its
+    own capacity)."""
+    if avg_move_10 is None:
+        return None
+    tot, used = 0.0, 0
+    for p in board[:10]:
+        sz = p.get("size") or {}
+        if not sz.get("exp_dvol"):
+            continue
+        be = CAP.breakeven_size(avg_move_10, sz["exp_dvol"], (p.get("metrics") or {}).get("vol20"), sz.get("spread"))
+        tot += min(be, sz.get("capacity") or 0.0)
+        used += 1
+    return {"names": used, "deployable": tot, "avg_move_top10": avg_move_10, "avg_move_top1": avg_move,
+            "top_capacity": ((top or {}).get("size") or {}).get("capacity"),
+            "top_breakeven": ((top or {}).get("size") or {}).get("breakeven")}
 
 
 def _size_cols(sz: Optional[dict]) -> list:

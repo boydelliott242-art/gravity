@@ -130,6 +130,7 @@ def test_future_bars_do_not_change_features(t_i):
     b = p1[p1["date"] <= t]
     assert len(a) > 0
     assert_features_equal(a, b)
+    assert_features_equal(a, b, cols=["spread_est", "dvol20"])   # cost-model info columns: no lookahead either
     # sanity: the mutation really did change the future
     fa = keyed(p0[p0["date"] > t])
     fb = keyed(p1[p1["date"] > t])

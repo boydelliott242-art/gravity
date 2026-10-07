@@ -68,6 +68,7 @@ SSR_DROP = 0.10                               # Rule 201: a ≥10% intraday drop
 LIQ_FLOOR = 300_000                           # published #1 needs ≥ $300k 20-day median dollar volume
 CAP_FROM = 0.5                                # probabilities above this are capped at their realised OOS rate
 SIM_FRACTION = 0.10                           # compounded curve: risk 10% of equity per day
+REALISTIC_SIZES = (10_000, 50_000)            # per-pick cost model sizes reported in the sim
 TIE_EPS = 1e-6                                # isotonic ties broken by the raw score (moves p by < 1e-6)
 BUNDLE_NAME = "bundle.pkl"
 DEFAULT_SITE_JSON = config.SITE_DATA / "model.json"
@@ -106,12 +107,13 @@ TARGET_TEXT = {
 }
 
 CAVEATS: List[str] = [
-    "Point-in-time universe: training and this backtest use every name listed today up to $20B, "
-    "keeping a row only while that stock was ≤ $2B at the time (that day's close × today's share "
-    "count). This removes the bias of using today's small-cap list, which over-represents stocks "
-    "that shrank into it and flattered short backtests (the earlier, biased version roughly doubled "
-    "the #1's average open→close). Stocks that delisted are still missing (no free history), and "
-    "share counts that changed a lot make the point-in-time cap approximate.",
+    "Point-in-time universe: training and this backtest use every listed common stock, keeping a row "
+    "only while that company was ≤ $2B at the time — that day's traded price × the share count on its "
+    "latest SEC cover page, adjusted for any split since. This removes the bias of using today's "
+    "small-cap list (which over-represents stocks that already collapsed into it) without discarding "
+    "serial diluters. It is still built from today's listings, so companies that delisted are missing "
+    "(their collapses would have helped shorts) while names that later grew are included — on balance "
+    "it leans slightly against shorts.",
     "No locate constraint: the simulation assumes the #1 name could be borrowed and shorted at the "
     "open every day. Many of these names are hard to borrow or unavailable, and borrow fees (often "
     "50-500%+ annualised) are not modelled beyond the flat cost.",
@@ -378,7 +380,7 @@ def _auc(y: np.ndarray, p: np.ndarray) -> Optional[float]:
 
 def _daily_table(day: np.ndarray, prob: np.ndarray, y: np.ndarray, oc: np.ndarray,
                  sq: Optional[np.ndarray] = None, pub: Optional[np.ndarray] = None,
-                 ssr: Optional[np.ndarray] = None) -> pd.DataFrame:
+                 ssr: Optional[np.ndarray] = None, costs: Optional[Dict[str, np.ndarray]] = None) -> pd.DataFrame:
     """Per test day: the #1, the top-10 and the top decile by ``prob``; plus
     the #1 under the publication rule (``pub``) and whether the raw #1 was
     under Rule 201 (``ssr``)."""
@@ -386,6 +388,8 @@ def _daily_table(day: np.ndarray, prob: np.ndarray, y: np.ndarray, oc: np.ndarra
                        "sq": sq if sq is not None else np.nan,
                        "pub": pub if pub is not None else True,
                        "ssr": ssr if ssr is not None else False})
+    for k, v in (costs or {}).items():
+        df[f"cost_{k}"] = v
     df = df[np.isfinite(df["p"]) & np.isfinite(df["y"]) & np.isfinite(df["oc"])]
     if not len(df):
         return pd.DataFrame(columns=["top1_y", "top1_oc", "top1_sq", "top1_ssr", "top10_y", "top10_oc",
@@ -406,6 +410,8 @@ def _daily_table(day: np.ndarray, prob: np.ndarray, y: np.ndarray, oc: np.ndarra
         "dec_y": dec, "uni_y": uni["y"], "uni_oc": uni["oc"],
         "pub1_y": pub1["y"], "pub1_oc": pub1["oc"], "pub1_sq": pub1["sq"],
         "n": g.size(),
+        **{f"top1_cost_{k}": top1[f"cost_{k}"] for k in (costs or {})},
+        **{f"pub1_cost_{k}": pub1[f"cost_{k}"] for k in (costs or {})},
     })
 
 
@@ -466,9 +472,10 @@ def _sim(daily: pd.DataFrame, cost: float = COST) -> Dict[str, Any]:
     gu = -daily["uni_oc"].to_numpy(float)
     gp = -daily["pub1_oc"].to_numpy(float) if "pub1_oc" in daily else np.full(len(daily), np.nan)
     gp_ok = gp[np.isfinite(gp)]
-    rows = [[_day(d), _f(a), _f(b), _f(c), _f(e)] for d, a, b, c, e in
+    rows = [[_day(d), _f(a), _f(b), _f(c), _f(e), _f(k)] for d, a, b, c, e, k in
             zip(daily.index, daily["top1_oc"], daily["top10_oc"], daily["uni_oc"],
-                daily["pub1_oc"] if "pub1_oc" in daily else [None] * len(daily))]
+                daily["pub1_oc"] if "pub1_oc" in daily else [None] * len(daily),
+                daily["pub1_cost_10000"] if "pub1_cost_10000" in daily else [None] * len(daily))]
 
     def compounded(g: np.ndarray) -> Dict[str, Any]:
         """Risk SIM_FRACTION of equity per day on the short (loss capped at total ruin)."""
@@ -480,7 +487,7 @@ def _sim(daily: pd.DataFrame, cost: float = COST) -> Dict[str, Any]:
 
     return {
         "daily": rows,
-        "columns": ["date", "oc_top1", "oc_top10_mean", "universe_mean_oc", "oc_pub1"],
+        "columns": ["date", "oc_top1", "oc_top10_mean", "universe_mean_oc", "oc_pub1", "pub1_cost_10k"],
         "pub_gross_total": _f(gp_ok.sum()) if len(gp_ok) else None,
         "pub_net_total": _f((gp_ok - cost).sum()) if len(gp_ok) else None,
         "pub_win_rate": _f(np.mean(gp_ok - cost > 0)) if len(gp_ok) else None,
@@ -494,6 +501,7 @@ def _sim(daily: pd.DataFrame, cost: float = COST) -> Dict[str, Any]:
                               "pub_net_total": _f((gp_ok - c).sum()) if len(gp_ok) else None}
                              for c in (0.01, 0.03, 0.05)],
         "top20_days_share": _f(np.sort(g1)[::-1][:20].sum() / g1.sum()) if g1.sum() > 0 else None,
+        "realistic": _realistic(daily),
         "gross_total": float(g1.sum()),
         "net_total": float((g1 - cost).sum()),
         "win_rate": float(np.mean(g1 - cost > 0)),
@@ -512,6 +520,31 @@ def _sim(daily: pd.DataFrame, cost: float = COST) -> Dict[str, Any]:
         "cost_assumption": cost,
         "units": "sum of daily returns at 1x notional (not compounded); short return = -(close/open - 1)",
     }
+
+
+def _realistic(daily: pd.DataFrame) -> Dict[str, Any]:
+    """Net of each pick's own estimated cost (capacity model: square-root
+    impact on both legs + spread) at fixed position sizes, for the published
+    #1 — the honest replacement for a flat cost assumption."""
+    out: Dict[str, Any] = {}
+    for size in REALISTIC_SIZES:
+        col = f"pub1_cost_{size}"
+        if col not in daily:
+            continue
+        m = daily["pub1_oc"].notna() & daily[col].notna()
+        g = -daily.loc[m, "pub1_oc"].to_numpy(float)
+        c = daily.loc[m, col].to_numpy(float)
+        net = g - c
+        eq = np.cumprod(1 + SIM_FRACTION * net) if len(net) else np.array([])
+        out[str(size)] = {
+            "days": int(m.sum()), "mean_cost": _f(c.mean()) if len(c) else None,
+            "median_cost": _f(np.median(c)) if len(c) else None,
+            "gross_mean": _f(g.mean()) if len(g) else None, "net_mean": _f(net.mean()) if len(net) else None,
+            "net_total": _f(net.sum()) if len(net) else None, "win_rate": _f(np.mean(net > 0)) if len(net) else None,
+            "compounded": _f(eq[-1]) if len(eq) else None,
+            "max_drawdown_pct": _f(np.max(1 - eq / np.maximum.accumulate(eq))) if len(eq) else None,
+        }
+    return out
 
 
 def _calibration(y: np.ndarray, p: np.ndarray, bins: int = 10) -> List[Dict[str, Any]]:
@@ -760,6 +793,11 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
     tested = np.isfinite(oos["m0"]["prob_dump"])
     pub_mask = publishable(lab)
     ssr_mask = ssr_next(lab)
+    from . import capacity as CAP
+    _dvx = CAP.exp_dvol(_numcol(lab, "dvol20"), _numcol(lab, "close") * _numcol(lab, "volume"))
+    _spr = CAP.spread_used_vec(_numcol(lab, "spread_est"), _numcol(lab, "price"), _numcol(lab, "dvol20"))
+    row_costs = {size: np.asarray(CAP.round_trip_cost(size, _dvx, _numcol(lab, "vol20"), _spr), float)
+                 for size in REALISTIC_SIZES}
     y_up5 = Y["y_pump"]
     big_move = np.abs(Y["y_oc"]) >= 0.05
     directional: Dict[str, Any] = {}
@@ -774,7 +812,8 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
     for m in ("m0", "m1"):
         p = oos[m]["prob_dump"]
         daily = _daily_table(row_dates[tested], p[tested], Y["y_dump"][tested], Y["y_oc"][tested],
-                             Y["y_squeeze"][tested], pub_mask[tested], ssr_mask[tested])
+                             Y["y_squeeze"][tested], pub_mask[tested], ssr_mask[tested],
+                             {k: v[tested] for k, v in row_costs.items()})
         # Is it a DOWN forecast or just a big-move forecast? (the honest question)
         pt, yo = p[tested], Y["y_oc"][tested]
         dec = pd.qcut(pd.Series(pt).rank(method="first"), 10, labels=False)
