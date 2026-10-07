@@ -7,39 +7,41 @@
   "Point-in-time universe: every listed stock, a row kept only while the company was \u2264 $2B at the time (traded price \u00d7 the share count on its latest SEC cover page, split-adjusted). Delisted stocks are still missing.",
   "Capacity: \u2264 5% of the session's expected dollar volume per leg and \u2264 0.5% estimated one-way impact (square-root law, Y = 0.7, daily volatility), with a conservative next-session volume and, live, IBKR's lendable shares.",
   "Costs: impact on both legs + one spread. The spread is the least certain input: the close-high-low estimate is trusted only between one tick ($0.0001 under $1, $0.01 above) and a liquidity cap (3% under $1M/day, 2% to $5M, 1% above). 'Tight spread' shows the result if real spreads sit near the tick.",
-  "About 25 variants tested: production features; liquidity / intraday-habit features; bagging; liquid-only training; the pre-market gap; dump-minus-pump ranking; direct return models; protective stops; 5/10/20-session holds; two universe definitions."
+  "About 35 variants tested: production features; liquidity / intraday-habit features; bagging; liquid-only training; the pre-market gap; dump-minus-pump ranking; direct return models; protective stops; 5/10/20-session holds; two universe definitions; and (round 9) seven morning models built only from what is knowable at 9:00 ET.",
+  "Round 9 (the morning model): Yahoo hourly bars with extended hours give, for each stock and morning, the last after-hours / pre-market trade before 9:00 ET, the extended-hours high and low, and how many hours had any trade (Yahoo reports no extended-hours volume). Overnight filings use EDGAR acceptance times. The winner was fixed by a rule written down before the results were seen (best development-window average move, then it had to match or beat the old morning model in the confirmation window).",
+  "The tables in this section are research runs (their own universe build); the Track Record shows the production model's walk-forward with the same cost model. A single daily #1 is a noisy statistic (about 210\u2013230 sessions per window): small changes to the universe moved the same model's average by about a point, so read differences smaller than that as noise. The morning-model comparison is paired \u2014 every variant on the same days and universe \u2014 which is what makes its ranking meaningful."
  ],
  "intraday": [
   {
    "tier": "Micro-cap (today's #1 rule)",
    "size_tested": "$10K",
    "names_per_day": {
-    "dev": 1863.0,
-    "confirm": 1938.0
+    "dev": 1872.0,
+    "confirm": 1954.0
    },
    "base_dump": {
-    "dev": 0.07385489344596863,
-    "confirm": 0.07380460947751999
+    "dev": 0.07362861931324005,
+    "confirm": 0.07364721596240997
    },
    "top1_hit": {
     "dev": 0.47826087474823,
-    "confirm": 0.4935064911842346
+    "confirm": 0.4978354871273041
    },
    "top1_mean_oc": {
-    "dev": -0.032818689942359924,
-    "confirm": -0.03640972450375557
+    "dev": -0.03993219509720802,
+    "confirm": -0.02502460405230522
    },
    "cost": {
-    "dev": 0.031123446334645793,
-    "confirm": 0.03269492983815428
+    "dev": 0.03824601138605627,
+    "confirm": 0.03741671407524305
    },
    "net": {
-    "dev": 0.00169524330121002,
-    "confirm": 0.00371479555862272
+    "dev": 0.0016861854978738689,
+    "confirm": -0.012392111438064329
    },
    "net_tight": {
-    "dev": 0.015122196861373508,
-    "confirm": 0.01837597880583394
+    "dev": 0.021486977460216067,
+    "confirm": 0.006983570725060389
    }
   },
   {
@@ -47,63 +49,63 @@
    "size_tested": "$500K",
    "names_per_day": {
     "dev": 146.0,
-    "confirm": 177.0
+    "confirm": 178.0
    },
    "base_dump": {
-    "dev": 0.057766739279031754,
-    "confirm": 0.053339648991823196
+    "dev": 0.058429524302482605,
+    "confirm": 0.05334027484059334
    },
    "top1_hit": {
-    "dev": 0.28985506296157837,
-    "confirm": 0.2467532455921173
+    "dev": 0.3140096664428711,
+    "confirm": 0.2770562767982483
    },
    "top1_mean_oc": {
-    "dev": -0.0015942553291097283,
-    "confirm": 0.007142473477870226
+    "dev": -0.00450708856806159,
+    "confirm": 0.007531104143708944
    },
    "cost": {
-    "dev": 0.015124463094237114,
-    "confirm": 0.015553516340772138
+    "dev": 0.017684908870378133,
+    "confirm": 0.017752057283851392
    },
    "net": {
-    "dev": -0.013530208226008329,
-    "confirm": -0.02269599009279793
+    "dev": -0.013177820202210613,
+    "confirm": -0.02528316074217143
    },
    "net_tight": {
-    "dev": -0.008111696090559888,
-    "confirm": -0.016574177050257998
+    "dev": -0.005243785833131691,
+    "confirm": -0.01681058561556641
    }
   },
   {
    "tier": "Takes $1M",
    "size_tested": "$1M",
    "names_per_day": {
-    "dev": 36.0,
+    "dev": 35.0,
     "confirm": 37.0
    },
    "base_dump": {
-    "dev": 0.07179886102676392,
-    "confirm": 0.06313668191432953
+    "dev": 0.07296080142259598,
+    "confirm": 0.06315082311630249
    },
    "top1_hit": {
-    "dev": 0.2222222238779068,
-    "confirm": 0.1991342008113861
+    "dev": 0.23671497404575348,
+    "confirm": 0.20346319675445557
    },
    "top1_mean_oc": {
-    "dev": -0.0025342183653265238,
-    "confirm": -0.0027463152073323727
+    "dev": -0.0032552818302065134,
+    "confirm": -0.0009546233341097832
    },
    "cost": {
-    "dev": 0.015614894248006224,
-    "confirm": 0.015997902269759053
+    "dev": 0.017629942826751264,
+    "confirm": 0.0181486900916584
    },
    "net": {
-    "dev": -0.013080675049354082,
-    "confirm": -0.013251586795956545
+    "dev": -0.014374661151905778,
+    "confirm": -0.017194066367103723
    },
    "net_tight": {
-    "dev": -0.007072964405274019,
-    "confirm": -0.00720665804963969
+    "dev": -0.0064303092086282505,
+    "confirm": -0.008962310646924414
    }
   }
  ],
@@ -118,16 +120,16 @@
     "confirm": -0.019925340078786446
    },
    "pit_net": {
-    "dev": 0.000988682566404477,
-    "confirm": -0.04467831910883817
+    "dev": 0.018346328118884446,
+    "confirm": 0.0008214970205173407
    },
    "pit_tier": {
-    "dev": 0.009210296281616735,
-    "confirm": 0.0205401200425628
+    "dev": 0.0098354339571514,
+    "confirm": 0.02050938488488656
    },
    "pit_t": {
-    "dev": 2.1424857237108266,
-    "confirm": 0.3020326199872921
+    "dev": 0.7888100213077999,
+    "confirm": -0.8646410047704548
    },
    "indep": {
     "dev": 11,
@@ -144,16 +146,16 @@
     "confirm": -0.0391145177586536
    },
    "pit_net": {
-    "dev": -0.019547973423722914,
-    "confirm": 0.006621643019295781
+    "dev": -0.01851923126830522,
+    "confirm": 0.01523333741395807
    },
    "pit_tier": {
-    "dev": 0.02122823446715893,
-    "confirm": 0.016055746488777837
+    "dev": 0.022537770265055348,
+    "confirm": 0.01606470977060241
    },
    "pit_t": {
-    "dev": -0.8572826569629053,
-    "confirm": -0.501965174194384
+    "dev": -1.279811510518309,
+    "confirm": 0.8983959599079693
    },
    "indep": {
     "dev": 11,
@@ -165,23 +167,23 @@
   "pit": {
    "dev": {
     "hit": 0.47826087474823,
-    "mean_oc": -0.032818689942359924,
-    "median_oc": -0.04663212224841118,
-    "auc": 0.7845238244844328,
-    "base": 0.07385489344596863,
-    "cost10k": 0.031123446334645793,
-    "net10k": 0.00169524330121002,
-    "net10k_tight": 0.015122196861373508
+    "mean_oc": -0.03993219509720802,
+    "median_oc": -0.045356377959251404,
+    "auc": 0.7818255418788534,
+    "base": 0.07362861931324005,
+    "cost10k": 0.03824601138605627,
+    "net10k": 0.0016861854978738689,
+    "net10k_tight": 0.021486977460216067
    },
    "confirm": {
-    "hit": 0.4935064911842346,
-    "mean_oc": -0.03640972450375557,
-    "median_oc": -0.04878053814172745,
-    "auc": 0.7833334789140489,
-    "base": 0.07380460947751999,
-    "cost10k": 0.03269492983815428,
-    "net10k": 0.00371479555862272,
-    "net10k_tight": 0.01837597880583394
+    "hit": 0.4978354871273041,
+    "mean_oc": -0.02502460405230522,
+    "median_oc": -0.04947911947965622,
+    "auc": 0.785424386745595,
+    "base": 0.07364721596240997,
+    "cost10k": 0.03741671407524305,
+    "net10k": -0.012392111438064329,
+    "net10k_tight": 0.006983570725060389
    }
   }
  },
@@ -194,10 +196,777 @@
   "cost10k": 0.033967
  },
  "verdict": [
-  "The daily #1 still finds dumps \u2014 48% of published #1s fell 5%+ open\u2192close vs 9% for the average name (point-in-time backtest), averaging \u22123.4% before costs.",
-  "But these are thin stocks. With each pick's own estimated cost, the average trade nets about 0% even at $10K (estimated cost \u2248 3.4% round trip) \u2014 roughly breakeven. If real spreads are near the tick it is better; the live tape now records real bid/ask spreads to settle this.",
-  "Names that can take $500K\u2013$1M: the model still finds dump candidates at about 5\u00d7 the normal rate, but their average same-day move is too small to pay the costs at that size. No variant \u2014 stops, direction-aware ranking, the pre-market gap, liquid-only models \u2014 fixed that.",
-  "20-session shorts in liquid names looked excellent (+6\u201312% per trade) on today's small-cap list, but that list over-represents stocks that had already collapsed. On a point-in-time universe the result is mixed and statistically indistinguishable from zero (about 11 independent trades per period). Not confirmed, not shipped.",
+  "New: the morning #1 now uses only what the 9:05 ET run can know \u2014 after-hours and pre-market trading. Its #1 fell 5%+ open\u2192close on 56% / 58% of sessions (development / confirmation) vs 43% / 51% for the morning model it replaces, averaging \u22125.9% / \u22126.4% before costs.",
+  "After each pick's own estimated cost that is +2.4% / +2.7% per trade at $10K and +0.5% / +0.7% at $50K (the old morning model: \u22120.9% / +0.1% at $10K). Costs now assume wide spreads whenever the estimator can't read one \u2014 real quotes logged since 7 Oct showed thin names quoting 4\u20139% wide.",
+  "Covering at 10:30 whenever the #1 is above its open did NOT help: on the days with hourly data it changed the $10K net from +3.1% to +1.1% (development) and from +2.5% to +1.9% (confirmation) \u2014 early pops usually fade later. Holding to the close stays the rule.",
+  "The close-only model (the evening watchlist, and the morning fallback) still finds dumps \u2014 48% of its #1s fell 5%+ open\u2192close vs 9% for the average name (point-in-time backtest), averaging \u22123.4% before costs.",
+  "But these are thin stocks. With each pick's own estimated cost, its average trade nets about 0% at $10K (estimated cost \u2248 3.4% round trip). The live tape records real bid/ask spreads to keep checking the cost model.",
+  "Names that can take $500K\u2013$1M: the model still finds dump candidates at about 3\u20135\u00d7 the normal rate, but their average same-day move is too small to pay the costs at that size. No variant \u2014 stops, direction-aware ranking, the pre-market gap, liquid-only models \u2014 fixed that.",
+  "20-session shorts in liquid names looked excellent (+4% to +12% per trade) on today's small-cap list, but that list over-represents stocks that had already collapsed. On a point-in-time universe the result is mixed and statistically indistinguishable from zero (about 11 independent trades per period). Not confirmed, not shipped.",
   "So the honest answer to \u201c$500K\u2013$1M without losing accuracy\u201d is no \u2014 not with these signals and free data. GRAVITY shows every pick's capacity, cost at your size and breakeven, so you can size each trade to what the stock can actually absorb."
- ]
+ ],
+ "morning": {
+  "rows": [
+   {
+    "key": "A_m0",
+    "label": "Close only (evening model)",
+    "hit": {
+     "dev": 0.49275362491607666,
+     "confirm": 0.523809552192688
+    },
+    "mean_oc": {
+     "dev": -0.03899459168314934,
+     "confirm": -0.03483011946082115
+    },
+    "median_oc": {
+     "dev": -0.049180351197719574,
+     "confirm": -0.05699476599693298
+    },
+    "squeeze": {
+     "dev": 0.20772946859903382,
+     "confirm": 0.24242424242424243
+    },
+    "net10k": {
+     "dev": 0.005144079422245574,
+     "confirm": -0.002697035993756176
+    },
+    "net50k": {
+     "dev": -0.011612431367212381,
+     "confirm": -0.022231886497192845
+    },
+    "auc": {
+     "dev": 0.7838352134824154,
+     "confirm": 0.7824212042990568
+    },
+    "vs_live": {
+     "dev": {
+      "days": 207,
+      "differs": 0.7004830917874396,
+      "mean_diff": 0.00767861120402813,
+      "ci90": [
+       -0.013155674561858177,
+       0.02807481773197651
+      ],
+      "hit_diff": 0.057971030473709106
+     },
+     "confirm": {
+      "days": 231,
+      "differs": 0.7748917748917749,
+      "mean_diff": -0.011795814149081707,
+      "ci90": [
+       -0.04414742812514305,
+       0.019264960661530495
+      ],
+      "hit_diff": 0.017316043376922607
+     }
+    }
+   },
+   {
+    "key": "Bp_m1_official",
+    "label": "Same model scored on the real 9:30 open (what the site showed \u2014 not knowable at 9:05)",
+    "hit": {
+     "dev": 0.6135265827178955,
+     "confirm": 0.5844155550003052
+    },
+    "mean_oc": {
+     "dev": -0.05796882137656212,
+     "confirm": -0.062244247645139694
+    },
+    "median_oc": {
+     "dev": -0.083333320915699,
+     "confirm": -0.07975450903177261
+    },
+    "squeeze": {
+     "dev": 0.25120772946859904,
+     "confirm": 0.30735930735930733
+    },
+    "net10k": {
+     "dev": 0.01625466193035746,
+     "confirm": 0.0182395926282266
+    },
+    "net50k": {
+     "dev": -0.007526201420214628,
+     "confirm": -0.007180721096121249
+    },
+    "auc": {
+     "dev": 0.7976402500607223,
+     "confirm": 0.794548116231437
+    },
+    "vs_live": {
+     "dev": {
+      "days": 207,
+      "differs": 0.6908212560386473,
+      "mean_diff": 0.02665283903479576,
+      "ci90": [
+       0.0006325697177089751,
+       0.05136923864483833
+      ],
+      "hit_diff": 0.17874398827552795
+     },
+     "confirm": {
+      "days": 231,
+      "differs": 0.5021645021645021,
+      "mean_diff": 0.015618312172591686,
+      "ci90": [
+       -0.007738749962300062,
+       0.03677404299378395
+      ],
+      "hit_diff": 0.0779220461845398
+     }
+    }
+   },
+   {
+    "key": "B_m1_live",
+    "label": "Morning model as it ran live (trained on the 9:30 open, fed the pre-market price)",
+    "hit": {
+     "dev": 0.43478259444236755,
+     "confirm": 0.5064935088157654
+    },
+    "mean_oc": {
+     "dev": -0.03131598234176636,
+     "confirm": -0.04662593454122543
+    },
+    "median_oc": {
+     "dev": -0.031897954642772675,
+     "confirm": -0.05128200352191925
+    },
+    "squeeze": {
+     "dev": 0.21739130434782608,
+     "confirm": 0.26406926406926406
+    },
+    "net10k": {
+     "dev": -0.00862860338483992,
+     "confirm": 0.0007651504363334454
+    },
+    "net50k": {
+     "dev": -0.030830378896753774,
+     "confirm": -0.026717347425423876
+    },
+    "auc": {
+     "dev": 0.7819950826882786,
+     "confirm": 0.7833502783752762
+    },
+    "vs_live": null
+   },
+   {
+    "key": "C_m1_honest",
+    "label": "Honest: trained and tested on the last trade before 9:00 ET",
+    "hit": {
+     "dev": 0.52173912525177,
+     "confirm": 0.5627705454826355
+    },
+    "mean_oc": {
+     "dev": -0.046374063938856125,
+     "confirm": -0.05285840108990669
+    },
+    "median_oc": {
+     "dev": -0.05882353335618973,
+     "confirm": -0.06967215985059738
+    },
+    "squeeze": {
+     "dev": 0.1932367149758454,
+     "confirm": 0.27705627705627706
+    },
+    "net10k": {
+     "dev": 0.012462416678824629,
+     "confirm": 0.015005026835577202
+    },
+    "net50k": {
+     "dev": -0.004577725355247903,
+     "confirm": -0.005195112334224803
+    },
+    "auc": {
+     "dev": 0.7875629439333857,
+     "confirm": 0.7855991262176902
+    },
+    "vs_live": {
+     "dev": {
+      "days": 207,
+      "differs": 0.7922705314009661,
+      "mean_diff": 0.015058084391057491,
+      "ci90": [
+       -0.00891128834336996,
+       0.03969475254416466
+      ],
+      "hit_diff": 0.08695653080940247
+     },
+     "confirm": {
+      "days": 231,
+      "differs": 0.6536796536796536,
+      "mean_diff": 0.006232471205294132,
+      "ci90": [
+       -0.021723518148064613,
+       0.032929353415966034
+      ],
+      "hit_diff": 0.05627703666687012
+     }
+    }
+   },
+   {
+    "key": "C_m1_honest_mix",
+    "label": "Honest: trained and tested on the last trade before 9:00 ET \u2014 M1 only where a pre-market price exists",
+    "hit": {
+     "dev": 0.5265700221061707,
+     "confirm": 0.5670995712280273
+    },
+    "mean_oc": {
+     "dev": -0.041135866194963455,
+     "confirm": -0.05394866690039635
+    },
+    "median_oc": {
+     "dev": -0.05882353335618973,
+     "confirm": -0.06933741271495819
+    },
+    "squeeze": {
+     "dev": 0.21256038647342995,
+     "confirm": 0.2683982683982684
+    },
+    "net10k": {
+     "dev": 0.00679637233222904,
+     "confirm": 0.016666196737472282
+    },
+    "net50k": {
+     "dev": -0.011127079343073035,
+     "confirm": -0.002979378285182264
+    },
+    "auc": {
+     "dev": 0.7875891387815519,
+     "confirm": 0.7858877813951386
+    },
+    "vs_live": {
+     "dev": {
+      "days": 207,
+      "differs": 0.6666666666666666,
+      "mean_diff": 0.009819887578487396,
+      "ci90": [
+       -0.012422800995409489,
+       0.03215530142188072
+      ],
+      "hit_diff": 0.0917874276638031
+     },
+     "confirm": {
+      "days": 231,
+      "differs": 0.658008658008658,
+      "mean_diff": 0.0073227304965257645,
+      "ci90": [
+       -0.02056865766644478,
+       0.034265678375959396
+      ],
+      "hit_diff": 0.06060606241226196
+     }
+    }
+   },
+   {
+    "key": "D_ext_shape",
+    "label": "Honest + shape of after-hours / pre-market trading",
+    "hit": {
+     "dev": 0.5555555820465088,
+     "confirm": 0.5800865888595581
+    },
+    "mean_oc": {
+     "dev": -0.05916571989655495,
+     "confirm": -0.06380953639745712
+    },
+    "median_oc": {
+     "dev": -0.060998138040304184,
+     "confirm": -0.08588958531618118
+    },
+    "squeeze": {
+     "dev": 0.18840579710144928,
+     "confirm": 0.23376623376623376
+    },
+    "net10k": {
+     "dev": 0.023510867721288468,
+     "confirm": 0.026645362900870072
+    },
+    "net50k": {
+     "dev": 0.004722334728480794,
+     "confirm": 0.007119475510178041
+    },
+    "auc": {
+     "dev": 0.7903309812330401,
+     "confirm": 0.7874387906218241
+    },
+    "vs_live": {
+     "dev": {
+      "days": 207,
+      "differs": 0.7777777777777778,
+      "mean_diff": 0.02784973569214344,
+      "ci90": [
+       0.004581716377288103,
+       0.05073486641049385
+      ],
+      "hit_diff": 0.12077298760414124
+     },
+     "confirm": {
+      "days": 231,
+      "differs": 0.6753246753246753,
+      "mean_diff": 0.01718359813094139,
+      "ci90": [
+       -0.010849535465240479,
+       0.044249095022678375
+      ],
+      "hit_diff": 0.07359308004379272
+     }
+    }
+   },
+   {
+    "key": "D_ext_shape_mix",
+    "label": "Honest + shape of after-hours / pre-market trading \u2014 M1 only where a pre-market price exists",
+    "hit": {
+     "dev": 0.5410627722740173,
+     "confirm": 0.5670995712280273
+    },
+    "mean_oc": {
+     "dev": -0.053496431559324265,
+     "confirm": -0.0643232986330986
+    },
+    "median_oc": {
+     "dev": -0.054717011749744415,
+     "confirm": -0.08403361588716507
+    },
+    "squeeze": {
+     "dev": 0.2028985507246377,
+     "confirm": 0.23376623376623376
+    },
+    "net10k": {
+     "dev": 0.01962218948392386,
+     "confirm": 0.027204556044830783
+    },
+    "net50k": {
+     "dev": 0.002648332516593267,
+     "confirm": 0.007574297872737698
+    },
+    "auc": {
+     "dev": 0.7901512896948724,
+     "confirm": 0.7876616471130958
+    },
+    "vs_live": {
+     "dev": {
+      "days": 207,
+      "differs": 0.6473429951690821,
+      "mean_diff": 0.022180449217557907,
+      "ci90": [
+       0.0014018019428476691,
+       0.04209189489483833
+      ],
+      "hit_diff": 0.10628017783164978
+     },
+     "confirm": {
+      "days": 231,
+      "differs": 0.6277056277056277,
+      "mean_diff": 0.01769735850393772,
+      "ci90": [
+       -0.008816946297883987,
+       0.044024329632520676
+      ],
+      "hit_diff": 0.06060606241226196
+     }
+    }
+   },
+   {
+    "key": "E_overnight",
+    "label": "Honest + shape + filings accepted overnight",
+    "hit": {
+     "dev": 0.5169082283973694,
+     "confirm": 0.5974025726318359
+    },
+    "mean_oc": {
+     "dev": -0.05708594620227814,
+     "confirm": -0.06917190551757812
+    },
+    "median_oc": {
+     "dev": -0.0537312775850296,
+     "confirm": -0.08588958531618118
+    },
+    "squeeze": {
+     "dev": 0.2028985507246377,
+     "confirm": 0.21212121212121213
+    },
+    "net10k": {
+     "dev": 0.022456387929535474,
+     "confirm": 0.033478157416506685
+    },
+    "net50k": {
+     "dev": 0.005083344099910751,
+     "confirm": 0.015376464450283059
+    },
+    "auc": {
+     "dev": 0.7948496704196952,
+     "confirm": 0.7916706147866284
+    },
+    "vs_live": {
+     "dev": {
+      "days": 207,
+      "differs": 0.7681159420289855,
+      "mean_diff": 0.02576996572315693,
+      "ci90": [
+       0.003310790052637458,
+       0.047913070768117905
+      ],
+      "hit_diff": 0.08212563395500183
+     },
+     "confirm": {
+      "days": 231,
+      "differs": 0.6536796536796536,
+      "mean_diff": 0.022545969113707542,
+      "ci90": [
+       -0.0024743112735450268,
+       0.04674689471721649
+      ],
+      "hit_diff": 0.09090906381607056
+     }
+    }
+   },
+   {
+    "key": "E_overnight_mix",
+    "label": "Honest + shape + filings accepted overnight \u2014 M1 only where a pre-market price exists",
+    "hit": {
+     "dev": 0.512077271938324,
+     "confirm": 0.6017315983772278
+    },
+    "mean_oc": {
+     "dev": -0.054687075316905975,
+     "confirm": -0.0736115574836731
+    },
+    "median_oc": {
+     "dev": -0.0537312775850296,
+     "confirm": -0.08695651590824127
+    },
+    "squeeze": {
+     "dev": 0.20772946859903382,
+     "confirm": 0.2077922077922078
+    },
+    "net10k": {
+     "dev": 0.02048017757781746,
+     "confirm": 0.03672943966492747
+    },
+    "net50k": {
+     "dev": 0.003131526296136145,
+     "confirm": 0.017800948872941983
+    },
+    "auc": {
+     "dev": 0.794240755872988,
+     "confirm": 0.7913341683072435
+    },
+    "vs_live": {
+     "dev": {
+      "days": 207,
+      "differs": 0.6811594202898551,
+      "mean_diff": 0.023371096700429916,
+      "ci90": [
+       0.003457609098404646,
+       0.042492810636758804
+      ],
+      "hit_diff": 0.07729467749595642
+     },
+     "confirm": {
+      "days": 231,
+      "differs": 0.6190476190476191,
+      "mean_diff": 0.02698562480509281,
+      "ci90": [
+       0.0035046921111643314,
+       0.04957083612680435
+      ],
+      "hit_diff": 0.0952380895614624
+     }
+    }
+   },
+   {
+    "key": "F_overnight_only",
+    "label": "Close only + filings accepted overnight",
+    "hit": {
+     "dev": 0.49275362491607666,
+     "confirm": 0.5064935088157654
+    },
+    "mean_oc": {
+     "dev": -0.040357720106840134,
+     "confirm": -0.032173994928598404
+    },
+    "median_oc": {
+     "dev": -0.04696305841207504,
+     "confirm": -0.05219206586480141
+    },
+    "squeeze": {
+     "dev": 0.1932367149758454,
+     "confirm": 0.24675324675324675
+    },
+    "net10k": {
+     "dev": 0.005816520166975163,
+     "confirm": -0.006303338425454298
+    },
+    "net50k": {
+     "dev": -0.01145663927231398,
+     "confirm": -0.02651735003322294
+    },
+    "auc": {
+     "dev": 0.7915276884872747,
+     "confirm": 0.7903746220605286
+    },
+    "vs_live": {
+     "dev": {
+      "days": 207,
+      "differs": 0.8115942028985508,
+      "mean_diff": 0.009041735902428627,
+      "ci90": [
+       -0.01375312078744173,
+       0.03146890923380852
+      ],
+      "hit_diff": 0.057971030473709106
+     },
+     "confirm": {
+      "days": 231,
+      "differs": 0.7445887445887446,
+      "mean_diff": -0.014451941475272179,
+      "ci90": [
+       -0.042739152908325195,
+       0.013710726983845234
+      ],
+      "hit_diff": 0.0
+     }
+    }
+   }
+  ],
+  "winner": "D_ext_shape",
+  "chosen": "D_ext_shape",
+  "winner_passed": true,
+  "coverage": {
+   "ext_ok": 0.6867589443839808,
+   "gap_ext_finite": 0.6840518682904909,
+   "gap_ext_finite_pub": 0.7191279943238404,
+   "path_ok": 0.6694448051836112,
+   "corr_gap_ext_vs_open": 0.5838646871140584,
+   "by_year_ext": {
+    "2024": 0.25892063492063494,
+    "2025": 0.8774525062978221,
+    "2026": 0.9149655300324772
+   },
+   "on_any_rate": 0.05365021427906501,
+   "on_offer_rate": 0.0018692673598221868,
+   "dump_if_on_offer": 0.2419305294752121,
+   "dump_base": 0.0902230367064476
+  },
+  "timing": {
+   "dev": {
+    "n": 177,
+    "open\u2192close": {
+     "mean": 0.06585543148793564,
+     "median": 0.06746761209110996,
+     "win": 0.6892655367231638,
+     "n": 177
+    },
+    "open\u219210:30": {
+     "mean": 0.0330423302122605,
+     "median": 0.04278074866310155,
+     "win": 0.6214689265536724,
+     "n": 177
+    },
+    "open\u219212:30": {
+     "mean": 0.039965772051439294,
+     "median": 0.05888878943526599,
+     "win": 0.6666666666666666,
+     "n": 177
+    },
+    "10:30\u2192close": {
+     "mean": 0.030953028691978135,
+     "median": 0.023060844260468172,
+     "win": 0.615819209039548,
+     "n": 177
+    },
+    "10:30\u2192close | up at 10:30": {
+     "mean": 0.04630835556756287,
+     "median": 0.034115754210641225,
+     "win": 0.6818181818181818,
+     "n": 66
+    },
+    "10:30\u2192close | down at 10:30": {
+     "mean": 0.02182283433352234,
+     "median": 0.018181800448205276,
+     "win": 0.5765765765765766,
+     "n": 111
+    },
+    "open\u2192close | up at 10:30": {
+     "mean": -0.030710933528811452,
+     "median": -0.022020097137494088,
+     "win": 0.42424242424242425,
+     "n": 66
+    },
+    "open\u2192close | down at 10:30": {
+     "mean": 0.12327327014654205,
+     "median": 0.12081628916214926,
+     "win": 0.8468468468468469,
+     "n": 111
+    }
+   },
+   "confirm": {
+    "n": 207,
+    "open\u2192close": {
+     "mean": 0.06151544630969591,
+     "median": 0.08422935423258782,
+     "win": 0.7004830917874396,
+     "n": 207
+    },
+    "open\u219210:30": {
+     "mean": 0.034831412617981033,
+     "median": 0.03947801889379465,
+     "win": 0.6763285024154589,
+     "n": 207
+    },
+    "open\u219212:30": {
+     "mean": 0.04342258860173957,
+     "median": 0.06451614961489327,
+     "win": 0.6666666666666666,
+     "n": 207
+    },
+    "10:30\u2192close": {
+     "mean": 0.03198226118490736,
+     "median": 0.045280993454935525,
+     "win": 0.6618357487922706,
+     "n": 207
+    },
+    "10:30\u2192close | up at 10:30": {
+     "mean": 0.021385900288026793,
+     "median": 0.04833655453650498,
+     "win": 0.6515151515151515,
+     "n": 66
+    },
+    "10:30\u2192close | down at 10:30": {
+     "mean": 0.036942259902596135,
+     "median": 0.04128713457926325,
+     "win": 0.6666666666666666,
+     "n": 141
+    },
+    "open\u2192close | up at 10:30": {
+     "mean": -0.1262162907362106,
+     "median": -0.019338052286995255,
+     "win": 0.3787878787878788,
+     "n": 66
+    },
+    "open\u2192close | down at 10:30": {
+     "mean": 0.14938987641629045,
+     "median": 0.13636359570455714,
+     "win": 0.851063829787234,
+     "n": 141
+    }
+   }
+  },
+  "timing_variant": "D_ext_shape",
+  "exit_rule": {
+   "dev": {
+    "n": 177,
+    "hold_mean": 0.06585543148793564,
+    "hold_net10k": 0.03105948503110241,
+    "hold_win": 0.6045197740112994,
+    "hold_worst": -0.5671861811288841,
+    "rule_mean": 0.04615990897594993,
+    "rule_net10k": 0.011363962519116694,
+    "rule_win": 0.4745762711864407,
+    "rule_worst": -0.7364921030756442,
+    "share_covered_1030": 0.3728813559322034
+   },
+   "confirm": {
+    "n": 207,
+    "hold_mean": 0.06151544630969591,
+    "hold_net10k": 0.025218920031241678,
+    "hold_win": 0.6086956521739131,
+    "hold_worst": -1.9484375871950745,
+    "rule_mean": 0.055579723251299895,
+    "rule_net10k": 0.019283196972845668,
+    "rule_win": 0.5169082125603864,
+    "rule_worst": -1.2169077390566323,
+    "share_covered_1030": 0.3188405797101449
+   }
+  },
+  "cost_model": "spread = estimate clipped to [tick, cap]; cap when unreadable; cap 6% <$250K/day, 3% <$1M, 2% <$5M, 1% above"
+ },
+ "basket": {
+  "top1": {
+   "dev": {
+    "days": 189,
+    "deployed_mean": 20399.79551847203,
+    "deployed_median": 12732.917848775327,
+    "net_per_dollar": 0.024701682118762603,
+    "day_win": 0.6031746031746031,
+    "t_stat": 1.9823678840543753,
+    "worst_day": -0.5840935125773976,
+    "pnl_per_day": 503.9092641850541
+   },
+   "confirm": {
+    "days": 212,
+    "deployed_mean": 13871.364530862418,
+    "deployed_median": 7125.245644923797,
+    "net_per_dollar": 0.03326316555531459,
+    "day_win": 0.6320754716981132,
+    "t_stat": 1.6351838901977218,
+    "worst_day": -1.970000057220459,
+    "pnl_per_day": 461.4054948681954
+   }
+  },
+  "top3": {
+   "dev": {
+    "days": 207,
+    "deployed_mean": 50476.88612259727,
+    "deployed_median": 45484.24915016865,
+    "net_per_dollar": 0.022615950119938995,
+    "day_win": 0.6038647342995169,
+    "t_stat": 2.2818867967762055,
+    "worst_day": -0.7331055947240024,
+    "pnl_per_day": 1141.582738758501
+   },
+   "confirm": {
+    "days": 230,
+    "deployed_mean": 41418.89848040125,
+    "deployed_median": 31870.918573959803,
+    "net_per_dollar": 0.0072966195443133425,
+    "day_win": 0.5739130434782609,
+    "t_stat": 0.22031776614734,
+    "worst_day": -0.7306017342827636,
+    "pnl_per_day": 302.21794415602596
+   }
+  },
+  "top5": {
+   "dev": {
+    "days": 207,
+    "deployed_mean": 83136.03905108546,
+    "deployed_median": 78642.17203516667,
+    "net_per_dollar": 0.006189721038772685,
+    "day_win": 0.5603864734299517,
+    "t_stat": 0.7054628503655639,
+    "worst_day": -0.4381440725696904,
+    "pnl_per_day": 514.5888899947312
+   },
+   "confirm": {
+    "days": 231,
+    "deployed_mean": 71930.01609143971,
+    "deployed_median": 66262.25957158626,
+    "net_per_dollar": -0.008856162857498455,
+    "day_win": 0.5194805194805194,
+    "t_stat": -1.4387338110875323,
+    "worst_day": -0.37338343908275284,
+    "pnl_per_day": -637.0239368482746
+   }
+  },
+  "top10": {
+   "dev": {
+    "days": 207,
+    "deployed_mean": 163547.88514520135,
+    "deployed_median": 156920.49560470835,
+    "net_per_dollar": -0.003037927712800795,
+    "day_win": 0.4927536231884058,
+    "t_stat": -0.9665686537489812,
+    "worst_day": -0.3954729315829122,
+    "pnl_per_day": -496.8466526525686
+   },
+   "confirm": {
+    "days": 231,
+    "deployed_mean": 145107.07376224248,
+    "deployed_median": 139897.83828166834,
+    "net_per_dollar": -0.006933006556002209,
+    "day_win": 0.5021645021645021,
+    "t_stat": -1.5974294935657372,
+    "worst_day": -0.3385644167657936,
+    "pnl_per_day": -1006.0282937159233
+   }
+  }
+ }
 }
