@@ -228,16 +228,73 @@ def compute_signs(panel: pd.DataFrame) -> Dict[str, float]:
 
 
 # ── commands ─────────────────────────────────────────────────────────────
+def build_training_panel() -> tuple:
+    """Point-in-time training panel (survivorship / selection fix).
+
+    Today's "≤ $2B" list over-represents stocks that *shrank* into small-cap
+    range and leaves out the ones that grew out of it — which flatters any
+    short backtest. Training therefore loads every name up to $20B today and
+    keeps a row only while that stock's market cap at the time (that day's
+    close × today's share count) was ≤ $2B. Delisted names are still missing
+    (no free history for them)."""
+    from .sources import prices, sec, universe
+    from . import features
+
+    t0 = time.time()
+    uni = universe.load_universe(max_cap=config.TRAIN_MAX_CAP)
+    uni = uni[(uni["market_cap"] > 0) & (uni["price"] > 0)].drop_duplicates("symbol")
+    shares_now = (uni.set_index("symbol")["market_cap"] / uni.set_index("symbol")["price"])
+    syms = uni["symbol"].tolist()
+    hist = prices.load_history(syms, refresh=True)
+    hist = {s: df for s, df in hist.items() if df is not None and len(df) >= 30}
+    splits = prices.load_splits(list(hist))
+    bench = prices.benchmark_history()
+    events = sec.events_for_universe(list(hist))
+    cmap = sec.cik_map() if net.sec_enabled() else {}
+    static = _static_frame(uni, cmap)
+    short_vol = None
+    try:
+        from .sources import finra_hist
+        start = min(df.index.min() for df in hist.values()).date()
+        short_vol = finra_hist.load(start, now_et().date(), symbols=list(hist))
+    except Exception as e:  # noqa: BLE001
+        log.warning("finra history unavailable: %s", e)
+    panel = features.build_panel(hist, events, splits, static, bench, short_vol=short_vol)
+    pit = panel["close"] * panel["symbol"].map(shares_now)
+    keep = pit <= config.MAX_MARKET_CAP
+    log.info("training panel: %d names ≤ $%.0fB today → %d of %d rows were ≤ $%.0fB at the time (%.0fs)",
+             len(hist), config.TRAIN_MAX_CAP / 1e9, int(keep.sum()), len(panel), config.MAX_MARKET_CAP / 1e9,
+             time.time() - t0)
+    panel = panel[keep.fillna(False)].reset_index(drop=True)
+    return panel, hist
+
+
+def _static_frame(uni: pd.DataFrame, cmap: dict) -> pd.DataFrame:
+    """asia / ipo_year / descriptors per symbol, with the Asia flag refined
+    from SEC business addresses and incorporation."""
+    from .sources import sec
+    static = uni.set_index("symbol")[["asia", "ipo_year", "market_cap", "name", "country", "sector", "industry", "price"]].copy()
+    static = static[~static.index.duplicated()]
+    for s in static.index:
+        c = cmap.get(s, {}).get("cik")
+        if not c:
+            continue
+        prof = _safe(sec.issuer_profile, c)
+        if prof and prof.get("asia"):
+            static.at[s, "asia"] = True
+    return static
+
+
 def cmd_train(_args: argparse.Namespace) -> int:
     from . import evidence, model
-    state = refresh_data()
-    panel = state["panel"]
+    state = refresh_data()                      # daily state stays current
+    panel, whist = build_training_panel()       # point-in-time training rows
     report = model.train(panel)
     publish.write_json("model.json", report)
-    ev = evidence.run_studies(panel, listing_dates=_listing_dates(state["hist"]))
+    ev = evidence.run_studies(panel, listing_dates=_listing_dates(whist))
     publish.write_json("evidence.json", ev)
     compute_signs(panel)
-    _safe(update_regime, panel)
+    _safe(update_regime, state["panel"])
     log.info("train done: %s", {k: report.get(k) for k in ("n_rows", "n_symbols", "trained_through")})
     return 0
 
@@ -317,10 +374,11 @@ def cmd_evening(args: argparse.Namespace) -> int:
     publish.write_json("scorecard.json", scorecard.summary())
     if args.retrain or _model_stale(9):
         try:
-            log.info("model stale — retraining (walk-forward)")
-            publish.write_json("model.json", model.train(state["panel"]))
-            publish.write_json("evidence.json", evidence.run_studies(state["panel"], listing_dates=_listing_dates(state["hist"])))
-            compute_signs(state["panel"])
+            log.info("model stale — retraining (walk-forward, point-in-time universe)")
+            tpanel, whist = build_training_panel()
+            publish.write_json("model.json", model.train(tpanel))
+            publish.write_json("evidence.json", evidence.run_studies(tpanel, listing_dates=_listing_dates(whist)))
+            compute_signs(tpanel)
         except Exception as e:  # noqa: BLE001 — keep the existing model and carry on
             log.exception("retrain failed — keeping the previous model")
             net.record_status("Model retrain", False, f"failed: {e}")
@@ -493,6 +551,7 @@ def _merge(dst: dict, src: dict) -> None:
 
 
 def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
+    from . import capacity as CAP
     from . import features, history, model
     from .sources import prices, sec, shortside, street
 
@@ -596,6 +655,19 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
         latest["short_ratio_5d"] = np.nan
     latest["borrow_status"] = [score.shortability(s, borrow, borrow_ok)["status"] for s in latest.index]
     today_iso, run_day = session.isoformat(), now_et().date().isoformat()
+    _pub = ((bundle.get("report") or {}).get("oos") or {}).get("m0") or {}
+    _mv = _pub.get("pub1_mean_oc")
+    avg_move = (-float(_mv)) if (_mv is not None and _mv < 0) else None   # the #1's historical average drop
+
+    def size_of(sym: str, m: dict) -> Optional[dict]:
+        df = hist.get(sym)
+        if df is None or len(df) < 12:
+            return None
+        b = borrow.get(sym) if borrow_ok else None
+        avail = b.get("available") if b else (0 if borrow_ok else None)
+        dv1 = (m.get("close") or 0) * (m.get("volume") or 0)
+        return _safe(CAP.size_block, m.get("close"), m.get("dvol20") or 0.0, dv1, m.get("vol20"),
+                     df["high"].to_numpy(), df["low"].to_numpy(), df["close"].to_numpy(), avail, avg_move)
 
     # 6) families (descriptive) + model attribution (what the model actually weighed)
     feature_docs = getattr(features, "FEATURE_DOCS", {})
@@ -707,6 +779,7 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
             "squeeze_danger": sqd, "squeeze_parts": sq_parts,
             "shortability": short, "families": fams, "reasons": reasons, "flags": flags,
             "attribution": attribution(sym),
+            "size": size_of(sym, m),
             "metrics": {
                 k: m.get(k) for k in (
                     "r1", "r3", "r5", "r20", "rvol1", "rsi14", "dist_ma20", "dist_ma50", "dd_52w",
@@ -752,6 +825,26 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
         if new_syms and live_extras:
             _merge(E, enrich(new_syms, latest, cmap, splits, 120))
     rank_of = {p["symbol"]: p["rank"] for p in board}
+
+    # how much could be spread across today's top 10 before estimated costs
+    # exceed the historical average move of a top-10 pick (each name capped
+    # at its own capacity)
+    _t10 = _pub.get("top10_mean_oc")
+    size_summary = None
+    if _t10 is not None and _t10 < 0:
+        tot, used = 0.0, 0
+        for p in board[:10]:
+            sz = p.get("size") or {}
+            if not sz.get("exp_dvol"):
+                continue
+            be = CAP.breakeven_size(-float(_t10), sz["exp_dvol"], (p.get("metrics") or {}).get("vol20"),
+                                    sz["spread"] if sz.get("spread") is not None else np.nan)
+            tot += min(be, sz.get("capacity") or 0.0)
+            used += 1
+        size_summary = {"names": used, "deployable": tot, "avg_move_top10": -float(_t10),
+                        "avg_move_top1": avg_move,
+                        "top_capacity": ((top or {}).get("size") or {}).get("capacity"),
+                        "top_breakeven": ((top or {}).get("size") or {}).get("breakeven")}
     twin_cards = []
     for t in tw:
         s = t["symbol"]
@@ -804,6 +897,7 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
             "publication_rule": (report.get("publication_rule") or {}).get("text"),
         },
         "top_tie_count": tie_n,
+        "size_summary": size_summary,
         "top": top,
         "board": board,
         "swing_board": swing_board,
@@ -823,7 +917,7 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
     pick_sqd = {p["symbol"]: p["squeeze_danger"] for p in board + swing_board + squeeze_zone + [t["pick"] for t in twin_cards]}
     _PENDING_SIDE.clear()
     _PENDING_SIDE.update({
-        "universe": (latest, hist, borrow, borrow_ok, events, splits, rank_of, session, pre, notes, pick_sqd),
+        "universe": (latest, hist, borrow, borrow_ok, events, splits, rank_of, session, pre, notes, pick_sqd, size_of),
         "probs": (today_iso, last_date.date().isoformat(), latest["prob_dump"].copy()),
         "borrow": (run_day, borrow, list(latest.index)) if borrow_ok else None,
     })
@@ -919,10 +1013,10 @@ def _calendar_block(session: date, latest: pd.DataFrame, hist: dict) -> dict:
     return {"earnings": [e for e in earn if e["in_universe"]][:80], "lockups": locks[:40]}
 
 
-def _write_universe(latest, hist, borrow, borrow_ok, events, splits, rank_of, session, pre, notes, pick_sqd=None) -> None:
+def _write_universe(latest, hist, borrow, borrow_ok, events, splits, rank_of, session, pre, notes, pick_sqd=None, size_of=None) -> None:
     cols = ["symbol", "name", "price", "market_cap", "prob_dump", "prob_squeeze", "prob_swing", "skew", "score",
             "board_rank", "ssr", "publishable", "borrow_status", "fee_rate", "available", "squeeze_danger",
-            "sector", "country", "flags", "spark"]
+            "sector", "country", "flags", "spark", "capacity", "breakeven", "cost_50k", "cost_500k"]
     rows = []
     for s, r in latest.iterrows():
         m = {k: (None if (not isinstance(v, (list, dict)) and pd.isna(v)) else v) for k, v in r.items()}
@@ -939,10 +1033,18 @@ def _write_universe(latest, hist, borrow, borrow_ok, events, splits, rank_of, se
                      _f(m.get("prob_squeeze")), _f(m.get("prob_swing")), _f(m.get("skew")),
                      None if m.get("score") is None else int(m["score"]), rank_of.get(s),
                      bool(m.get("ssr")), bool(m.get("publishable")), short["status"], short.get("fee_rate"),
-                     short.get("available"), sqd, m.get("sector"), m.get("country"), flags, spark])
+                     short.get("available"), sqd, m.get("sector"), m.get("country"), flags, spark]
+                    + _size_cols(size_of(s, m) if size_of else None))
     rows.sort(key=lambda x: -(x[4] or 0))
     publish.write_json("universe.json", {"asof": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                                          "session_date": session.isoformat(), "columns": cols, "rows": rows})
+
+
+def _size_cols(sz: Optional[dict]) -> list:
+    if not sz:
+        return [None, None, None, None]
+    c = sz.get("costs") or {}
+    return [_f(sz.get("capacity")), _f(sz.get("breakeven")), _f(c.get("50000")), _f(c.get("500000"))]
 
 
 def _f(x: Any) -> Optional[float]:

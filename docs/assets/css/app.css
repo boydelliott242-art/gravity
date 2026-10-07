@@ -1146,7 +1146,7 @@ button.hero-ticker:hover { opacity: 0.86; }
   .board .c-prob { grid-area: prob; width: auto; text-align: right; }
   .board .c-prob .pbar { display: none; }
   .board .c-prob .pv { font-size: 18px; margin: 0; }
-  .board .c-lift, .board .c-fam, .board .c-gap, .board .c-borrow, .board .c-sq, .board .c-spark { display: none !important; }
+  .board .c-lift, .board .c-fam, .board .c-gap, .board .c-borrow, .board .c-sq, .board .c-spark, .board .c-size { display: none !important; }
   .board .c-meta-m { grid-area: meta; display: block; }
   .board-empty td { grid-column: 1 / -1; }
   .mcard-meta { display: flex; flex-wrap: wrap; gap: var(--s1) var(--s2); align-items: center; font: 400 12px/1.4 var(--mono); color: var(--fg-3); }
@@ -1264,3 +1264,16 @@ button.hero-ticker:hover { opacity: 0.86; }
 }
 .swing-table th:nth-child(2), .swing-table td:nth-child(2) { text-align: left; font-family: var(--sans); }
 .swing-table .sw-name .tk { display: inline-block; }
+
+/* ── size (capacity & cost at the chosen position size) ─────────────────── */
+.board .c-size { white-space: nowrap; font: 400 13px/1 var(--mono); }
+.board .c-size .sz-cap { display: block; margin-top: 6px; font-size: 11px; color: var(--fg-3); }
+.board .c-size .red { color: var(--red); }
+.sec-q { font: 400 clamp(22px, 2.4vw, 30px)/1.25 var(--serif); color: var(--fg); max-width: 60ch; margin-bottom: var(--s3); }
+.verdict { margin-bottom: var(--s4); }
+.verdict li { margin-bottom: var(--s1); color: var(--fg-2); }
+details.rec-block > summary { cursor: pointer; list-style: none; }
+details.rec-block > summary::-webkit-details-marker { display: none; }
+details.rec-block > summary::after { content: " +"; color: var(--fg-3); }
+details.rec-block[open] > summary::after { content: " −"; }
+.mtable tr.hot th, .mtable tr.hot td { color: var(--fg); background: var(--bg-1); }

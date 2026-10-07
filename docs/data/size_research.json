@@ -1,0 +1,206 @@
+{
+ "generated": "2026-10-06",
+ "question": "Can GRAVITY's daily #1 be shorted at $500K\u2013$1M without moving the price \u2014 and keep its accuracy?",
+ "method": [
+  "Walk-forward, out of sample: monthly test folds, 5-session embargo (20 for multi-day holds), isotonic calibration on a later held-out slice \u2014 the production recipe.",
+  "Every variant was chosen on a DEVELOPMENT window (Dec 2024 \u2013 Oct 2025) and reported on an untouched CONFIRMATION window (Nov 2025 \u2013 Sep 2026), so picking the best of many cannot inflate the result.",
+  "Capacity: \u2264 5% of the session's expected dollar volume per leg and \u2264 0.5% estimated one-way impact (square-root law, Y = 0.7, daily volatility), using a conservative next-session volume (25th percentile after volume spikes), and, live, IBKR's lendable shares.",
+  "Costs: impact on both legs + an Abdi\u2013Ranaldo effective-spread estimate (+ borrow fee for multi-day holds).",
+  "About 20 model variants tested: production features; new liquidity / intraday-habit features; bagging; liquid-only training; the pre-market gap (M1); dump-minus-pump ranking; direct return models; protective stops at 3\u201310%; 5/10/20-session holds; and a point-in-time universe."
+ ],
+ "capacity_rules": {
+  "max_participation": 0.05,
+  "max_impact_one_way": 0.005,
+  "impact_Y": 0.7
+ },
+ "intraday": [
+  {
+   "tier": "Micro-cap (today's #1 rule)",
+   "size_tested": "$50K",
+   "names_per_day": {
+    "dev": 1755.5,
+    "confirm": 1950.0
+   },
+   "base_dump": {
+    "dev": 0.075094074010849,
+    "confirm": 0.07419328391551971
+   },
+   "top1_hit": {
+    "dev": 0.5240384340286255,
+    "confirm": 0.5108225345611572
+   },
+   "top1_mean_oc": {
+    "dev": -0.05147290974855423,
+    "confirm": -0.03115132637321949
+   },
+   "cost": {
+    "dev": 0.07644025574571003,
+    "confirm": 0.0940135643364485
+   },
+   "net": {
+    "dev": -0.024967341746877196,
+    "confirm": -0.06286224049110457
+   }
+  },
+  {
+   "tier": "Takes $500K",
+   "size_tested": "$500K",
+   "names_per_day": {
+    "dev": 151.0,
+    "confirm": 183.0
+   },
+   "base_dump": {
+    "dev": 0.051833558827638626,
+    "confirm": 0.05608852580189705
+   },
+   "top1_hit": {
+    "dev": 0.2788461446762085,
+    "confirm": 0.27272728085517883
+   },
+   "top1_mean_oc": {
+    "dev": -0.0022447830997407436,
+    "confirm": -0.0011375482426956296
+   },
+   "cost": {
+    "dev": 0.02166636998127763,
+    "confirm": 0.026469478140225492
+   },
+   "net": {
+    "dev": -0.01942158743227091,
+    "confirm": -0.0253319298179038
+   }
+  },
+  {
+   "tier": "Takes $1M",
+   "size_tested": "$1M",
+   "names_per_day": {
+    "dev": 53.0,
+    "confirm": 48.0
+   },
+   "base_dump": {
+    "dev": 0.057678379118442535,
+    "confirm": 0.06418092548847198
+   },
+   "top1_hit": {
+    "dev": 0.18269230425357819,
+    "confirm": 0.25974026322364807
+   },
+   "top1_mean_oc": {
+    "dev": -0.0006305316928774118,
+    "confirm": -0.007033385336399078
+   },
+   "cost": {
+    "dev": 0.019933780791607604,
+    "confirm": 0.019981812376893678
+   },
+   "net": {
+    "dev": -0.019303249131751847,
+    "confirm": -0.012948427589687658
+   }
+  }
+ ],
+ "multi_day_20": {
+  "biased": {
+   "$500K": {
+    "net": {
+     "dev": 0.04148191360749638,
+     "confirm": 0.07827161150258959
+    },
+    "mean_r": {
+     "dev": -0.06032552454006432,
+     "confirm": -0.09830960205360018
+    },
+    "tier_mean_r": {
+     "dev": -0.03122708997761396,
+     "confirm": -0.019925340078786446
+    },
+    "win": {
+     "dev": 0.6009615384615384,
+     "confirm": 0.6698113207547169
+    },
+    "mae_p90": {
+     "dev": 0.5270101530644192,
+     "confirm": 0.4446209019400687
+    }
+   },
+   "$1M": {
+    "net": {
+     "dev": 0.05996636517579811,
+     "confirm": 0.1168935823314628
+    },
+    "mean_r": {
+     "dev": -0.0770488026223505,
+     "confirm": -0.1362830909701802
+    },
+    "tier_mean_r": {
+     "dev": -0.04007573369816737,
+     "confirm": -0.0391145177586536
+    },
+    "win": {
+     "dev": 0.6298076923076923,
+     "confirm": 0.7028301886792453
+    },
+    "mae_p90": {
+     "dev": 0.28751357567062075,
+     "confirm": 0.3422230280661192
+    }
+   }
+  },
+  "pit": {
+   "$500K": {
+    "net": {
+     "dev": -0.0124,
+     "confirm": -0.0567
+    },
+    "tier_mean_r": {
+     "dev": 0.0091,
+     "confirm": 0.0201
+    }
+   },
+   "$1M": {
+    "net": {
+     "dev": -0.0469,
+     "confirm": -0.0264
+    },
+    "tier_mean_r": {
+     "dev": 0.0197,
+     "confirm": 0.0155
+    }
+   }
+  }
+ },
+ "main_pit": {
+  "published": {
+   "dev": {
+    "hit": 0.522,
+    "mean_oc": -0.056,
+    "auc": 0.787
+   },
+   "confirm": {
+    "hit": 0.472,
+    "mean_oc": -0.035,
+    "auc": 0.778
+   }
+  },
+  "pit": {
+   "dev": {
+    "hit": 0.43,
+    "mean_oc": -0.0089,
+    "auc": 0.783
+   },
+   "confirm": {
+    "hit": 0.498,
+    "mean_oc": -0.0272,
+    "auc": 0.779
+   }
+  }
+ },
+ "verdict": [
+  "Micro-caps (today's #1): the dumps are real, but these names trade so little that even ~$50K moves the price about as much as the dump. They are small-size trades \u2014 use each pick's capacity and breakeven size.",
+  "Names that can take $500K\u2013$1M: the model still finds dump candidates at ~5\u00d7 the normal rate, but they also rip; across every intraday variant the average move is too small to pay ~1.5\u20132.5% round-trip costs at that size. Protective stops did not fix it.",
+  "20-session shorts in liquid names looked excellent (+6\u201312% per trade) \u2014 until the universe was made point-in-time. Today's small-cap list over-represents stocks that already collapsed; with that bias removed the edge disappears. It was not shipped as a strategy.",
+  "The same correction trimmed the main #1's backtest while its ranking power was unchanged. Retrained on the point-in-time universe, the published #1 now backtests at 46% dumped 5%+ and -2.8% average open\u2192close (median -4.3%), versus 9.2% for the average name. These are the numbers the site now reports.",
+  "Bottom line: no tested approach kept the micro-cap dump rate at $500K+ size. GRAVITY now shows, for every pick, how much it can absorb and what your size would cost, so the decision is yours with the real numbers in front of you."
+ ],
+ "main_pit_note": "Experiment (dump-only recipe, development / confirmation periods) that motivated the switch; the official retrained numbers are in the Track Record."
+}

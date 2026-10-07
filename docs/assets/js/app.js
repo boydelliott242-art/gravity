@@ -51,6 +51,8 @@ const S = {
   disposers: { record: [], live: [] },
   uni: { status: 'idle', rows: [], bySym: new Map(), asof: null, session: null, fallback: false },
   look: { q: '', sort: 'prob', dir: -1, page: 0, filters: new Set() },
+  size: 50000,
+  sizeLab: null,
 };
 
 /* ── small helpers ─────────────────────────────────────────────────────── */
@@ -499,8 +501,9 @@ function heroSub(p) {
     bits.push(`<p class="hero-sub__line"><span class="eyebrow">Pump odds</span><b>${esc(pct(p.prob_pump))}</b> odds of a 5%+ rise open→close instead${isNum(baseOf('pump')) ? ` · base ${esc(pct(baseOf('pump'), 1))}` : ''}</p>`);
   }
   const chip = skewChip(p.skew);
-  if (!chip && !bits.length) return '';
-  return `<div class="hero-sub reveal">${chip ? `<div class="hero-sub__chip">${chip}</div>` : ''}${bits.join('')}</div>`;
+  const size = sizeLine(p);
+  if (!chip && !bits.length && !size) return '';
+  return `<div class="hero-sub reveal">${chip ? `<div class="hero-sub__chip">${chip}</div>` : ''}${bits.join('')}<div id="hero-size">${size}</div></div>`;
 }
 
 /** Normalised attribution {family: 0–1} → hbars with plain labels, biggest first. */
@@ -525,6 +528,7 @@ const FILTERS = [
   { id: 'asia', label: 'Asia-linked', title: 'Issuer country or business address in Asia', test: isAsia },
   { id: 'offer24', label: 'Offering in 24h', title: 'Offering, ATM, toxic financing or unregistered sale filed in the 24 hours before publish', test: freshSupply },
   { id: 'sub1', label: 'Under $1', title: 'Last close below one dollar', test: (p) => isNum(p.price) && p.price < 1 },
+  { id: 'fits', label: 'Fits my size', title: 'Capacity (volume, impact and IBKR borrow) at least the selected size', test: (p) => fitsSize(p) },
 ];
 
 const SORTS = {
@@ -534,6 +538,7 @@ const SORTS = {
   gap: { label: 'Pre-market gap', get: (p) => (p.premarket ? p.premarket.gap_pct : null), dir: -1 },
   fee: { label: 'Borrow fee', get: (p) => obj(p.shortability).fee_rate, dir: 1 },
   sq: { label: 'Squeeze danger', get: (p) => p.squeeze_danger, dir: 1 },
+  size: { label: 'Cost at my size', get: (p) => costAt(p), dir: 1 },
   symbol: { label: 'Ticker', get: (p) => p.symbol, dir: 1 },
 };
 
@@ -565,7 +570,7 @@ function boardRow(p, max) {
   const pre = p.premarket;
   const gap = pre && isNum(pre.gap_pct) ? pct(pre.gap_pct, 0, true) : DASH;
   const nm = [p.name, p.country].filter(Boolean).join(' · ');
-  const meta = `<div class="mcard-meta">${probBar(p.prob_dump, S.base, max)}<span>Lift ${esc(liftTxt(p.lift))}</span><span>Gap ${esc(gap)}</span>${borrowInline(p.shortability)}<span>Squeeze ${esc(isNum(p.squeeze_danger) ? p.squeeze_danger : DASH)}</span></div>`;
+  const meta = `<div class="mcard-meta">${probBar(p.prob_dump, S.base, max)}<span>Lift ${esc(liftTxt(p.lift))}</span><span>Gap ${esc(gap)}</span>${borrowInline(p.shortability)}<span>Squeeze ${esc(isNum(p.squeeze_danger) ? p.squeeze_danger : DASH)}</span>${isNum(obj(p.size).capacity) ? `<span>${esc(sizeLabel(S.size))} cost ${esc(pct(costAt(p), 1))} · max ${esc(money(p.size.capacity))}</span>` : ''}</div>`;
   return `<tr data-sym="${sym}">
     <td class="c-rank">${isNum(p.rank) ? pad2(p.rank) : DASH}</td>
     <td class="c-name"><button type="button" class="tk" data-open="${sym}">${sym}</button><span class="nm">${txt(nm)}</span>${arr(p.flags).length ? flagChips(p.flags, 4) : ''}</td>
@@ -574,6 +579,7 @@ function boardRow(p, max) {
     <td class="c-fam">${familyBars(p.families)}</td>
     <td class="c-gap">${esc(gap)}</td>
     <td class="c-borrow">${borrowChip(p.shortability)}<span class="borrow__txt">${esc(borrowText(p.shortability))}</span></td>
+    <td class="c-size">${sizeCell(p)}</td>
     <td class="c-sq">${squeezeMeter(p.squeeze_danger)}</td>
     <td class="c-spark">${sparkline(p.chart)}</td>
     <td class="c-meta-m">${meta}</td>
@@ -598,10 +604,22 @@ function renderBoard() {
     <div class="board-tools">
       <div class="filters" role="group" aria-label="Filter the board">${chips}</div>
       <label class="board-sort">Sort <select id="board-sort">${opts}</select></label>
+      <label class="board-sort">My size <select id="board-size">${SIZE_OPTS.map((v) => `<option value="${v}"${v === S.size ? ' selected' : ''}>${sizeLabel(v)}</option>`).join('')}</select></label>
       <p class="board-count" id="board-count" aria-live="polite"></p>
     </div>
     <div class="board-scroll"><table class="board" id="board-table"><caption class="sr-only">Today's board, ranked by modeled dump odds. Select a ticker for its dossier.</caption><thead></thead><tbody></tbody></table></div>`;
   drawBoard();
+  const bs = $('#board-size');
+  if (bs) bs.addEventListener('change', () => {
+    S.size = Number(bs.value) || 50000;
+    saveSize(S.size);
+    safe('board', renderBoard);
+    const hs = $('#hero-size');
+    if (hs && S.today && S.today.top) hs.innerHTML = sizeLine(S.today.top);
+    drawLookup();
+    const nb = $('#board-size');
+    if (nb) nb.focus();
+  });
 }
 
 function drawBoard() {
@@ -617,6 +635,7 @@ function drawBoard() {
     { cls: 'h-fam', label: 'Signals', scale: 'dil exh dec flow st news' },
     { key: 'gap', label: 'Pre-mkt' },
     { key: 'fee', label: 'Borrow' },
+    { cls: 'h-size', key: 'size', label: `At ${sizeLabel(S.size)}`, scale: 'est. round-trip cost · max size' },
     { key: 'sq', label: 'Squeeze' },
     { cls: 'h-spark', label: '120 sessions' },
   ];
@@ -631,8 +650,8 @@ function drawBoard() {
   setHTML($('thead', table), `<tr>${th}</tr>`);
   const rows = sortedFiltered(board);
   let body;
-  if (!board.length) body = '<tr class="board-empty"><td colspan="9">No names made the board this session — see the squeeze zone for what was held back.</td></tr>';
-  else if (!rows.length) body = '<tr class="board-empty"><td colspan="9">No names match every active filter. Clear a filter to see more.</td></tr>';
+  if (!board.length) body = '<tr class="board-empty"><td colspan="10">No names made the board this session — see the squeeze zone for what was held back.</td></tr>';
+  else if (!rows.length) body = '<tr class="board-empty"><td colspan="10">No names match every active filter. Clear a filter to see more.</td></tr>';
   else body = rows.map((p) => boardRow(p, max)).join('');
   setHTML($('tbody', table), body);
   const cnt = $('#board-count');
@@ -1146,11 +1165,12 @@ const LK_FILTERS = [
   { id: 'nossr', label: 'No Rule 201', test: (r) => !r.ssr },
   { id: 'sub1', label: 'Under $1', test: (r) => isNum(r.price) && r.price < 1 },
   { id: 'board', label: 'On the board', test: (r) => isNum(r.board_rank) },
+  { id: 'fits500', label: 'Takes $500K', test: (r) => isNum(r.capacity) && r.capacity >= 5e5 },
 ];
 const LK_COLS = [
   ['symbol', 'Ticker', 1], ['price', 'Price', -1], ['market_cap', 'Mkt cap', -1], ['prob', 'Dump odds', -1],
   ['prob_squeeze', 'Squeeze odds', -1], ['prob_swing', 'Swing odds', -1], ['skew', 'Skew', -1],
-  ['fee_rate', 'Borrow fee', 1], ['squeeze_danger', 'Sq. danger', 1],
+  ['fee_rate', 'Borrow fee', 1], ['squeeze_danger', 'Sq. danger', 1], ['capacity', 'Max size', -1],
 ];
 
 async function loadUniverse() {
@@ -1267,6 +1287,7 @@ function drawLookup() {
       <td>${esc(price(r.price))}</td><td>${esc(money(r.market_cap))}</td><td class="${r.board_rank ? 'red' : ''}">${esc(pct(r.prob_dump))}</td>
       <td>${esc(pct(r.prob_squeeze))}</td><td>${esc(pct(r.prob_swing))}</td><td>${esc(isNum(r.skew) ? pct(r.skew) : DASH)}</td>
       <td>${esc(isNum(r.fee_rate) ? `${pctUnits(r.fee_rate, 0)}` : (r.borrow_status === 'NONE' ? 'none' : DASH))}</td><td>${esc(isNum(r.squeeze_danger) ? r.squeeze_danger : DASH)}</td>
+      <td>${esc(isNum(r.capacity) ? money(r.capacity) : DASH)}</td>
       <td>${sparkCloses(r.spark)}</td></tr>`;
   }).join('') : `<tr class="board-empty"><td colspan="${LK_COLS.length + 1}">No scored name matches “${esc(S.look.q)}”. Names outside the small/micro-cap universe (or that did not trade last session) are not scored.</td></tr>`);
   if (cnt) cnt.textContent = `${int(rows.length)} of ${int(S.uni.rows.length)} names · as of ${S.uni.asof ? fmtStamp(S.uni.asof) : DASH}`;
@@ -1354,6 +1375,100 @@ function historyHTML(p) {
     bits.push(`<div class="hist-row"><span class="eyebrow">Shares to borrow</span>${miniLine(bh.map((r) => [r[0], r[2]]), { label: `${p.symbol} lendable shares history` })}<span class="mono">${esc(compact(bh[0][2]))} → ${esc(compact(bh[bh.length - 1][2]))}</span></div>`);
   }
   return bits.join('');
+}
+
+/* ── trade size (§ size) ───────────────────────────────────────────────── */
+const SIZE_KEY = 'gravity:size:v1';
+const SIZE_OPTS = [10000, 50000, 100000, 500000, 1000000];
+function loadSize() {
+  try { const v = Number(localStorage.getItem(SIZE_KEY)); if (SIZE_OPTS.includes(v)) return v; } catch { /* storage blocked */ }
+  return 50000;
+}
+function saveSize(v) { try { localStorage.setItem(SIZE_KEY, String(v)); } catch { /* storage blocked */ } }
+const sizeLabel = (v) => (v >= 1e6 ? `$${v / 1e6}M` : `$${Math.round(v / 1e3)}K`);
+
+/** Estimated round-trip cost at the selected size, or null. */
+function costAt(p, size = S.size) {
+  const c = obj(obj(p && p.size).costs)[String(size)];
+  return isNum(c) ? c : null;
+}
+function fitsSize(p, size = S.size) {
+  const cap = obj(p && p.size).capacity;
+  return isNum(cap) && cap >= size;
+}
+const LIMIT_TXT = { volume: '5% of expected volume', impact: '0.5% estimated impact', borrow: 'IBKR lendable shares' };
+
+function sizeCell(p) {
+  const sz = obj(p.size);
+  if (!isNum(sz.capacity)) return `<span class="muted">${DASH}</span>`;
+  const c = costAt(p);
+  const fits = fitsSize(p);
+  const be = sz.breakeven;
+  const tooBig = isNum(be) && S.size > be;
+  return `<span class="${!fits || tooBig ? 'red' : ''}" title="${esc(`Estimated round-trip cost at ${sizeLabel(S.size)}: impact on both legs + spread`)}">${esc(pct(c, 1))}</span><small class="sz-cap">max ${esc(money(sz.capacity))}</small>`;
+}
+
+function sizeLine(p) {
+  const sz = obj(p.size);
+  if (!isNum(sz.capacity)) return '';
+  const be = isNum(sz.breakeven) ? (sz.breakeven >= 1e4 ? money(sz.breakeven) : 'under $10K') : null;
+  return `<p class="hero-sub__line"><span class="eyebrow">Size</span>Absorbs about <b>${esc(money(sz.capacity))}</b> before moving the price (limit: ${esc(LIMIT_TXT[sz.limit] || sz.limit || DASH)})${be ? ` · breakeven ≈ <b>${esc(be)}</b> — above that, estimated costs exceed the #1's historical average move` : ''} · at ${esc(sizeLabel(S.size))}: <b>${esc(pct(costAt(p), 1))}</b> round-trip</p>`;
+}
+
+function sizeDossier(p) {
+  const sz = obj(p.size);
+  if (!isNum(sz.capacity)) return '';
+  const rows = SIZE_OPTS.map((q) => {
+    const c = obj(sz.costs)[String(q)];
+    const part = obj(sz.participation)[String(q)];
+    const ok = isNum(sz.capacity) && q <= sz.capacity;
+    const be = isNum(sz.breakeven) && q <= sz.breakeven;
+    return `<tr${q === S.size ? ' class="hot"' : ''}><th scope="row">${esc(sizeLabel(q))}</th><td>${esc(pct(c, 1))}</td><td>${esc(isNum(part) ? pct(part, part < 0.1 ? 1 : 0) : DASH)}</td><td class="${ok ? '' : 'red'}">${ok ? 'Yes' : 'No'}</td><td class="${be ? '' : 'red'}">${isNum(sz.breakeven) ? (be ? 'Yes' : 'No') : DASH}</td></tr>`;
+  }).join('');
+  return kv([
+    ['Max size without moving the price', esc(money(sz.capacity)), `limit: ${LIMIT_TXT[sz.limit] || sz.limit || DASH}`],
+    ['Expected session $ volume', esc(money(sz.exp_dvol)), 'conservative estimate'],
+    ['IBKR lendable value', esc(isNum(sz.cap_borrow) ? money(sz.cap_borrow) : DASH)],
+    ['Spread estimate', esc(isNum(sz.spread) ? pct(sz.spread, 2) : DASH), sz.spread_floor ? 'estimator floor used — real spread unknown' : 'Abdi–Ranaldo, 20 sessions'],
+    ['Breakeven size', esc(isNum(sz.breakeven) ? money(sz.breakeven) : DASH), isNum(sz.avg_move) ? `where costs reach the #1's ${pct(sz.avg_move, 1)} average move` : ''],
+  ]) + `<div class="table-scroll" style="margin-top:16px"><table class="mtable"><caption class="sr-only">Estimated cost by position size</caption><thead><tr><th scope="col">Size</th><th scope="col">Round-trip cost</th><th scope="col">Share of volume</th><th scope="col">Within capacity</th><th scope="col">Below breakeven</th></tr></thead><tbody>${rows}</tbody></table></div><p class="note" style="margin-top:8px">Square-root impact model (Y = 0.7 × daily volatility × √(size ÷ volume)) on both legs plus one spread. Planning estimates — real costs depend on how the order is worked.</p>`;
+}
+
+/* ── size lab (docs/data/size_research.json) ───────────────────────────── */
+function renderSizeLab() {
+  const root = $('#sizelab-root');
+  if (!root) return;
+  const r = S.sizeLab;
+  if (!r) { root.innerHTML = empty('The size research file has not been published.'); return; }
+  const dc = (o, f) => `${esc(f(obj(o).dev))} <span class="muted">/</span> ${esc(f(obj(o).confirm))}`;
+  const intr = arr(r.intraday).map((t) => `<tr><th scope="row">${esc(t.tier)} <span class="nm">tested at ${esc(t.size_tested)}</span></th><td>${dc(t.names_per_day, (v) => int(v))}</td><td>${dc(t.base_dump, (v) => pct(v, 1))}</td><td>${dc(t.top1_hit, (v) => pct(v, 0))}</td><td>${dc(t.top1_mean_oc, (v) => pct(v, 1, true))}</td><td>${dc(t.cost, (v) => pct(v, 1))}</td><td class="red">${dc(t.net, (v) => pct(v, 1, true))}</td></tr>`).join('');
+  const md = obj(r.multi_day_20);
+  const mdRows = ['$500K', '$1M'].map((t) => {
+    const b = obj(obj(md.biased)[t]);
+    const p = obj(obj(md.pit)[t]);
+    return `<tr><th scope="row">${esc(t)}</th><td>${dc(b.net, (v) => pct(v, 1, true))}</td><td>${dc(b.tier_mean_r, (v) => pct(v, 1, true))}</td><td class="red">${dc(p.net, (v) => pct(v, 1, true))}</td><td>${dc(p.tier_mean_r, (v) => pct(v, 1, true))}</td></tr>`;
+  }).join('');
+  const mp = obj(r.main_pit);
+  const mpRow = (k, label) => `<tr><th scope="row">${esc(label)}</th><td>${dc({ dev: obj(obj(mp[k]).dev).hit, confirm: obj(obj(mp[k]).confirm).hit }, (v) => pct(v, 0))}</td><td>${dc({ dev: obj(obj(mp[k]).dev).mean_oc, confirm: obj(obj(mp[k]).confirm).mean_oc }, (v) => pct(v, 1, true))}</td><td>${dc({ dev: obj(obj(mp[k]).dev).auc, confirm: obj(obj(mp[k]).confirm).auc }, (v) => fixed(v, 3))}</td></tr>`;
+  const ss = obj(S.today && S.today.size_summary);
+  const today = isNum(ss.deployable) ? `<dl class="tiles reveal">
+      ${stat('Deployable today, top 10', esc(money(ss.deployable)), esc(`spread across ${int(ss.names)} names, each within its capacity and breakeven`))}
+      ${stat('#1 capacity', esc(money(ss.top_capacity)), 'before moving the price')}
+      ${stat('#1 breakeven size', esc(isNum(ss.top_breakeven) ? money(ss.top_breakeven) : DASH), esc(isNum(ss.avg_move_top1) ? `costs reach its ${pct(ss.avg_move_top1, 1)} average move` : ''))}
+      ${stat('Avg move, a top-10 pick', esc(pct(-ss.avg_move_top10, 1, true)), 'open→close, walk-forward backtest')}
+    </dl>` : '';
+  root.innerHTML = `
+    ${today}
+    <p class="sec-q reveal">${esc(r.question || '')}</p>
+    <ul class="notes verdict reveal">${arr(r.verdict).map((v) => `<li>${esc(v)}</li>`).join('')}</ul>
+    <div class="rec-block reveal"><h3 class="rec-sub">Same-day shorts by size</h3><p class="note">Each cell: development / confirmation period. Measured on today's small-cap list; the point-in-time correction lowered the comparable numbers elsewhere.</p>
+      <div class="table-scroll"><table class="mtable"><thead><tr><th scope="col">Tier</th><th scope="col">Names/day</th><th scope="col">Base dump</th><th scope="col">#1 dumped</th><th scope="col">#1 avg open→close</th><th scope="col">Est. cost</th><th scope="col">Net / trade</th></tr></thead><tbody>${intr}</tbody></table></div></div>
+    <div class="rec-block reveal"><h3 class="rec-sub">20-session shorts in liquid names — before and after the point-in-time fix</h3>
+      <div class="table-scroll"><table class="mtable"><thead><tr><th scope="col">Tier</th><th scope="col">Net / trade (biased list)</th><th scope="col">Tier average (biased)</th><th scope="col">Net / trade (point-in-time)</th><th scope="col">Tier average (point-in-time)</th></tr></thead><tbody>${mdRows}</tbody></table></div>
+      <p class="note" style="margin-top:8px">On today's list the tier itself drifted down 2–4% per 20 sessions — the signature of stocks that had already collapsed into small-cap range. Measured point-in-time, the same tier rose, and the edge vanished.</p></div>
+    <div class="rec-block reveal"><h3 class="rec-sub">The daily #1 — before and after the point-in-time fix</h3>${r.main_pit_note ? `<p class="note">${esc(r.main_pit_note)}</p>` : ''}
+      <div class="table-scroll"><table class="mtable"><thead><tr><th scope="col">Universe</th><th scope="col">#1 dumped 5%+</th><th scope="col">#1 avg open→close</th><th scope="col">AUC</th></tr></thead><tbody>${mpRow('published', "Today's small-cap list (old)")}${mpRow('pit', 'Point-in-time (now used)')}</tbody></table></div></div>
+    <details class="rec-block reveal"><summary class="rec-sub">How this was tested</summary><ul class="caveats">${arr(r.method).map((m) => `<li>${esc(m)}</li>`).join('')}</ul></details>`;
 }
 
 /* ── method & footer ───────────────────────────────────────────────────── */
@@ -1479,6 +1594,7 @@ function dossierHTML(rec) {
     ['Squeeze danger', esc(isNum(p.squeeze_danger) ? `${p.squeeze_danger} / 100` : DASH), sqWord(p.squeeze_danger)],
     ['Odds of a +20% spike', esc(pct(p.prob_squeeze)), 'open→high, model'],
   ]) + (p.squeeze_parts ? `<p class="eyebrow" style="margin:24px 0 8px">What drives the squeeze score</p><div style="max-width:480px">${partsBars(p.squeeze_parts)}</div>` : '')));
+  if (p.size) parts.push(dzSec('Size & cost', sizeDossier(p)));
   parts.push(dzSec('SEC filings', filingTable(p.filings)));
   parts.push(dzSec('Headlines', newsList(p.news)));
 
@@ -1843,10 +1959,12 @@ function watchFreshness() {
 /* ── boot ──────────────────────────────────────────────────────────────── */
 async function init() {
   wireGlobal();
-  const [today, model, evidence, scorecard, live] = await Promise.all(
-    ['today.json', 'model.json', 'evidence.json', 'scorecard.json', 'live.json'].map(getJSON),
+  S.size = loadSize();
+  const [today, model, evidence, scorecard, live, sizeLab] = await Promise.all(
+    ['today.json', 'model.json', 'evidence.json', 'scorecard.json', 'live.json', 'size_research.json'].map(getJSON),
   );
   delete S.errors['live.json'];  // optional feed: absent outside the session
+  S.sizeLab = sizeLab && typeof sizeLab === 'object' ? sizeLab : null;
   S.live = live && typeof live === 'object' ? live : null;
   S.today = today && typeof today === 'object' ? today : null;
   S.model = model && typeof model === 'object' ? model : null;
@@ -1868,6 +1986,7 @@ async function init() {
   safe('swing', renderSwing);
   safe('twins', renderTwins);
   safe('squeeze', renderSqueeze);
+  safe('sizelab', renderSizeLab);
   safe('market', renderMarket);
   safe('calendar', renderCalendar);
   safe('lookup', renderLookup);

@@ -172,7 +172,7 @@ def parse_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     return df
 
 
-def filter_universe(parsed: pd.DataFrame) -> pd.DataFrame:
+def filter_universe(parsed: pd.DataFrame, max_cap: Optional[float] = None) -> pd.DataFrame:
     """Apply the contract's exclusions to a ``parse_rows`` frame.
 
     Adds ``attrs["excluded"]`` = {reason: count} so the pipeline can show
@@ -182,7 +182,8 @@ def filter_universe(parsed: pd.DataFrame) -> pd.DataFrame:
     reason = df["reason"].copy()
     reason[reason.isna() & df["price"].isna()] = "no_price"
     reason[reason.isna() & (df["price"] < config.MIN_PRICE)] = "price_below_min"
-    reason[reason.isna() & (df["market_cap"] > config.MAX_MARKET_CAP)] = "market_cap_above_max"
+    cap = config.MAX_MARKET_CAP if max_cap is None else max_cap
+    reason[reason.isna() & (df["market_cap"] > cap)] = "market_cap_above_max"
     keep = reason.isna()
     excluded = {str(k): int(v) for k, v in reason[~keep].value_counts().items()}
     kept = df.loc[keep, COLUMNS]
@@ -204,7 +205,7 @@ def _empty() -> pd.DataFrame:
     return df
 
 
-def load_universe(max_age_s: int = 6 * 3600) -> pd.DataFrame:
+def load_universe(max_age_s: int = 6 * 3600, max_cap: Optional[float] = None) -> pd.DataFrame:
     """Eligible small/micro-cap common stocks, one row per canonical symbol.
 
     Columns (CONTRACTS.md §1): ``symbol name price pct_change volume
@@ -234,7 +235,7 @@ def load_universe(max_age_s: int = 6 * 3600) -> pd.DataFrame:
 
     rows = payload["rows"]
     parsed = parse_rows(rows)
-    df = filter_universe(parsed)
+    df = filter_universe(parsed, max_cap)
     common = int(parsed["reason"].isna().sum())
     df.attrs.update({
         "listed": len(rows),

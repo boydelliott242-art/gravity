@@ -69,7 +69,8 @@ def log_picks(today: dict) -> None:
         "published_at": today.get("generated_at"),
         "first_published_at": (prev or {}).get("first_published_at") or today.get("generated_at"),
         "model": (today.get("model") or {}).get("version"),
-        "top": {k: top.get(k) for k in ("symbol", "prob_dump", "score", "premarket", "squeeze_danger")} if top else None,
+        "top": ({k: top.get(k) for k in ("symbol", "prob_dump", "score", "premarket", "squeeze_danger")}
+                | {"capacity": (top.get("size") or {}).get("capacity"), "breakeven": (top.get("size") or {}).get("breakeven")}) if top else None,
         "board": [
             {"rank": b.get("rank"), "symbol": b.get("symbol"), "prob_dump": b.get("prob_dump")}
             for b in today.get("board", [])

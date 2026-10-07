@@ -106,11 +106,12 @@ TARGET_TEXT = {
 }
 
 CAVEATS: List[str] = [
-    "Survivorship bias: the universe is the set of names listed today. Stocks that collapsed and "
-    "delisted during the last three years are missing, so historical dump rates are probably "
-    "understated. The universe is also chosen by today's market cap and price, which over-represents "
-    "stocks that shrank into small-cap territory — a mild look-ahead that can flatter a model that "
-    "shorts weak, volatile names. The backtest is not a fully point-in-time universe.",
+    "Point-in-time universe: training and this backtest use every name listed today up to $20B, "
+    "keeping a row only while that stock was ≤ $2B at the time (that day's close × today's share "
+    "count). This removes the bias of using today's small-cap list, which over-represents stocks "
+    "that shrank into it and flattered short backtests (the earlier, biased version roughly doubled "
+    "the #1's average open→close). Stocks that delisted are still missing (no free history), and "
+    "share counts that changed a lot make the point-in-time cap approximate.",
     "No locate constraint: the simulation assumes the #1 name could be borrowed and shorted at the "
     "open every day. Many of these names are hard to borrow or unavailable, and borrow fees (often "
     "50-500%+ annualised) are not modelled beyond the flat cost.",

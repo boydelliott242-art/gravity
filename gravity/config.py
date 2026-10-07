@@ -30,7 +30,9 @@ DANELFIN_API_KEY = os.environ.get("DANELFIN_API_KEY", "").strip()
 
 # ── Universe ─────────────────────────────────────────────────────────────
 MIN_PRICE = 0.10                     # below this, quotes are noise
-MAX_MARKET_CAP = 2_000_000_000       # small + micro + nano caps
+MAX_MARKET_CAP = 2_000_000_000       # small + micro + nano caps (point-in-time for training)
+TRAIN_MAX_CAP = 20_000_000_000       # training pulls names up to $20B today, then keeps a row
+                                     # only while that name was ≤ MAX_MARKET_CAP at the time
 MIN_DOLLAR_VOLUME_20D = 50_000       # median daily $ volume to be tradeable at all
 HISTORY_PERIOD = "3y"                # daily bars kept per symbol
 

@@ -100,7 +100,7 @@ def test_report_schema_and_files(trained):
         assert sum(b["n"] for b in cal) == rep["walk_forward"]["oos_rows"]
     assert rep["n_rows"] == int(trained["panel"]["y_dump"].notna().sum())
     assert rep["trained_through"] == str(trained["panel"]["date"].max().date())
-    assert any("Survivorship" in c for c in rep["caveats"])
+    assert any("Point-in-time universe" in c for c in rep["caveats"])
     assert any("pre-market" in c for c in rep["caveats"])
     assert rep["importance"] and {"family", "feature", "importance"} <= set(rep["importance"][0])
     assert {f["family"] for f in rep["importance_family"]} <= set(M.FAMILIES)
