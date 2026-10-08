@@ -1,0 +1,24 @@
+Pre-registered 2026-10-07 15:55 CT, before any full-run R9 result was seen.
+Candidates: honest morning variants C_m1_honest, D_ext_shape, E_overnight, each scored "pure"
+(whole shortlist) or "_mix" (M1 only where an extended-hours price exists, else M0).
+1. Winner = best DEV published-#1 mean open->close (most negative); tie-break DEV #1 dump rate.
+2. Adopt the winner if its CONFIRM #1 mean open->close <= B_m1_live's AND its CONFIRM #1 dump rate >= B_m1_live's - 2 pts.
+3. Otherwise adopt C_m1_honest (train/serve consistency) unless its CONFIRM mean open->close is worse
+   than B_m1_live's by more than the paired 90% CI half-width.
+B' (official open) is reported only as the number the site showed before; it is not a candidate (not knowable at 9:05 ET).
+
+Addendum pre-registered 2026-10-07 21:30 CT, before the leak-free re-run (R9c) was run:
+Features are recomputed relative to the SAME hourly series' prior regular close (no 3%-agreement blanking, which
+correlated with future reverse splits), and rows are kept only when the hourly 'previous session' equals the panel date.
+1. Keep D (honest + shape) only if, leak-free, its CONFIRM #1 mean open->close is still <= B_m1_live's and its CONFIRM dump
+   rate >= B's - 2 pts. Otherwise fall back to C (honest gap only) under the original rule 3, else B.
+2. Robustness: D2 = D without the bar-count features (n_ext, n_pm), which Yahoo's same-day revisions change most.
+   Adopt D2 instead of D if D2's DEV and CONFIRM #1 mean open->close are each within 0.5 pt of D's (no meaningful loss).
+
+Addendum 2 pre-registered 2026-10-07 21:55 CT, before the guard test (R9e) was run:
+Problem: the leak-free morning model (D2) picks dumps more often (higher hit rate, better median) but has fatter squeeze
+tails than the close-only model. Candidate tail guards for the morning #1 (skip to the next eligible name if triggered):
+  G1: gap_ext >= +20%   G2: gap_ext >= +30%   G3: gap_ext >= +50%   G4: ext_hi >= +40%
+1. Pick the guard with the best DEV mean open->close of the guarded D2 #1 (ties: lower DEV squeeze rate).
+2. Adopt it only if, in CONFIRM, guarded D2's mean open->close <= unguarded D2's AND its squeeze rate is lower.
+3. If no guard passes, ship D2 unguarded and show the tail risk plainly (it already beats the old live morning model).

@@ -65,18 +65,34 @@ const pad2 = (n) => String(n).padStart(2, '0');
 const empty = (html) => `<p class="empty">${html}</p>`;
 
 
+/** Dump odds as shown everywhere: "≥" when the model's output sits at the
+ * out-of-sample cap (the true odds may be higher; history can't tell). */
+function fmtProb(p, d = 0) {
+  if (!p || !isNum(p.prob_dump)) return pct(null);
+  if (p.model_used !== 'm0' && p.model_used !== 'm1') return pct(p.prob_dump, d);   // unknown model → no cap claim
+  const cap = obj(obj(obj(S.today).model).prob_cap)[p.model_used];
+  return `${isNum(cap) && p.prob_dump >= cap - 1e-4 ? '≥' : ''}${pct(p.prob_dump, d)}`;
+}
+
 /** One honest sentence about how the #1 has fared historically (model.json walk-forward). */
 function backtestLine(which) {
   const oos = (S.model && S.model.oos) || {};
-  const m = oos.m0;  // the morning #1 is chosen on close-only features; M1 only re-scores
+  // M1's walk-forward only describes the live rule when it was trained on what the
+  // 9:05 run knows (morning_set ≠ "official"); otherwise quote M0 and say so.
+  const honestM1 = which === 'm1' && oos.m1 && obj(S.model).morning_set && S.model.morning_set !== 'official';
+  const key = honestM1 ? 'm1' : 'm0';
+  const m = oos[key];
   if (!m) return '';
+  const scope = honestM1 ? 'this morning rule, trained on extended-hours trades before 9:00 ET (live inputs come from same-day bars, which Yahoo sometimes revises later)'
+    : which === 'm1' ? 'the close-only version of this rule (today\'s ranking also used a pre-market price, which has no backtest of its own)'
+    : 'this exact rule';
   const hit = isNum(m.pub1_hit) ? m.pub1_hit : m.top1_hit;
   const sqr = isNum(m.pub1_squeeze_rate) ? m.pub1_squeeze_rate : m.top1_squeeze_rate;
   const avg = isNum(m.pub1_mean_oc) ? m.pub1_mean_oc : m.top1_mean_oc;
   if (!isNum(hit)) return '';
-  const r10 = obj(obj(obj(obj(S.model).sim).m0).realistic)['10000'];
+  const r10 = obj(obj(obj(obj(S.model).sim)[key]).realistic)['10000'];
   const net = r10 && isNum(r10.net_mean) ? ` — after each pick's own estimated cost at $10K that is ${Math.abs(r10.net_mean) < 0.0005 ? 'roughly breakeven' : `${pct(r10.net_mean, 1, true)} per trade`}` : '';
-  return ` Backtest of this exact rule (point-in-time universe, no Rule-201 names, ≥$300K daily volume): the #1 fell 5%+ open→close on ${Math.round(hit * 100)}% of sessions${isNum(sqr) ? `, spiked 20%+ above the open on ${Math.round(sqr * 100)}%` : ''}${isNum(avg) ? `, averaging ${pct(avg, 1, true)} open→close before costs` : ''}${net}. A tilt in the odds, never a sure thing.`;
+  return ` Backtest of ${scope} (point-in-time universe, no Rule-201 names, ≥$300K daily volume): the #1 fell 5%+ open→close on ${Math.round(hit * 100)}% of sessions${isNum(sqr) ? `, spiked 20%+ above the open on ${Math.round(sqr * 100)}%` : ''}${isNum(avg) ? `, averaging ${pct(avg, 1, true)} open→close before costs` : ''}${net}. A tilt in the odds, never a sure thing.`;
 }
 
 function host(u) {
@@ -440,7 +456,7 @@ function renderHero() {
   const sqNote = isNum(top.squeeze_danger) ? `${sqWord(top.squeeze_danger)} — a crowding score, not a forecast` : 'Not enough data to score';
   const scored = t.universe && isNum(t.universe.scored) ? t.universe.scored : null;
   const modelLine = top.model_used === 'm1'
-    ? 'M1 reading — uses the pre-market price as the expected open'
+    ? (obj(S.model).morning_set && S.model.morning_set !== 'official' ? 'M1 reading — adds what traded after the close and before 9:00 ET' : 'M1 reading — uses the pre-market price as the expected open')
     : top.model_used === 'm0' ? 'M0 reading — close-only features (no pre-market print)' : 'Model version not reported';
 
   const aboutNote = `${esc(modelLine)}. Features as of the close on ${esc(fmtDay(t.features_asof, { year: true }))}.${isNum(top.score) ? (top.score >= 100 ? (t.top_tie_count > 1 ? ` Tied with ${esc(int(t.top_tie_count - 1))} other name${t.top_tie_count > 2 ? 's' : ''} for the highest odds of the ${esc(int(scored))} scored — ties are ordered by the model's raw score.` : ` The highest odds of the ${esc(int(scored))} names scored today.`) : ` Higher odds than ${esc(top.score)}% of the ${esc(int(scored))} names scored today.`) : ''}${backtestLine(top.model_used)}${isNum(top.rank) && top.rank > 1 ? ` The ${top.rank - 1} higher-ranked board name${top.rank > 2 ? 's are' : ' is'} skipped because ${top.rank > 2 ? 'they are' : 'it is'} under the Rule 201 short-sale restriction today or trade under $300K a day — the rule the backtest measured.` : ''}`;
@@ -477,11 +493,11 @@ function renderHero() {
 
 /** Base rate for a target from model.json (dump/squeeze/swing/pump), or null. */
 function baseOf(k) {
-  const b = obj(obj(S.model).base_rate)[k];
-  if (isNum(b)) return b;
+  // swing: one source everywhere — the out-of-sample base of the swing report
   const sw = swingReport();
   if (k === 'swing' && isNum(sw.base_rate)) return sw.base_rate;
-  return null;
+  const b = obj(obj(S.model).base_rate)[k];
+  return isNum(b) ? b : null;
 }
 
 /** "62% of its big-move odds point down" — the downside share of the two big-move odds. */
@@ -576,7 +592,7 @@ function boardRow(p, max) {
   return `<tr data-sym="${sym}">
     <td class="c-rank">${isNum(p.rank) ? pad2(p.rank) : DASH}</td>
     <td class="c-name"><button type="button" class="tk" data-open="${sym}">${sym}</button><span class="nm">${txt(nm)}</span>${arr(p.flags).length ? flagChips(p.flags, 4) : ''}</td>
-    <td class="c-prob"><span class="pv">${esc(pct(p.prob_dump))}</span>${probBar(p.prob_dump, S.base, max)}</td>
+    <td class="c-prob"><span class="pv">${esc(fmtProb(p))}</span>${probBar(p.prob_dump, S.base, max)}</td>
     <td class="c-lift">${esc(liftTxt(p.lift))}</td>
     <td class="c-fam">${familyBars(p.families)}</td>
     <td class="c-gap">${esc(gap)}</td>
@@ -739,7 +755,7 @@ function renderTwins() {
       <p class="card__big">${simN == null ? DASH : `${simN}<small>% alike</small>`}</p>
       ${arr(t.reasons).length ? `<ul class="why">${arr(t.reasons).map((r) => `<li>${esc(r)}</li>`).join('')}</ul>` : ''}
       ${flags.length ? flagChips(flags, 4) : ''}
-      <div class="card__meta"><span>Dump odds <b>${esc(pct(t.prob_dump))}</b></span><span>${esc(price(t.price))} · ${esc(money(t.market_cap))}</span></div>
+      <div class="card__meta"><span>Dump odds <b>${esc(fmtProb(t))}</b></span><span>${esc(price(t.price))} · ${esc(money(t.market_cap))}</span></div>
     </article>`;
   }).join('')}</div>`;
 }
@@ -774,7 +790,7 @@ function renderSqueeze() {
     const sym = esc(p.symbol);
     return `<li>
       <div class="z-name"><button type="button" class="tk" data-open="${sym}">${sym}</button><span class="nm">${txt([p.name, p.country].filter(Boolean).join(' · '))}</span>${borrowInline(p.shortability)}</div>
-      <div class="z-prob"><b>${esc(pct(p.prob_dump))}</b><small>dump odds</small></div>
+      <div class="z-prob"><b>${esc(fmtProb(p))}</b><small>dump odds</small></div>
       <div class="z-sq">${squeezeMeter(p.squeeze_danger, { large: true })}</div>
       <p class="why">${txt(p.zone_reason)}</p>
       ${partsBars(p.squeeze_parts)}
@@ -821,7 +837,7 @@ function backtestBlock(m) {
   const base = obj(m.base_rate).dump;
   const cost = isNum(sim.cost_assumption) ? sim.cost_assumption : null;
   const tabs = ['m0', 'm1'].filter((k) => obj(m.sim)[k] || obj(m.oos)[k]);
-  const tabHTML = tabs.map((k) => `<button type="button" role="tab" id="tab-${k}" aria-controls="bt-panel" aria-selected="${k === tab}" tabindex="${k === tab ? 0 : -1}" data-tab="${k}">${k === 'm1' ? 'M1 · knows the real open (live uses a pre-market proxy)' : 'M0 · close only — what the morning run can do'}</button>`).join('');
+  const tabHTML = tabs.map((k) => `<button type="button" role="tab" id="tab-${k}" aria-controls="bt-panel" aria-selected="${k === tab}" tabindex="${k === tab ? 0 : -1}" data-tab="${k}">${k === 'm1' ? (m.morning_set && m.morning_set !== 'official' ? 'M1 · + after-hours & pre-market trading (through 9:00 ET)' : 'M1 · knows the real open (live uses a pre-market proxy)') : 'M0 · close only (evening run; morning fallback)'}</button>`).join('');
   const nDays = arr(sim.daily).length;
   return `<div>${head}
     <p class="note">Walk-forward, out of sample${m.trained_through ? ` through ${esc(fmtDay(m.trained_through, { weekday: false, year: true }))}` : ''}. Short the #1 at the open, cover at the close${isNum(cost) ? `, ${esc(pct(cost, 0))} round-trip cost` : ''}. The published rule skips names under the Rule 201 short-sale restriction and names trading under $300K a day; it still assumes borrow was always available — often it isn't.${m.publication_rule ? ` <span class="sr-only">${esc(m.publication_rule.text || '')}</span>` : ''}</p>
@@ -859,8 +875,8 @@ function swingTiles() {
   return `<p class="eyebrow" style="margin:8px 0 0">5-session swing · short the swing #1 at the next open, cover at the fifth close</p>
     <dl class="tiles">
       ${stat('Fell 15%+', esc(pct(isNum(sw.pub1_hit) ? sw.pub1_hit : sw.top1_hit)), esc(`average name ${pct(bs, 1)}`))}
-      ${stat('Average 5-session move', esc(pct(isNum(sw.pub1_mean_c5) ? sw.pub1_mean_c5 : sw.top1_mean_c5, 1, true)), esc(`median ${pct(isNum(sw.pub1_median_c5) ? sw.pub1_median_c5 : sw.top1_median_c5, 1, true)}`))}
-      ${stat('Win rate', esc(pct(sim.win_rate)), 'non-overlapping trades, after cost')}
+      ${stat('Average 5-session move', esc(pct(isNum(sw.pub1_mean_c5) ? sw.pub1_mean_c5 : sw.top1_mean_c5, 1, true)), esc(`median ${pct(isNum(sw.pub1_median_c5) ? sw.pub1_median_c5 : sw.top1_median_c5, 1, true)} · all daily entries (overlapping), before costs and borrow`))}
+      ${stat('Net per trade', `<span class="${isNum(sim.mean_trade_net) && sim.mean_trade_net < 0 ? 'red' : ''}">${esc(pct(sim.mean_trade_net, 1, true))}</span>`, esc(`${isNum(sim.n_trades) ? `${int(sim.n_trades)} non-overlapping trades` : 'non-overlapping trades'}, after ${pct(sim.cost_assumption, 0)} cost, before borrow · won ${pct(sim.win_rate, 0)} of them${isNum(sim.mean_trade_net) && sim.mean_trade_net < 0 ? ' — the losers are much bigger than the winners' : ''}`))}
       ${stat('Worst trade', esc(pct(isNum(sim.worst_trade) ? sim.worst_trade : sim.worst, 0, true)), esc(isNum(sim.n_trades) ? `${int(sim.n_trades)} trades` : 'short return'))}
     </dl>`;
 }
@@ -1011,21 +1027,24 @@ function renderEvidence() {
   const vals = all.flatMap((s) => [s.pct_dump, ...arr(s.ci_pct_dump)]).filter(isNum);
   const max = Math.max(0.1, Math.ceil((Math.max(0, ...vals) * 1.08) / 0.05) * 0.05);
   const bp = base ? base.pct_dump : null;
-  root.innerHTML = `<p class="note reveal" style="margin-bottom:24px">Red tick = share that fell 5%+ open→close the next session · whisker = 95% interval · dashed = all names (${esc(pct(bp, 1))}).</p>
+  root.innerHTML = `<p class="note reveal" style="margin-bottom:24px">Red tick = share that fell 5%+ open→close the next session · whisker = 95% interval · dashed = the comparison group (all names, ${esc(pct(bp, 1))}, unless the card says otherwise).</p>
     <div class="grid-cards reveal">${all.map((s) => {
       const isBase = s === base;
       const ci = arr(s.ci_pct_dump);
       const small = isNum(s.n) && s.n < 200;
-      const sr = `${pct(s.pct_dump, 1)} dumped${ci.length === 2 && isNum(ci[0]) && isNum(ci[1]) ? ` (95% interval ${pct(ci[0], 1)} to ${pct(ci[1], 1)})` : ''}${isBase ? '' : `, versus ${pct(bp, 1)} for all names`}.`;
+      // some studies compare with their own matched group, not with all names
+      const ref = isNum(s.ref_pct_dump) ? s.ref_pct_dump : bp;
+      const refLab = isNum(s.ref_pct_dump) && isNum(bp) && Math.abs(s.ref_pct_dump - bp) > 0.002 ? 'comparable names' : 'all names';
+      const sr = `${pct(s.pct_dump, 1)} dumped${ci.length === 2 && isNum(ci[0]) && isNum(ci[1]) ? ` (95% interval ${pct(ci[0], 1)} to ${pct(ci[1], 1)})` : ''}${isBase ? '' : `, versus ${pct(ref, 1)} for ${refLab}`}.`;
       return `<article class="card ev-card${isBase ? ' is-base' : ''}">
         <p class="eyebrow">${isBase ? 'Baseline · ' : ''}n = ${esc(int(s.n))}${isNum(s.n_symbols) ? ` · ${esc(int(s.n_symbols))} names` : ''}${small ? ' · small sample' : ''}</p>
         <h3>${txt(s.title)}</h3>
         <p class="ev-plain">${txt(s.plain)}</p>
-        <div>${whisker(s.pct_dump, ci, isBase ? null : bp, max)}<div class="ev-scale" aria-hidden="true"><span>0%</span><span>${esc(pct(max))}</span></div></div>
+        <div>${whisker(s.pct_dump, ci, isBase ? null : ref, max)}<div class="ev-scale" aria-hidden="true"><span>0%</span><span>${esc(pct(max))}</span></div></div>
         <p class="sr-only">${esc(sr)}</p>
         <div class="ev-nums">
           <span><b>${esc(pct(s.pct_dump, 1))}</b>dumped next session</span>
-          <span><b>${esc(isBase ? '1.0×' : liftTxt(s.lift_dump))}</b>vs all names</span>
+          <span><b>${esc(isBase ? '1.0×' : liftTxt(s.lift_dump))}</b>vs ${refLab}${refLab === 'comparable names' ? ` (${esc(pct(ref, 1))})` : ''}</span>
           <span><b>${esc(pct(s.median_oc, 1, true))}</b>median open→close</span>
           ${isNum(s.pct_up5) ? `<span><b>${esc(pct(s.pct_up5, 1))}</b>ran UP 5%+ instead</span>` : ''}
           ${isNum(s.pct_swing) ? `<span><b>${esc(pct(s.pct_swing, 1))}</b>fell 15%+ within 5 sessions</span>` : ''}
@@ -1068,7 +1087,7 @@ function renderLive() {
       ${stat(`#1 ${esc(top.symbol)} · open → now`, `<span class="${isNum(top.oc_now) && top.oc_now < 0 ? 'red' : ''}">${esc(pct(top.oc_now, 1, true))}</span>`, esc(`${price(top.open)} open → ${price(top.last)} last`))}
       ${stat('High since the open', esc(pct(top.oh_now, 1, true)), 'the rip a short had to sit through')}
       ${stat('Low since the open', esc(pct(top.ol_now, 1, true)), 'the best cover so far')}
-      ${stat('Board, open → now', esc(pct(L.board_mean_oc_now, 1, true)), esc(`${down5} of ${rows.length} down 5%+ so far`))}
+      ${stat('Board, open → now', esc(pct(L.board_mean_oc_now, 1, true)), esc(`${down5} of ${rows.length} down 5%+ so far${arr(L.unquoted).length ? ` · ${arr(L.unquoted).length} with no regular-session quote (halted or no data): ${arr(L.unquoted).slice(0, 6).join(', ')}` : ''}`))}
     </dl>
     <div class="chart" id="live-chart"></div>` : empty('No live quote for the #1 in this snapshot.')}
     ${rows.length ? `<div class="table-scroll" style="margin-top:32px"><table class="mtable"><caption class="sr-only">Board names, open to now</caption>
@@ -1104,7 +1123,7 @@ function renderSwing() {
   const max = Math.max(0.2, Math.ceil((Math.max(0, ...sb.map((p) => p.prob_swing).filter(isNum)) * 1.1) / 0.1) * 0.1);
   const sw = swingReport();
   const bt = isNum(sw.pub1_hit) || isNum(sw.top1_hit)
-    ? `<p class="note" style="margin-bottom:24px">Backtest (out of sample): the top swing pick fell 15%+ by the fifth close on ${esc(pct(isNum(sw.pub1_hit) ? sw.pub1_hit : sw.top1_hit))} of entries${isNum(sw.pub1_mean_c5) ? `, averaging ${esc(pct(sw.pub1_mean_c5, 1, true))}` : ''}${isNum(bs) ? ` — versus ${esc(pct(bs, 1))} for the average name` : ''}. Multi-day shorts also pay borrow every day and ride every overnight gap.</p>` : '';
+    ? `<p class="note" style="margin-bottom:24px">Backtest (out of sample): the top swing pick fell 15%+ by the fifth close on ${esc(pct(isNum(sw.pub1_hit) ? sw.pub1_hit : sw.top1_hit))} of entries${isNum(sw.pub1_mean_c5) ? `, averaging ${esc(pct(sw.pub1_mean_c5, 1, true))}` : ''}${isNum(bs) ? ` — versus ${esc(pct(bs, 1))} for the average name` : ''}. ${(() => { const sim = obj(sw.sim_pub && Object.keys(obj(sw.sim_pub)).length ? sw.sim_pub : sw.sim); return isNum(sim.mean_trade_net) ? `But as a trade it ${sim.mean_trade_net < 0 ? 'lost' : 'made'} ${esc(pct(Math.abs(sim.mean_trade_net), 1))} per trade on average after a ${esc(pct(sim.cost_assumption, 0))} cost (${esc(int(sim.n_trades))} non-overlapping trades, before borrow)${sim.mean_trade_net < 0 ? ' — the occasional squeeze outweighs the many winners' : ''}. ` : ''; })()}Multi-day shorts also pay borrow every day and ride every overnight gap.</p>` : '';
   root.innerHTML = `${bt}<div class="table-scroll reveal"><table class="mtable swing-table"><caption class="sr-only">Swing board: highest odds of a 15%+ fall over five sessions</caption>
     <thead><tr><th scope="col">#</th><th scope="col">Ticker</th><th scope="col">Swing odds${isNum(bs) ? ` <span class="muted">· base ${esc(pct(bs, 1))}</span>` : ''}</th><th scope="col">Today's skew</th><th scope="col">Today's dump odds</th><th scope="col">Borrow</th><th scope="col">Board</th></tr></thead>
     <tbody>${sb.map((p) => `<tr>
@@ -1112,7 +1131,7 @@ function renderSwing() {
       <th scope="row" class="sw-name"><button type="button" class="tk" data-open="${esc(p.symbol)}">${esc(p.symbol)}</button><span class="nm">${txt([p.name, p.country].filter(Boolean).join(' · '))}</span>${arr(p.flags).length ? flagChips(p.flags, 3) : ''}</th>
       <td class="c-prob"><span class="pv">${esc(pct(p.prob_swing))}</span>${probBar(p.prob_swing, bs, max)}</td>
       <td>${esc(isNum(p.skew) ? `${pct(p.skew)} down` : DASH)}</td>
-      <td>${esc(pct(p.prob_dump))}</td>
+      <td>${esc(fmtProb(p))}</td>
       <td>${borrowInline(p.shortability)}</td>
       <td>${isNum(p.board_rank) ? `#${esc(p.board_rank)}` : DASH}</td>
     </tr>`).join('')}</tbody></table></div>`;
@@ -1298,7 +1317,7 @@ function drawLookup() {
     const sym = esc(r.symbol);
     const tk = S.recs.has(r.symbol) ? `<button type="button" class="tk" data-open="${sym}">${sym}</button>` : `<button type="button" class="tk tk--quiet">${sym}</button>`;
     return `<tr data-lksym="${sym}"><th scope="row">${tk}<span class="nm">${txt(r.name)}</span>${r.ssr ? '<span class="chip chip--red">SSR</span>' : ''}</th>
-      <td>${esc(price(r.price))}</td><td>${esc(money(r.market_cap))}</td><td class="${r.board_rank ? 'red' : ''}">${esc(pct(r.prob_dump))}</td>
+      <td>${esc(price(r.price))}</td><td>${esc(money(r.market_cap))}</td><td class="${r.board_rank ? 'red' : ''}">${esc(fmtProb(r))}</td>
       <td>${esc(pct(r.prob_squeeze))}</td><td>${esc(pct(r.prob_swing))}</td><td>${esc(isNum(r.skew) ? pct(r.skew) : DASH)}</td>
       <td>${esc(isNum(r.fee_rate) ? `${pctUnits(r.fee_rate, 0)}` : (r.borrow_status === 'NONE' ? 'none' : DASH))}</td><td>${esc(isNum(r.squeeze_danger) ? r.squeeze_danger : DASH)}</td>
       <td>${esc(isNum(r.capacity) ? money(r.capacity) : DASH)}</td>
@@ -1322,7 +1341,7 @@ function showLookupCard(sym) {
     <div class="card__top"><div><p class="card__sym">${esc(sym)}</p><p class="card__name">${txt([r.name, r.sector, r.country].filter(Boolean).join(' · '))}</p></div>
       <span class="eyebrow">${isNum(r.board_rank) ? `Board #${esc(r.board_rank)}` : 'Not on today\'s boards'}</span></div>
     <dl class="tiles">
-      ${stat('Dump odds', `<span class="red">${esc(pct(r.prob_dump))}</span>`, esc(isNum(S.base) ? `base ${pct(S.base, 1)}${isNum(r.score) ? ` · higher than ${r.score}% of names` : ''}` : ''))}
+      ${stat('Dump odds', `<span class="red">${esc(fmtProb(r))}</span>`, esc(isNum(S.base) ? `base ${pct(S.base, 1)}${isNum(r.score) ? ` · higher than ${r.score}% of names` : ''}` : ''))}
       ${stat('Squeeze odds', esc(pct(r.prob_squeeze)), 'P(+20% above the open)')}
       ${stat('Swing odds', esc(pct(r.prob_swing)), '15%+ lower five sessions out')}
       ${stat('Borrow', esc(r.borrow_status || DASH), esc(isNum(r.fee_rate) ? `${pctUnits(r.fee_rate, 1)}/yr · ${compact(r.available)} sh` : 'IBKR'))}
@@ -1443,12 +1462,100 @@ function sizeDossier(p) {
     ['Max size without moving the price', esc(money(sz.capacity)), `limit: ${LIMIT_TXT[sz.limit] || sz.limit || DASH}`],
     ['Expected session $ volume', esc(money(sz.exp_dvol)), 'conservative estimate'],
     ['IBKR lendable value', esc(isNum(sz.cap_borrow) ? money(sz.cap_borrow) : DASH)],
-    ['Spread used in costs', esc(isNum(sz.spread) ? pct(sz.spread, 2) : DASH), sz.spread_estimated === false ? 'estimator could not read it — conservative fallback (≥ 0.5% or one cent)' : 'Abdi–Ranaldo estimate, 20 sessions'],
+    ['Spread used in costs', esc(isNum(sz.spread) ? pct(sz.spread, 2) : DASH),
+      sz.spread_source === 'quoted' ? 'median real bid/ask quote recorded by the live tape, recent sessions'
+        : (sz.spread_source === 'band cap' || sz.spread_estimated === false) ? 'estimator could not read a spread — the conservative cap for this liquidity tier (6% under $250K/day, 3% under $1M, 2% under $5M, 1% above)'
+        : 'close-high-low (Abdi–Ranaldo) estimate over 20 sessions, kept between one tick and the liquidity-tier cap'],
     ['Breakeven size', esc(isNum(sz.breakeven) ? money(sz.breakeven) : DASH), isNum(sz.avg_move) ? `where costs reach ${sz.move_basis === '#1' ? "the historical #1's" : "a historical top-10 pick's"} ${pct(sz.avg_move, 1)} average move — a point estimate with wide uncertainty` : ''],
   ]) + `<div class="table-scroll" style="margin-top:16px"><table class="mtable"><caption class="sr-only">Estimated cost by position size</caption><thead><tr><th scope="col">Size</th><th scope="col">Round-trip cost</th><th scope="col">Share of volume</th><th scope="col">Within capacity</th><th scope="col">Below breakeven</th></tr></thead><tbody>${rows}</tbody></table></div><p class="note" style="margin-top:8px">Square-root impact model (Y = 0.7 × daily volatility × √(size ÷ volume)) on both legs plus one spread. Planning estimates — real costs depend on how the order is worked.</p>`;
 }
 
 /* ── size lab (docs/data/size_research.json) ───────────────────────────── */
+/* ── "Spread it" planner: split a total across today's eligible picks, each
+   kept within its own capacity and breakeven (water-filling). Cost per name
+   follows the same square-root law as gravity/capacity.py: cost(q) = spread +
+   k·√q, with k backed out of the published $10K cost. */
+const PLAN_KEY = 'gravity:plan:v1';
+const PLAN_TOTALS = [10000, 25000, 50000, 100000, 250000, 500000, 1000000];
+const PLAN_K = [1, 3, 5, 10];
+function loadPlan() {
+  try { const v = JSON.parse(localStorage.getItem(PLAN_KEY) || '{}'); return { total: PLAN_TOTALS.includes(v.total) ? v.total : 50000, k: PLAN_K.includes(v.k) ? v.k : 5 }; } catch { return { total: 50000, k: 5 }; }
+}
+function savePlan(v) { try { localStorage.setItem(PLAN_KEY, JSON.stringify(v)); } catch { /* storage blocked */ } }
+function costFn(p) {
+  const sz = obj(p && p.size);
+  const c10 = obj(sz.costs)['10000'];
+  if (!isNum(c10) || !isNum(sz.spread)) return null;
+  const spr = Math.max(sz.spread, 0.001);
+  const k = Math.max(c10 - spr, 0) / Math.sqrt(10000);
+  return (q) => spr + k * Math.sqrt(Math.max(q, 0));
+}
+function waterfill(total, caps) {
+  const alloc = caps.map(() => 0);
+  let rem = total;
+  let open = caps.map((c, i) => i).filter((i) => caps[i] > 0);
+  while (rem > 1 && open.length) {
+    const share = rem / open.length;
+    const next = [];
+    open.forEach((i) => { const add = Math.min(caps[i] - alloc[i], share); alloc[i] += add; rem -= add; if (caps[i] - alloc[i] > 1e-6) next.push(i); });
+    if (next.length === open.length) break;
+    open = next;
+  }
+  return { alloc, rem: Math.max(rem, 0) };
+}
+function planBasket(board, total, k) {
+  const picks = arr(board).filter((p) => p.publishable && isNum(obj(p.size).capacity)).slice(0, k);
+  const lims = picks.map((p) => { const sz = obj(p.size); const be = isNum(sz.breakeven) ? sz.breakeven : Infinity; return { lim: Math.min(sz.capacity, be), why: be < sz.capacity ? 'breakeven' : 'capacity' }; });
+  const caps = lims.map((x) => (x.lim >= 1000 ? x.lim : 0));
+  const { alloc, rem } = waterfill(total, caps);
+  const rows = picks.map((p, i) => { const f = costFn(p); const q = alloc[i]; return { p, q, cap: caps[i], why: lims[i].why, cost: q > 0 && f ? f(q) : null }; });
+  const dep = rows.reduce((a, r) => a + r.q, 0);
+  const wcost = dep > 0 ? rows.reduce((a, r) => a + (isNum(r.cost) ? r.cost * r.q : 0), 0) / dep : null;
+  return { rows, dep, rem, wcost };
+}
+function renderPlanner() {
+  const el = $('#planner');
+  if (!el || !S.today) return;
+  const pl = S.plan || (S.plan = loadPlan());
+  const b = planBasket(S.today.board, pl.total, pl.k);
+  const opt = (vals, cur, lab) => vals.map((v) => `<option value="${v}"${v === cur ? ' selected' : ''}>${esc(lab(v))}</option>`).join('');
+  const bkAll = obj(obj(S.sizeLab).basket);
+  const mu = obj(obj(S.today).top).model_used === 'm1' ? 'm1' : 'm0';
+  const bk = obj(bkAll[mu] || (mu === 'm1' ? bkAll : null));
+  const hist = obj(bk[`top${pl.k}`]);
+  const modelName = mu === 'm1' ? 'the morning model' : 'the close-only model (today\'s board)';
+  const histLine = isNum(obj(hist.confirm).net_per_dollar)
+    ? `<p class="note">History for a similar rule with ${modelName} (top ${pl.k} eligible names each day, each capped at its capacity up to $50K, walk-forward): net after each name's estimated cost ${esc(pct(obj(hist.dev).net_per_dollar, 2, true))} per dollar deployed in development, ${esc(pct(hist.confirm.net_per_dollar, 2, true))} in confirmation; ${esc(pct(obj(hist.confirm).day_win, 0))} of confirmation days made money. History, not a promise.</p>` : '';
+  const rows = b.rows.map((r, i) => `<tr${i === 0 ? ' class="hot"' : ''}><th scope="row"><a href="#/${encodeURIComponent(r.p.symbol)}" data-open="${esc(r.p.symbol)}">${esc(r.p.symbol)}</a> <span class="nm">#${esc(r.p.rank)}</span></th><td>${r.cap > 0 ? esc(money(r.q)) : `<span class="muted">${r.why === 'breakeven' ? 'cost > avg move' : 'too thin'}</span>`}</td><td>${r.cap > 0 ? `${esc(money(r.cap))} <span class="nm">${esc(r.why)}</span>` : '&lt; $1K'}</td><td>${r.q > 0 ? esc(pct(r.cost, 1)) : DASH}</td><td>${esc(fmtProb(r.p))}</td></tr>`).join('');
+  el.innerHTML = `<div class="rec-block"><h3 class="rec-sub">Spread it</h3>
+    <p class="note">More money without moving prices means more names, not a bigger position: each name below is capped at the smaller of its capacity and its breakeven size. Only names that pass the published rule (no short-sale restriction, ≥ $300K a day) are used.</p>
+    <div class="plan-ctl"><label>Total <select id="plan-total">${opt(PLAN_TOTALS, pl.total, sizeLabel)}</select></label>
+      <label>Across <select id="plan-k">${opt(PLAN_K, pl.k, (v) => (v === 1 ? 'the #1 only' : `top ${v} eligible`))}</select></label></div>
+    ${b.rows.length ? `<div class="table-scroll"><table class="mtable"><thead><tr><th scope="col">Name</th><th scope="col">Size</th><th scope="col">Max</th><th scope="col">Est. cost</th><th scope="col">Dump odds</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <dl class="tiles">${stat('Deployed', esc(money(b.dep)), esc(`of ${sizeLabel(pl.total)}`))}${stat('Left over', esc(money(b.rem)), b.rem > 1 ? 'no room left without moving prices or passing breakeven' : 'all placed')}${stat('Avg est. cost', esc(isNum(b.wcost) ? pct(b.wcost, 1) : DASH), 'round trip, size-weighted')}</dl>` : empty('No eligible names with a capacity estimate today.')}
+    ${histLine}</div>`;
+  const on = (id, key) => { const x = $(id); if (x) x.addEventListener('change', () => { pl[key] = Number(x.value); savePlan(pl); renderPlanner(); }); };
+  on('#plan-total', 'total'); on('#plan-k', 'k');
+}
+
+function morningBlock(mo) {
+  if (!mo || !arr(mo.rows).length) return '';
+  const dc = (o, f) => `${esc(f(obj(o).dev))} <span class="muted">/</span> ${esc(f(obj(o).confirm))}`;
+  const sp = (v) => pct(v, 1, true);
+  const rows = arr(mo.rows).map((r) => `<tr${r.key === mo.chosen ? ' class="hot"' : ''}><th scope="row">${esc(r.label)}${r.key === mo.chosen ? ' <span class="nm">now live</span>' : ''}</th><td>${dc(r.hit, (v) => pct(v, 0))}</td><td>${dc(r.mean_oc, sp)}</td><td>${dc(r.squeeze, (v) => pct(v, 0))}</td><td>${dc(r.net10k, sp)}</td><td>${dc(r.net50k, sp)}</td><td>${dc(r.auc, (v) => fixed(v, 3))}</td></tr>`).join('');
+  const t = obj(mo.timing);
+  const tl = (k) => obj(obj(t.confirm)[k]);
+  const tRows = ['open→close', 'open→10:30', 'open→12:30', '10:30→close', 'open→close | up at 10:30', '10:30→close | up at 10:30', 'open→close | down at 10:30', '10:30→close | down at 10:30']
+    .filter((k) => obj(t.dev)[k] || obj(t.confirm)[k])
+    .map((k) => `<tr><th scope="row">Short ${esc(k.replace(' | ', ', if '))}</th><td>${dc({ dev: obj(obj(t.dev)[k]).mean, confirm: tl(k).mean }, sp)}</td><td>${dc({ dev: obj(obj(t.dev)[k]).win, confirm: tl(k).win }, (v) => pct(v, 0))}</td><td>${dc({ dev: obj(obj(t.dev)[k]).n, confirm: tl(k).n }, (v) => int(v))}</td></tr>`).join('');
+  const cov = obj(mo.coverage);
+  return `<div class="rec-block reveal"><h3 class="rec-sub">The morning #1: what is actually knowable at 9:05 ET</h3>
+    <p class="note">The morning model used to be trained on the official 9:30 opening gap, which the 9:05 run cannot know; live it was fed the pre-market price instead (the two agree only loosely: correlation ${esc(fixed(cov.corr_gap_ext_vs_open, 2))}). It is now trained and tested on the same kind of input the 9:05 run uses — extended-hours trades before 9:00 ET (live, these come from same-day bars, which Yahoo sometimes revises slightly later). Published #1 each day, development / confirmation; net uses each pick's estimated cost (impact + spread) at that size.</p>
+    <div class="table-scroll"><table class="mtable"><thead><tr><th scope="col">Morning model</th><th scope="col">#1 dumped</th><th scope="col">#1 avg open→close</th><th scope="col">Spiked +20%</th><th scope="col">Net $10K</th><th scope="col">Net $50K</th><th scope="col">AUC</th></tr></thead><tbody>${rows}</tbody></table></div></div>
+    ${tRows ? `<div class="rec-block reveal"><h3 class="rec-sub">When to get in and out</h3><p class="note">Short return of the published #1 from hourly bars (positive = the price fell), development / confirmation. Before costs. Conditional rows split days by where the price stood at 10:30 versus the open.</p>
+    <div class="table-scroll"><table class="mtable"><thead><tr><th scope="col">Trade</th><th scope="col">Avg short return</th><th scope="col">Share of days it paid</th><th scope="col">Days</th></tr></thead><tbody>${tRows}</tbody></table></div></div>` : ''}`;
+}
+
 function renderSizeLab() {
   const root = $('#sizelab-root');
   if (!root) return;
@@ -1466,13 +1573,15 @@ function renderSizeLab() {
   const g = (k) => ({ dev: obj(mp.dev)[k], confirm: obj(mp.confirm)[k] });
   const ss = obj(S.today && S.today.size_summary);
   const today = isNum(ss.deployable) ? `<dl class="tiles reveal">
-      ${stat('Deployable today, top 10', esc(money(ss.deployable)), esc(`spread across ${int(ss.names)} names, each within its capacity and breakeven`))}
+      ${stat('Deployable today', esc(money(ss.deployable)), esc(`across ${int(ss.names)} eligible name${ss.names === 1 ? '' : 's'} (no short-sale restriction, ≥ $300K/day), each within its capacity and breakeven`))}
       ${stat('#1 capacity', esc(money(ss.top_capacity)), 'before moving the price')}
       ${stat('#1 breakeven size', esc(isNum(ss.top_breakeven) ? money(ss.top_breakeven) : DASH), esc(isNum(ss.avg_move_top1) ? `costs reach the historical #1's ${pct(ss.avg_move_top1, 1)} average move` : ''))}
       ${stat('Avg move, a top-10 pick', esc(pct(-ss.avg_move_top10, 1, true)), 'open→close before costs, walk-forward backtest')}
     </dl>` : '';
   root.innerHTML = `
     ${today}
+    <div id="planner" class="reveal"></div>
+    ${morningBlock(r.morning)}
     <p class="sec-q reveal">${esc(r.question || '')}</p>
     <ul class="notes verdict reveal">${arr(r.verdict).map((v) => `<li>${esc(v)}</li>`).join('')}</ul>
     <div class="rec-block reveal"><h3 class="rec-sub">The daily #1 on a point-in-time universe</h3><p class="note">Development / confirmation period. Net uses each pick's own estimated cost at $10K; "tight" assumes spreads near one tick.</p>
@@ -1484,6 +1593,7 @@ function renderSizeLab() {
       <div class="table-scroll"><table class="mtable"><thead><tr><th scope="col">Tier</th><th scope="col">Net / trade, today's list</th><th scope="col">Tier avg, today's list</th><th scope="col">Net / trade, point-in-time</th><th scope="col">Tier avg, point-in-time</th><th scope="col">t-stat</th><th scope="col">Independent trades</th></tr></thead><tbody>${mdRows}</tbody></table></div>
       <p class="note" style="margin-top:8px">On today's list the tier itself drifted down — the signature of stocks that had already collapsed into small-cap range. Point-in-time, the result is mixed and within noise.</p></div>
     <details class="rec-block reveal"><summary class="rec-sub">How this was tested</summary><ul class="caveats">${arr(r.method).map((m) => `<li>${esc(m)}</li>`).join('')}</ul></details>`;
+  renderPlanner();
 }
 
 /* ── method & footer ───────────────────────────────────────────────────── */
@@ -1563,7 +1673,7 @@ function dossierHTML(rec) {
   const pre = p.premarket;
   const gap = pre && isNum(pre.gap_pct) ? pct(pre.gap_pct, 0, true) : DASH;
   const keys = `<dl class="dz-keys">
-    <div><dt class="eyebrow">Dump odds</dt><dd class="${isNum(p.prob_dump) ? 'red' : ''}">${esc(pct(p.prob_dump))}<small>${esc(isNum(base) ? `base ${pct(base, 1)} · ${liftTxt(p.lift)}` : 'base rate not reported')}</small></dd></div>
+    <div><dt class="eyebrow">Dump odds</dt><dd class="${isNum(p.prob_dump) ? 'red' : ''}">${esc(fmtProb(p))}<small>${esc(isNum(base) ? `base ${pct(base, 1)} · ${liftTxt(p.lift)}` : 'base rate not reported')}</small></dd></div>
     <div><dt class="eyebrow">Swing odds</dt><dd>${esc(pct(p.prob_swing))}<small>15%+ lower five sessions out</small></dd></div>
     <div><dt class="eyebrow">Pre-market</dt><dd>${esc(gap)}<small>${esc(pre ? `${price(pre.price)} at ${fmtTimeET(pre.asof)} ET` : 'no print reported')}</small></dd></div>
     <div><dt class="eyebrow">Squeeze danger</dt><dd>${squeezeMeter(p.squeeze_danger)}<small>${esc(sqWord(p.squeeze_danger))}</small></dd></div>

@@ -279,9 +279,64 @@ def build_training_panel() -> tuple:
              int(panel.attrs.get("pit_sec_rows", 0)), time.time() - t0)
     panel = panel[keep.to_numpy()].reset_index(drop=True)
     features._cross_sectional(panel)           # ranks / breadth over the kept universe, as live
+    if features.MORNING_SET != "official":
+        _add_morning_features(panel, events)
     net.STATUS.clear()
     net.STATUS.update(saved_status)
     return panel, hist
+
+
+def _add_morning_features(panel: pd.DataFrame, events: Dict[str, List[dict]]) -> None:
+    """Morning-model inputs for training, exactly as the 9:05 ET run sees them:
+    gap_open = last after-hours / pre-market trade before 9:00 ET (not the
+    9:30 open, which the morning run can't know), plus — per MORNING_SET — the
+    shape of extended-hours trading and filings accepted overnight."""
+    from . import features
+    from .sources import exthours
+
+    t0 = time.time()
+    store = _safe(exthours.update_store, sorted(panel["symbol"].unique()), default=None)
+    if store is None or not len(store):
+        store = exthours.load_store()
+    f = exthours.training_features(panel[["symbol", "date", "close"]], store)
+    panel["gap_open"] = f["gap_ext"].astype(np.float32).to_numpy()
+    for c in features.EXT_EXTRA:
+        if c in features.M1_EXTRA:
+            panel[c] = f[c].astype(np.float32).to_numpy()
+    if any(c in features.M1_EXTRA for c in features.ON_FEATURES):
+        nxt = features.next_session_dates(panel["date"])
+        on = features.overnight_counts(panel["symbol"].to_numpy(), panel["date"], nxt, events)
+        for c in features.ON_FEATURES:
+            panel[c] = on[c].astype(np.float32)
+    log.info("morning features (%s): %.0f%% of rows have an extended-hours price (%.0fs)", features.MORNING_SET,
+             100 * float(np.isfinite(panel["gap_open"]).mean()), time.time() - t0)
+
+
+def _morning_inputs(latest: pd.DataFrame, shortlist: List[str], pre: Dict[str, dict],
+                    events: Dict[str, List[dict]], overnight: Dict[str, List[dict]],
+                    last_date: pd.Timestamp, session: date) -> pd.DataFrame:
+    """The shortlist's morning-model rows (same definitions as training)."""
+    from . import features
+    from .sources import exthours
+
+    sub = latest.loc[shortlist].copy()
+    budget = max(15.0, min(120.0, _secs_until_bell(session)))
+    xf = _safe(exthours.live_features, shortlist, session, last_date.date(), None, budget, default=None)
+    xf = (xf if xf is not None else pd.DataFrame(index=shortlist)).reindex(shortlist)
+    # exactly the training definition: no Nasdaq fallback (a finite gap with blank
+    # extended-hours shape never occurs in training); Nasdaq's quote is display-only
+    sub["gap_open"] = xf["gap_ext"].to_numpy(float) if "gap_ext" in xf else np.nan
+    for c in features.EXT_EXTRA:
+        if c in features.M1_EXTRA:
+            sub[c] = xf[c].to_numpy(float) if c in xf else np.nan
+    if any(c in features.M1_EXTRA for c in features.ON_FEATURES):
+        ev = {s: list(events.get(s, [])) + list(overnight.get(s, [])) for s in shortlist}
+        n = len(shortlist)
+        on = features.overnight_counts(np.array(shortlist, dtype=object), [last_date] * n, [pd.Timestamp(session)] * n, ev)
+        for c in features.ON_FEATURES:
+            sub[c] = on[c]
+    sub["m1_ok"] = True if config.MORNING_SCOPE == "shortlist" else np.isfinite(sub["gap_open"].to_numpy(float))
+    return sub
 
 
 def _pit_market_cap(panel: pd.DataFrame, frames: List[dict], cmap: dict, splits: dict,
@@ -291,8 +346,9 @@ def _pit_market_cap(panel: pd.DataFrame, frames: List[dict], cmap: dict, splits:
     fr = pd.DataFrame(frames)
     by_cik = {c: g.sort_values("end") for c, g in fr.groupby("cik")} if len(fr) else {}
     sec_rows = 0
+    adr_fixed = 0
     for sym, idx in panel.groupby("symbol").groups.items():
-        rows = panel.loc[idx, ["date", "price"]]
+        rows = panel.loc[idx, ["date", "price", "close"]]
         dates = pd.to_datetime(rows["date"])
         cik = (cmap.get(sym) or {}).get("cik")
         g = by_cik.get(int(cik)) if cik else None
@@ -306,6 +362,7 @@ def _pit_market_cap(panel: pd.DataFrame, frames: List[dict], cmap: dict, splits:
             rep_dates = ends[k_eff]
             # splits between the report date and t change the share count
             sp = sorted(splits.get(sym, []), key=lambda x: x["date"])
+            factor = None
             if sp:
                 sd = pd.to_datetime([x["date"] for x in sp]).to_numpy()
                 cum = np.cumprod([float(x["ratio"]) for x in sp])
@@ -313,11 +370,27 @@ def _pit_market_cap(panel: pd.DataFrame, frames: List[dict], cmap: dict, splits:
                     j = np.searchsorted(sd, t, side="right") - 1
                     return np.where(j >= 0, cum[np.clip(j, 0, None)], 1.0)
                 sh = sh * factor(dates.to_numpy()) / factor(rep_dates)
+            # ADRs: the SEC cover page counts ORDINARY shares while the listed
+            # unit is the ADS (often 1 ADS = 5…1,000 ordinary). When Nasdaq's
+            # implied unit count is under a third of the SEC count on today's
+            # basis, rescale the whole SEC history by that ratio. (A higher
+            # Nasdaq count usually means dilution since the last report — left as is.)
+            st = shares_today.get(sym, np.nan) if sym in shares_today.index else np.nan
+            if np.isfinite(st) and st > 0:
+                today64 = np.datetime64(pd.Timestamp.now().normalize())
+                last_adj = vals[-1] * (float(factor(today64) / factor(ends[-1:])[0]) if factor is not None else 1.0)
+                ratio = float(st) / last_adj if last_adj > 0 else np.nan
+                if np.isfinite(ratio) and ratio < 1 / 3:
+                    sh = sh * ratio
+                    adr_fixed += 1
             cap.loc[idx] = rows["price"].to_numpy(float) * sh
             sec_rows += len(idx)
         elif sym in shares_today.index and np.isfinite(shares_today.get(sym, np.nan)):
-            cap.loc[idx] = rows["price"].to_numpy(float) * float(shares_today[sym])
+            # no SEC history: today's share count only matches the SPLIT-ADJUSTED
+            # close (as-traded price × today's count is off by every split since)
+            cap.loc[idx] = rows["close"].to_numpy(float) * float(shares_today[sym])
     panel.attrs["pit_sec_rows"] = sec_rows
+    panel.attrs["pit_adr_rescaled"] = adr_fixed
     return cap
 
 
@@ -393,10 +466,20 @@ def _publish_today(today: dict, args: argparse.Namespace, message: str) -> int:
             and not cur.get("sample"):
         log.info("run is after the open — keeping the pre-open page for %s", today["session_date"])
         return 0
+    if cur.get("session_date") == today["session_date"] and cur.get("run") == "morning" \
+            and today.get("run") == "evening" and not cur.get("late"):
+        log.info("an evening build must not replace the morning page for %s — keeping it", today["session_date"])
+        return 0
     publish.write_json("today.json", today)
     _flush_side()
     if not today["late"]:
-        scorecard.log_picks(today)
+        logged = scorecard.log_picks(today)
+        if logged is False and _is_late(today["session_date"]):
+            # the bell rang between deciding "not late" and logging: say so on the page
+            today["late"] = True
+            publish.write_json("today.json", today)
+        elif args.no_push:
+            scorecard.mark_unverified(today["session_date"], "written by a run that did not push (--no-push)")
         from . import feed
         _safe(feed.write)
     else:
@@ -421,7 +504,14 @@ def cmd_evening(args: argparse.Namespace) -> int:
         _withhold(f"evening data refresh too thin ({e})", not args.no_push)
         return 2
     elig = state["latest"]["symbol"].tolist()
-    n = scorecard.grade(state["hist"], elig)
+    hist_g = dict(state["hist"])
+    missing = [s for s in scorecard.ungraded_symbols() if s not in hist_g]
+    if missing:                       # a pick that fell out of the universe (sub-$0.10, delisted…) still gets graded
+        from .sources import prices as _prices
+        extra = _safe(_prices.load_history, missing, refresh=True, report=False, default={}) or {}
+        hist_g.update({s: df for s, df in extra.items() if df is not None and len(df)})
+        log.info("grading: loaded bars for %d/%d picks outside today's universe", len(extra), len(missing))
+    n = scorecard.grade(hist_g, elig)
     log.info("graded %d session(s)", n)
     publish.write_json("scorecard.json", scorecard.summary())
     if args.retrain or _model_stale(9):
@@ -554,6 +644,15 @@ def _intel():
         return None
 
 
+def _secs_until_bell(session: date, margin_min: int = 10) -> float:
+    """Wall-clock seconds left before ``margin_min`` minutes ahead of that
+    session's 9:30 ET open (inf for runs after the close of the previous day
+    that are not racing the bell, i.e. more than 12 h before it)."""
+    bell = datetime.combine(session, datetime.min.time(), tzinfo=ET).replace(hour=9, minute=30)
+    left = (bell - now_et()).total_seconds() - margin_min * 60
+    return float("inf") if left > 12 * 3600 else left
+
+
 def enrich(symbols: List[str], latest: pd.DataFrame, cmap: dict, splits: dict,
            deadline_s: float, deep: Optional[List[str]] = None) -> dict:
     """Per-name lookups (news, short interest, analyst, float, dilution,
@@ -662,14 +761,30 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
         if s in latest.index and any(e.get("category") in score.SUPPLY_CATS for e in evs) and s not in shortlist:
             shortlist.append(s)
     pre: Dict[str, dict] = {}
-    if phase == "pre-market" or run == "morning":
+    want_pre = phase == "pre-market" or run == "morning"
+    if want_pre and _secs_until_bell(session) < 60:
+        log.warning("pre-market snapshot skipped — too close to the 9:30 ET open (M0 only)")
+        want_pre = False
+    if want_pre:
         t_p = time.time()
-        pre = _safe(prices.premarket_snapshot, shortlist, default={}) or {}
+        pre = _safe(prices.premarket_snapshot, shortlist, max(60.0, min(900.0, _secs_until_bell(session) - 600.0)), default={}) or {}
         log.info("pre-market snapshot: %d/%d names in %.0fs", len(pre), len(shortlist), time.time() - t_p)
-    use_open_syms = [s for s in shortlist if s in pre and pre[s].get("gap_pct") is not None and phase == "pre-market"]
-    if use_open_syms:
+    from . import features as _features
+    # M1 was trained on extended-hours trades through 9:00 ET; an earlier run (07:20 CT)
+    # would feed it a shorter window, so it scores close-only and the 9:05 run decides
+    m1_window_ok = now_et().time() >= datetime.min.time().replace(hour=9)
+    if _features.MORNING_SET != "official" and phase == "pre-market" and want_pre and not m1_window_ok:
+        log.info("before 9:00 ET — close-only scores for now; the 9:05 ET run adds the pre-market model")
+        use_open_syms, sub = [], latest.iloc[:0]
+    elif _features.MORNING_SET != "official" and phase == "pre-market" and want_pre:
+        sub = _morning_inputs(latest, shortlist, pre, events, overnight, last_date, session)
+        use_open_syms = list(sub.index[sub["m1_ok"].astype(bool)])
+        sub = sub.loc[use_open_syms]
+    else:
+        use_open_syms = [s for s in shortlist if s in pre and pre[s].get("gap_pct") is not None and phase == "pre-market"]
         sub = latest.loc[use_open_syms].copy()
         sub["gap_open"] = [pre[s]["gap_pct"] for s in use_open_syms]
+    if use_open_syms:
         p1 = model.predict(bundle, sub, use_open=True)
         for c in OUT:
             if c in p1.columns:
@@ -713,6 +828,9 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
     _m10 = _pub.get("top10_mean_oc")
     avg_move_10 = (-float(_m10)) if (_m10 is not None and _m10 < 0) else None  # a top-10 pick's
 
+    from . import live as _live
+    quoted_spreads = _safe(_live.recent_spreads, default={}) or {}
+
     def size_of(sym: str, m: dict, move: Optional[float] = None, basis: str = "top-10") -> Optional[dict]:
         df = hist.get(sym)
         if df is None or len(df) < 12:
@@ -722,7 +840,7 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
         dv1 = (m.get("close") or 0) * (m.get("volume") or 0)
         blk = _safe(CAP.size_block, m.get("close"), m.get("dvol20") or 0.0, dv1, m.get("vol20"),
                     df["high"].to_numpy(), df["low"].to_numpy(), df["close"].to_numpy(), avail,
-                    avg_move_10 if move is None else move)
+                    avg_move_10 if move is None else move, quoted_spreads.get(sym))
         if blk is not None:
             blk["move_basis"] = basis
         return blk
@@ -748,7 +866,8 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
 
     E: Dict[str, Dict[str, Any]] = {k: {} for k in ("news", "si", "analyst", "dilution", "insider", "floats", "chatter")}
     if live_extras:
-        _merge(E, enrich(dossier, latest, cmap, splits, ENRICH_DEADLINE_S, deep=board_pool[:30] + swing_pool[:5]))
+        _merge(E, enrich(dossier, latest, cmap, splits, max(20.0, min(ENRICH_DEADLINE_S, _secs_until_bell(session))),
+                         deep=board_pool[:30] + swing_pool[:5]))
     danel = _safe(street.danelfin, dossier[:15], default={}) or {}
 
     # attribution for everything we'll show
@@ -1088,19 +1207,25 @@ def _write_universe(latest, hist, borrow, borrow_ok, events, splits, rank_of, se
 
 
 def _size_summary(board: list, top: Optional[dict], avg_move: Optional[float], avg_move_10: Optional[float], CAP) -> Optional[dict]:
-    """How much could be spread across today's top 10 before estimated costs
-    exceed a top-10 pick's historical average move (each name capped at its
-    own capacity)."""
+    """How much could be spread across today's top 10 ELIGIBLE names (no SSR,
+    ≥ $300K/day) before estimated costs exceed a top-10 pick's historical
+    average move (each name capped at its own capacity; names that can't hold
+    $1K are not counted)."""
     if avg_move_10 is None:
         return None
     tot, used = 0.0, 0
-    for p in board[:10]:
+    elig = [p for p in board if p.get("publishable")][:10]      # the rule the backtest measured
+    for p in elig:
         sz = p.get("size") or {}
         if not sz.get("exp_dvol"):
             continue
-        be = CAP.breakeven_size(avg_move_10, sz["exp_dvol"], (p.get("metrics") or {}).get("vol20"), sz.get("spread"))
-        tot += min(be, sz.get("capacity") or 0.0)
-        used += 1
+        be = sz.get("breakeven")
+        if be is None:
+            be = CAP.breakeven_size(avg_move_10, sz["exp_dvol"], (p.get("metrics") or {}).get("vol20"), sz.get("spread"))
+        m = min(be, sz.get("capacity") or 0.0)
+        if m >= 1000:                                             # a name that can't hold $1K adds nothing
+            tot += m
+            used += 1
     return {"names": used, "deployable": tot, "avg_move_top10": avg_move_10, "avg_move_top1": avg_move,
             "top_capacity": ((top or {}).get("size") or {}).get("capacity"),
             "top_breakeven": ((top or {}).get("size") or {}).get("breakeven")}

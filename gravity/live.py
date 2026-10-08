@@ -48,6 +48,28 @@ def _log_spreads(rows: Dict[str, dict]) -> None:
 log = logging.getLogger(__name__)
 
 
+def recent_spreads(days: int = 5, min_quotes: int = 3) -> Dict[str, float]:
+    """Median real bid/ask spread per symbol over the last ``days`` logged
+    sessions (regular-hours quotes recorded by this job), for symbols with at
+    least ``min_quotes`` quotes. Used by the cost model in place of the estimate."""
+    import statistics
+    files = sorted(SPREAD_LOG.glob("*.jsonl"))[-days:] if SPREAD_LOG.exists() else []
+    acc: Dict[str, list] = {}
+    for fp in files:
+        try:
+            for line in fp.read_text().splitlines():
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                v = r.get("spread")
+                if isinstance(v, (int, float)) and 0 < v < 0.5 and r.get("symbol"):
+                    acc.setdefault(r["symbol"], []).append(float(v))
+        except OSError:
+            continue
+    return {s: statistics.median(v) for s, v in acc.items() if len(v) >= min_quotes}
+
+
 def _row(sym: str, q: Optional[dict], session: Optional[str] = None) -> Optional[dict]:
     """open→now for ``sym`` — only from a quote of THIS session's regular
     hours (a halted name's chart can still show yesterday's session)."""
@@ -98,6 +120,7 @@ def snapshot(today: dict) -> Optional[dict]:
         "top": top_row,
         "board": board,
         "board_mean_oc_now": sum(oc) / len(oc) if oc else None,
+        "unquoted": [p["symbol"] for p in today.get("board", []) if not rows.get(p["symbol"])],
         "note": "Live and unofficial — the official grade uses completed daily bars after the close.",
     }
 

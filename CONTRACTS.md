@@ -221,7 +221,7 @@ Bearish tags: `offering`, `priced`, `dilution`, `reverse_split`,
 
 ```python
 FEATURES: list[str]          # exact model input columns, stable order
-M1_EXTRA: list[str]          # ["gap_open"] — only known at/after the open (live proxy = pre-market price)
+M1_EXTRA: list[str]          # ["gap_open"] (+ EXT_EXTRA / ON_FEATURES per config.MORNING_SET) — morning-only inputs
 LABELS: list[str]            # y_oc, y_co, y_gap, y_ol, y_oh, y_c5, y_dump, y_bigdump, y_squeeze
 def build_panel(hist: dict[str, pd.DataFrame], events: dict[str, list[dict]],
                 splits: dict[str, list[dict]], static: pd.DataFrame,
@@ -238,8 +238,26 @@ of the **close of `date`** using only bars ≤ date and FilingEvents with
 - `y_dump = y_oc ≤ DUMP_THRESHOLD`, `y_bigdump = y_oc ≤ BIG_DUMP_THRESHOLD`,
   `y_squeeze = y_oh ≥ SQUEEZE_THRESHOLD`
 - labels are NaN when t+1 is missing, halted (volume 0) or has bad prints.
-- `gap_open` (M1 feature) = `y_gap` — it is known at 9:30 on t+1, so the
-  M1 model may use it; M0 may not.
+- `gap_open` (M1 feature): with `MORNING_SET = "official"` it is `y_gap`
+  (known only at 9:30 — live gets a pre-market proxy). With "honest" / "ext"
+  / "ext_on" the training panel overwrites it with the last after-hours /
+  pre-market trade before 9:00 ET of t+1, as a ratio to the SAME hourly
+  series' regular close of t (`close_h_prev`; one fetch, one split basis —
+  never compared with the daily bars, whose disagreements cluster on names
+  that reverse-split later). Usable only when the hourly series' previous
+  session IS t; NaN when nothing traded (`sources/exthours.py`, Yahoo hourly
+  bars with extended hours). The 9:05 ET run computes it the same way for its
+  shortlist (no Nasdaq fallback; runs before 9:00 ET use M0 only).
+- `EXT_SHAPE` (MORNING_SET "ext"/"ext_counts"/"ext_on"): `ext_hi`, `ext_lo`
+  (extended-hours high/low), `ext_fade` (last vs high), `ah_ret` (last
+  after-hours trade), all vs `close_h_prev`. `EXT_COUNTS` ("ext_counts" only):
+  `n_ext` / `n_pm` (hourly windows with any trade — Yahoo gives no
+  extended-hours volume; most exposed to Yahoo's same-day revisions).
+- `ON_FEATURES` (MORNING_SET "ext_on"): `on_<group>` = filings ACCEPTED in
+  [16:00 ET on t, 9:00 ET on t+1) of the forms the live EDGAR feed scans
+  (`sec.CURRENT_FORMS`), bucketed by `event_groups`; NaN for symbols with no
+  event history (`features.overnight_counts`).
+- M0 never sees any morning-only input.
 
 Row filters: close ≥ MIN_PRICE, 20-day median dollar volume ≥
 MIN_DOLLAR_VOLUME_20D, ≥ 60 prior bars. Static columns carried: `asia`,

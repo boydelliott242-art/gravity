@@ -42,26 +42,30 @@ def _write(p: Path, obj: dict) -> None:
     tmp.replace(p)
 
 
-def log_picks(today: dict) -> None:
+def log_picks(today: dict) -> Optional[bool]:
     """Record (or refresh, until graded) the picks for ``today['session_date']``.
 
     Morning runs overwrite evening runs for the same session — the morning
-    list is the one made with pre-market information. A graded file is
-    frozen."""
+    list is the one made with pre-market information — never the reverse. A
+    graded file is frozen. Returns True when written, False when refused
+    (after the bell / graded / morning already on record), None when not applicable."""
     session = today.get("session_date")
     if not session or today.get("sample") or today.get("late"):
-        return
+        return None
     # Hard rule: a pick only counts if it was on record before that
     # session's 9:30 ET opening bell.
     open_bell = datetime.combine(date.fromisoformat(session), dtime(9, 30), tzinfo=ET)
     if now_et() >= open_bell:
         log.info("not logging picks for %s — the session has already opened", session)
-        return
+        return False
     p = _path(session)
     prev = _read(p) if p.exists() else None
     if prev and prev.get("outcome"):
         log.info("pick log %s already graded — leaving it frozen", session)
-        return
+        return False
+    if prev and prev.get("run") == "morning" and today.get("run") == "evening" and not prev.get("unverified"):
+        log.info("pick log %s already has the morning list — an evening build does not replace it", session)
+        return False
     top = today.get("top") or {}
     rec = {
         "session_date": session,
@@ -78,6 +82,7 @@ def log_picks(today: dict) -> None:
         "outcome": None,
     }
     _write(p, rec)
+    return True
 
 
 def _bar(hist: Dict[str, pd.DataFrame], sym: str, day: pd.Timestamp) -> Optional[pd.Series]:
@@ -105,6 +110,22 @@ def _fresh_through(hist: Dict[str, pd.DataFrame], sym: str, day: pd.Timestamp) -
     return df is not None and len(df) > 0 and df.index.max() >= day and not df.attrs.get("stale", False)
 
 
+def ungraded_symbols() -> List[str]:
+    """#1 and board symbols of every ungraded pick log (to load their bars
+    even if they have dropped out of the scoring universe)."""
+    out: List[str] = []
+    for p in sorted(config.PICK_LOG.glob("*.json")):
+        rec = _read(p)
+        if not rec or rec.get("outcome"):
+            continue
+        top = (rec.get("top") or {}).get("symbol")
+        out += ([top] if top else []) + [b.get("symbol") for b in rec.get("board", []) if b.get("symbol")]
+    return sorted(set(out))
+
+
+GIVE_UP_SESSIONS = 3   # sessions after which a #1 with no bar is recorded as "no data" instead of waiting
+
+
 def grade(hist: Dict[str, pd.DataFrame], eligible: List[str]) -> int:
     """Grade every ungraded pick log whose session has complete data.
 
@@ -127,9 +148,19 @@ def grade(hist: Dict[str, pd.DataFrame], eligible: List[str]) -> int:
             log.info("grade %s deferred: %d bars vs %d the session before", rec["session_date"], len(uni), n_prev)
             continue
         top_sym = (rec.get("top") or {}).get("symbol")
+        give_up = False
         if top_sym and _bar(hist, top_sym, day) is None and not _fresh_through(hist, top_sym, day):
-            log.info("grade %s deferred: no fresh data for the #1 (%s) yet", rec["session_date"], top_sym)
-            continue
+            from .util import next_trading_day
+            later = sum(1 for s in eligible[:200] if hist.get(s) is not None and (hist[s].index > day).any())
+            sessions_since, d_ = 0, day.date()
+            while sessions_since < 10 and (d_ := next_trading_day(d_)) <= now_et().date():
+                sessions_since += 1
+            # only give up when there is NO frame at all for the #1 (after an explicit load attempt);
+            # a frame that exists but is stale means "not refreshed yet", never "vanished"
+            if sessions_since < GIVE_UP_SESSIONS or later == 0 or hist.get(top_sym) is not None:
+                log.info("grade %s deferred: no fresh data for the #1 (%s) yet", rec["session_date"], top_sym)
+                continue
+            give_up = True       # the market has moved on; the #1 never got a bar → record it, don't hide it
         u_oc = np.array([x["oc"] for x in uni])
         out = {
             "graded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -145,6 +176,9 @@ def grade(hist: Dict[str, pd.DataFrame], eligible: List[str]) -> int:
                 t["dump"] = t["oc"] <= config.DUMP_THRESHOLD
                 t["squeezed"] = t["oh"] >= config.SQUEEZE_THRESHOLD
                 out["top"] = t
+            elif give_up:
+                out["top"] = {"missing": True, "halted": False,
+                              "note": f"no price data for {top['symbol']} {GIVE_UP_SESSIONS}+ sessions later (delisted, renamed or under $0.10?)"}
             else:
                 out["top"] = {"missing": True, "halted": True, "note": "no regular-session bar (halted or no trades)"}
         b_oc = []

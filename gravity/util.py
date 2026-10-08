@@ -28,6 +28,14 @@ _HOLIDAYS = {
     "2028-09-04", "2028-11-23", "2028-12-25",
 }
 HOLIDAYS_THROUGH = 2028
+# NYSE early closes (13:00 ET): day after Thanksgiving, Christmas Eve, the day before July 4.
+_EARLY_CLOSE = {"2024-07-03", "2024-11-29", "2024-12-24", "2025-07-03", "2025-11-28", "2025-12-24",
+                "2026-11-27", "2026-12-24", "2027-11-26", "2028-07-03", "2028-11-24"}
+
+
+def session_close(d: date) -> time:
+    """Regular-session close for ``d`` (13:00 ET on early-close days)."""
+    return time(13, 0) if d.isoformat() in _EARLY_CLOSE else time(16, 0)
 
 
 def holidays_covered(year: int) -> bool:
@@ -62,7 +70,7 @@ def target_session(at: Optional[datetime] = None) -> date:
     close on a trading day, else the next trading day."""
     at = (at or now_et()).astimezone(ET)
     d = at.date()
-    if is_trading_day(d) and at.time() < time(16, 0):
+    if is_trading_day(d) and at.time() < session_close(d):
         return d
     return next_trading_day(d)
 
@@ -75,9 +83,10 @@ def market_phase(at: Optional[datetime] = None) -> str:
     t = at.time()
     if time(4, 0) <= t < time(9, 30):
         return "pre-market"
-    if time(9, 30) <= t < time(16, 0):
+    close = session_close(at.date())
+    if time(9, 30) <= t < close:
         return "open"
-    if time(16, 0) <= t < time(20, 0):
+    if close <= t < time(20, 0):
         return "after-hours"
     return "closed"
 

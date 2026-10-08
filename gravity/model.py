@@ -106,6 +106,19 @@ TARGET_TEXT = {
               f"[{OC_CLIP[0]:+.0%}, {OC_CLIP[1]:+.0%}]",
 }
 
+from . import features as _features_mod
+_M1_CAVEAT = (
+    "M1 uses the real 9:30 open in the backtest; live it uses a pre-market price as a proxy for the "
+    "open, which can differ materially. Treat M1 live numbers as less reliable than its backtest."
+    if _features_mod.MORNING_SET == "official" else
+    "M1 is trained and tested on what the morning run actually knows at ~9:00 ET: the last after-hours / "
+    "pre-market trade (Yahoo hourly bars), not the 9:30 open"
+    + (", plus the shape of extended-hours trading (high, low, fade, after-hours move)" if _features_mod.MORNING_SET in ("ext", "ext_counts", "ext_on") else "")
+    + (" and filings accepted overnight" if _features_mod.MORNING_SET == "ext_on" else "")
+    + ". Live, those inputs come from same-day hourly bars, which Yahoo sometimes revises slightly later; the "
+    "morning run records what it saw to measure that. Yahoo serves hourly history only for ~2 years, so older rows "
+    "have no extended-hours inputs."
+)
 CAVEATS: List[str] = [
     "Point-in-time universe: training and this backtest use every listed common stock, keeping a row "
     "only while that company was ≤ $2B at the time — that day's traded price × the share count on its "
@@ -130,8 +143,7 @@ CAVEATS: List[str] = [
     "dropped. A short trapped in a halt is exactly the worst case, and it is not in these numbers.",
     "Uncapped risk: a short can lose more than 100% in one session (the data contains open→close "
     "moves above +1,000%). Daily P&L is summed at 1x notional per day, not compounded, with no stop.",
-    "M1 uses the real 9:30 open in the backtest; live it uses a pre-market price as a proxy for the "
-    "open, which can differ materially. Treat M1 live numbers as less reliable than its backtest.",
+    _M1_CAVEAT,
     "Historical filing features are form/item based (no text matching); names without SEC history "
     "get blank filing features. Live text-matched catalysts are an overlay the model never trained on.",
     "Probabilities are calibrated on the most recent held-out quarter; they drift when the market "
@@ -739,6 +751,13 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
     unknown = [c for c in f1 if c not in FEATURE_DOCS]
     if unknown:
         raise ValueError(f"unknown feature columns: {unknown[:10]}")
+    # morning-only extras (extended-hours shape, overnight filings) come from
+    # sources outside the panel builder; if they are absent, M1 trains on NaN
+    # for them (the model treats NaN as "not traded / unknown") rather than failing
+    extra_absent = [c for c in M1_EXTRA if c != "gap_open" and c not in panel.columns]
+    if extra_absent:
+        log.warning("train: morning inputs %s absent from the panel — NaN in this fit", extra_absent)
+        panel = panel.assign(**{c: np.nan for c in extra_absent})
     need = ["date", "symbol"] + [c for c in f1 if c not in FINRA_FEATURES] + ["y_oc", "y_dump", "y_bigdump", "y_squeeze"]
     missing = [c for c in need if c not in panel.columns]
     if missing:
@@ -970,6 +989,7 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
         "caveats": CAVEATS,
         "params": {"hgb": s["hgb"], "max_fit_rows": s["max_fit_rows"], "cost": COST, "oc_clip": list(OC_CLIP)},
         "features": {"m0": f0, "m1": f1},
+        "morning_set": _features_mod.MORNING_SET,
         "sklearn_version": sklearn.__version__,
         "timing": {"walk_forward_s": round(wf_s, 1), "final_fit_s": round(fin_s, 1),
                    "importance_s": round(imp_s, 1), "total_s": round(time.time() - t_all, 1)},
@@ -1057,7 +1077,9 @@ def _model_masks(bundle: Dict[str, Any], rows: pd.DataFrame, use_open: bool):
     f1 = list(bundle.get("m1_features") or (f0 + list(M1_EXTRA)))
     X = _matrix(rows, f1)
     use1 = np.zeros(len(rows), dtype=bool)
-    if use_open and "gap_open" in rows.columns and "gap_open" in f1:
+    if use_open and "m1_ok" in rows.columns:          # the morning run chose the M1 rows itself
+        use1 = rows["m1_ok"].fillna(False).to_numpy(bool)
+    elif use_open and "gap_open" in rows.columns and "gap_open" in f1:
         use1 = np.isfinite(X[:, f1.index("gap_open")])
     return f0, f1, X, use1
 

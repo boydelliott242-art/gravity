@@ -42,7 +42,7 @@ import math
 import pickle
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
@@ -903,7 +903,7 @@ def benchmark_history(period: str = config.HISTORY_PERIOD) -> pd.DataFrame:
     # Yahoo sometimes publishes the latest IWM bar without a close (it is then
     # dropped). Market features for that session would go blank in live
     # scoring, so fill any missing completed session from Nasdaq.
-    now = now_et()
+    now = _now()
     last_done = now.date() if (is_trading_day(now.date()) and now.time() >= dtime(16, 15)) else prev_trading_day(now.date())
     have = df.index.max().date() if len(df) else None
     if have is None or have < last_done:
@@ -951,7 +951,7 @@ def _benchmark_close_bar(day: date) -> Optional[pd.DataFrame]:
             continue
         vol = num(blk.get("volume"))
         return pd.DataFrame({"open": [close], "high": [close], "low": [close], "close": [close],
-                             "volume": [vol if vol is not None else float("nan")]},
+                             "volume": [vol if vol is not None else 0.0]},       # contract: volume ≥ 0 (0 = unknown here)
                             index=pd.DatetimeIndex([pd.Timestamp(day)]))
     return None
 
@@ -1143,7 +1143,7 @@ def _yahoo_premarket(symbol: str, now: datetime) -> Tuple[Optional[Dict[str, Any
     }, False
 
 
-def premarket_snapshot(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+def premarket_snapshot(symbols: List[str], deadline_s: float = 240.0) -> Dict[str, Dict[str, Any]]:
     """Latest extended-hours price for each symbol (shortlist only, ≤ ~150).
 
     → ``{symbol: {"price", "prev_close", "gap_pct" (fraction vs the previous
@@ -1164,8 +1164,12 @@ def premarket_snapshot(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
     if not syms:
         net.record_status(NASDAQ_STATUS, True, "no symbols requested")
         return out
-    with ThreadPoolExecutor(max_workers=PREMARKET_WORKERS) as ex:
-        payloads = list(ex.map(lambda s: (s, _nasdaq_quote(s)), syms))
+    t_start = time.time()
+    ex = ThreadPoolExecutor(max_workers=PREMARKET_WORKERS)
+    futs = {ex.submit(_nasdaq_quote, s): s for s in syms}
+    done, _late = wait(list(futs), timeout=max(1.0, deadline_s))
+    payloads = [(futs[f], f.result() if f in done and not f.exception() else None) for f in futs]
+    ex.shutdown(wait=False, cancel_futures=True)
     failed, n_ok, statuses = [], 0, set()
     for s, payload in payloads:
         if payload is None or not isinstance(payload, dict) or not payload.get("data"):
@@ -1179,6 +1183,9 @@ def premarket_snapshot(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
     n_nasdaq = len(out)
     n_yahoo = 0
     for s in failed:
+        if time.time() - t_start > deadline_s:
+            log.warning("premarket: deadline reached — %d Yahoo fallbacks skipped", len(failed))
+            break
         snap, limited = _yahoo_premarket(s, now)
         if limited:
             log.warning("premarket: Yahoo rate-limited; skipping remaining fallbacks")

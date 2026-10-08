@@ -1277,3 +1277,10 @@ details.rec-block > summary::-webkit-details-marker { display: none; }
 details.rec-block > summary::after { content: " +"; color: var(--fg-3); }
 details.rec-block[open] > summary::after { content: " −"; }
 .mtable tr.hot th, .mtable tr.hot td { color: var(--fg); background: var(--bg-1); }
+
+/* Spread-it planner */
+.plan-ctl { display: flex; flex-wrap: wrap; gap: var(--s3); margin: 0 0 var(--s3); }
+.plan-ctl label { display: inline-flex; align-items: center; gap: var(--s1); font-size: 12px; color: var(--fg-3); }
+.plan-ctl select { background: var(--bg-2); border: 1px solid var(--line-2); border-radius: 2px; padding: 6px var(--s1); font: 500 12px/1.2 var(--sans); color: var(--fg); }
+#planner .tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+@media (max-width: 640px) { #planner .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }

@@ -23,8 +23,19 @@ def _rfc822(iso: str) -> str:
     return format_datetime(d)
 
 
+def _base_rate() -> float:
+    """Model base rate of a 5%+ open→close drop (so every title carries it)."""
+    try:
+        m = json.loads((config.SITE_DATA / "model.json").read_text())
+        b = float((m.get("base_rate") or {}).get("dump"))
+        return b if 0 < b < 1 else float("nan")
+    except (OSError, ValueError, TypeError):
+        return float("nan")
+
+
 def build(limit: int = 40) -> str:
     items: List[str] = []
+    base = _base_rate()
     for f in sorted(config.PICK_LOG.glob("*.json"), reverse=True)[:limit]:
         try:
             rec = json.loads(f.read_text())
@@ -37,6 +48,8 @@ def build(limit: int = 40) -> str:
         p = top.get("prob_dump")
         label = "pre-market #1" if rec.get("run") == "morning" else "watchlist #1 (evening before)"
         title = f"{rec['session_date']} · {label}: {sym}" + (f" — {p * 100:.0f}% odds of a 5%+ open→close drop" if p else "")
+        if p and base == base:
+            title += f" (base {base * 100:.0f}%, {p / base:.1f}×)"
         out = (rec.get("outcome") or {}).get("top") or {}
         if out.get("missing"):
             result = "Result: halted / no regular-session trades."

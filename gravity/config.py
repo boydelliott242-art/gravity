@@ -34,6 +34,12 @@ MAX_MARKET_CAP = 2_000_000_000       # small + micro + nano caps (point-in-time 
 TRAIN_MAX_CAP = float("inf")         # training loads every listed name, then keeps a row only
                                      # while that name was ≤ MAX_MARKET_CAP at the time
 MIN_DOLLAR_VOLUME_20D = 50_000       # median daily $ volume to be tradeable at all
+# Morning-model inputs (see features.M1_EXTRA): "official" | "honest" | "ext" | "ext_counts" | "ext_on"
+# "ext" won the leak-free pre-registered comparison (data/research/r9_selection_rule.txt, r9c.json)
+MORNING_SET = "ext"
+# Which shortlist names the morning model scores: "shortlist" (all — it was trained
+# with "no extended-hours trade" rows) or "traded" (only names with an extended-hours price)
+MORNING_SCOPE = "shortlist"
 HISTORY_PERIOD = "3y"                # daily bars kept per symbol
 
 # ── Outcome definitions (used by labels, evidence, scorecard) ────────────

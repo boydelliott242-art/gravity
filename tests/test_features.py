@@ -85,11 +85,12 @@ def assert_features_equal(a: pd.DataFrame, b: pd.DataFrame, cols: List[str] = FE
 # ── contract shape ───────────────────────────────────────────────────────
 def test_column_contract():
     assert len(FEAT) == len(set(FEAT)) == 75 + (len(F.FINRA_FEATURES) if F.USE_FINRA else 0)
-    assert F.M1_EXTRA == ["gap_open"]
+    assert F.M1_EXTRA[0] == "gap_open" and set(F.M1_EXTRA) <= {"gap_open"} | set(F.EXT_EXTRA) | set(F.ON_FEATURES)
+    assert not (set(F.EXT_EXTRA) | set(F.ON_FEATURES)) & set(FEAT)   # evening model never sees morning-only inputs
     assert F.LABELS == ["y_oc", "y_co", "y_gap", "y_ol", "y_oh", "y_c5", "y_dump", "y_bigdump", "y_squeeze",
                         "y_swing", "y_pump", "y_h5"]
     assert F.PANEL_FEATURES[:len(FEAT)] == FEAT and set(F.FINRA_FEATURES) <= set(F.PANEL_FEATURES)
-    assert set(F.FEATURE_DOCS) == set(F.PANEL_FEATURES) | set(F.M1_EXTRA)
+    assert set(F.FEATURE_DOCS) == set(F.PANEL_FEATURES) | {"gap_open"} | set(F.EXT_EXTRA) | set(F.ON_FEATURES)
     assert all(F.FEATURE_DOCS[c][0] == "flow" for c in F.FINRA_FEATURES)
     assert all(fam in F.FAMILIES and desc for fam, desc in F.FEATURE_DOCS.values())
     assert "gap_open" not in FEAT  # M0 must never see the open
@@ -102,7 +103,7 @@ def test_column_contract():
     rsi = p[["rsi14", "rsi2"]].to_numpy(float)
     assert np.nanmin(rsi) >= 0 and np.nanmax(rsi) <= 100
     fams = F.feature_families()
-    assert sum(len(v) for v in fams.values()) == len(FEAT) + 1
+    assert sum(len(v) for v in fams.values()) == len(FEAT) + len(F.M1_EXTRA)
 
 
 # ── lookahead: bars ──────────────────────────────────────────────────────

@@ -1712,7 +1712,10 @@ def shares_frames(first_year: int = 2023, today: Optional[date] = None) -> List[
         for q in range(1, 5):
             if date(y, 3 * q - 2, 1) > today:
                 break
-            current = (y, (today.month - 1) // 3 + 1) == (y, q) and y == today.year
+            # a quarter's instantaneous frame keeps filling until ~45 days after it
+            # ends (10-Q/10-K cover pages): refresh daily until 75 days past quarter end
+            q_end = (date(y + 1, 1, 1) if q == 4 else date(y, 3 * q + 1, 1)) - timedelta(days=1)
+            current = today <= q_end + timedelta(days=75)
             url = FRAMES_URL.format(y=y, q=q)
             data = net.cached(NS_FRAMES, url, 20 * 3600 if current else 365 * 86400,
                               lambda u=url: _sec_json(u, missing_ok=True, timeout=60.0))

@@ -134,6 +134,15 @@ def test_log_picks_refuses_after_open(pick_log, monkeypatch):
     assert json.loads((pick_log / "2026-10-01.json").read_text())["top"]["symbol"] == "AAA"
 
 
+def test_evening_never_replaces_morning_record(pick_log, monkeypatch):
+    monkeypatch.setattr(scorecard, "now_et", lambda: datetime(2026, 10, 1, 8, 15, tzinfo=ET))
+    assert scorecard.log_picks(_today()) is True                                   # morning list on record
+    late_evening = {**_today(), "run": "evening", "top": {"symbol": "EVE"}}
+    assert scorecard.log_picks(late_evening) is False                              # launchd fired a missed evening job
+    assert json.loads((pick_log / "2026-10-01.json").read_text())["top"]["symbol"] == "AAA"
+    assert scorecard.log_picks({**_today(), "top": {"symbol": "MOR2"}}) is True    # a later morning run may refresh
+
+
 def test_grade_and_freeze(pick_log, monkeypatch):
     monkeypatch.setattr(scorecard, "now_et", lambda: datetime(2026, 10, 1, 8, 0, tzinfo=ET))
     scorecard.log_picks(_today())
@@ -187,6 +196,7 @@ def test_pit_market_cap_uses_shares_as_reported_then():
         "date": pd.to_datetime(["2025-01-10", "2025-07-10", "2026-03-10", "2025-05-01", "2025-07-01", "2025-05-01"]),
         "price": [2.0, 1.0, 0.5, 0.10, 2.00, 4.0],
     })
+    panel["close"] = panel["price"]                  # no splits for these rows except RS (unused by the SEC branch)
     frames = [
         {"cik": 1, "end": "2024-12-31", "shares": 10e6},      # diluter: 10M → 1B shares
         {"cik": 1, "end": "2026-01-31", "shares": 1e9},
@@ -202,3 +212,41 @@ def test_pit_market_cap_uses_shares_as_reported_then():
     assert cap.iloc[3] == pytest.approx(0.10 * 400e6)    # before the reverse split
     assert cap.iloc[4] == pytest.approx(2.00 * 20e6)     # after it: 400M × 0.05 = 20M shares
     assert cap.iloc[5] == pytest.approx(4.0 * 1e6)       # no SEC data → today's share count
+
+
+def test_pit_market_cap_adr_and_fallback_split_basis():
+    from gravity.cli import _pit_market_cap
+    panel = pd.DataFrame({
+        "symbol": ["ADR", "ADR", "NS", "NS"],
+        "date": pd.to_datetime(["2025-03-03", "2026-03-02", "2025-03-03", "2026-03-02"]),
+        "price": [0.50, 0.40, 6.60, 9.00],            # as traded
+        "close": [0.50, 0.40, 132.0, 9.00],           # split-adjusted to today's basis (NS: 1:20 reverse split in 2025-06)
+    })
+    frames = [{"cik": 7, "end": "2024-12-31", "shares": 5e9},   # ORDINARY shares; 1 ADS = 500 ordinary
+              {"cik": 7, "end": "2025-12-31", "shares": 6e9}]
+    cmap = {"ADR": {"cik": 7}}
+    shares_today = pd.Series({"ADR": 12e6, "NS": 30e6})          # Nasdaq: ADS count / post-split count
+    cap = _pit_market_cap(panel, frames, cmap, {"NS": [{"date": "2025-06-02", "ratio": 0.05}]}, shares_today)
+    assert cap.iloc[0] == pytest.approx(0.50 * 5e9 * (12e6 / 6e9))   # ≈ $5M, not $2.5B
+    assert cap.iloc[1] == pytest.approx(0.40 * 12e6)
+    assert panel.attrs["pit_adr_rescaled"] == 1
+    assert cap.iloc[2] == pytest.approx(132.0 * 30e6)                 # $3.96B before the reverse split — not $198M
+    assert cap.iloc[3] == pytest.approx(9.00 * 30e6)
+
+
+def test_grade_records_a_vanished_pick_instead_of_waiting_forever(pick_log, monkeypatch):
+    monkeypatch.setattr(scorecard, "now_et", lambda: datetime(2026, 10, 1, 8, 0, tzinfo=ET))
+    scorecard.log_picks(_today())
+    day, later = pd.Timestamp("2026-10-01"), pd.Timestamp("2026-10-07")
+    def bars(c):
+        return pd.DataFrame({"open": [1.0, 1.0], "high": [1.1, 1.1], "low": [0.9, 0.9], "close": [c, 1.0],
+                             "volume": [1e5, 1e5]}, index=[day, later])
+    hist = {f"U{i}": bars(1.02 if i % 2 else 0.94) for i in range(250)}     # AAA (the #1) has no data at all
+    uni = list(hist)
+    monkeypatch.setattr(scorecard, "now_et", lambda: datetime(2026, 10, 2, 18, 0, tzinfo=ET))
+    assert scorecard.grade(hist, uni) == 0                                   # 1 session later: still waits
+    monkeypatch.setattr(scorecard, "now_et", lambda: datetime(2026, 10, 7, 18, 0, tzinfo=ET))
+    assert scorecard.grade(hist, uni) == 1                                   # market moved on → recorded, not hidden
+    top = json.loads((pick_log / "2026-10-01.json").read_text())["outcome"]["top"]
+    assert top["missing"] is True and "no price data" in top["note"]
+    assert scorecard.ungraded_symbols() == []

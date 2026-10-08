@@ -78,8 +78,25 @@ if USE_FINRA:
 # Every feature column the panel carries (FEATURES first, stable order).
 PANEL_FEATURES: List[str] = FEATURES + [c for c in FINRA_FEATURES if c not in FEATURES]
 
-# Only known at/after the 9:30 open of t+1 (live proxy = pre-market price).
-M1_EXTRA: List[str] = ["gap_open"]
+# Morning model (M1) inputs beyond FEATURES. config.MORNING_SET picks them:
+#   "official" — gap_open = the official 9:30 opening gap in training (live it is
+#                fed the ~9:00 ET extended-hours price: a train/serve mismatch)
+#   "honest"   — gap_open = the last extended-hours trade before 9:00 ET, in
+#                training AND live (sources/exthours.py)
+#   "ext"      — honest + the shape of extended-hours trading (high/low/fade/after-hours move)
+#   "ext_counts" — ext + how many hourly windows had trades (more exposed to Yahoo's
+#                same-day revisions; the leak-free research run R9c found no gain from it)
+#   "ext_on"   — ext + filings accepted between the 16:00 close and 9:00 ET
+EXT_EXTRA: List[str] = ["ext_hi", "ext_lo", "ext_fade", "n_ext", "n_pm", "ah_ret"]   # every documented extended-hours input
+EXT_SHAPE: List[str] = ["ext_hi", "ext_lo", "ext_fade", "ah_ret"]
+EXT_COUNTS: List[str] = ["n_ext", "n_pm"]
+ON_GROUPS: List[str] = ["filings", "offer", "reg", "effect", "unreg", "delist", "finance", "current", "f144", "late"]
+ON_FEATURES: List[str] = [f"on_{g}" for g in ON_GROUPS]
+MORNING_SET = str(getattr(config, "MORNING_SET", "official"))
+M1_EXTRA: List[str] = (["gap_open"]
+                       + (EXT_SHAPE if MORNING_SET in ("ext", "ext_counts", "ext_on") else [])
+                       + (EXT_COUNTS if MORNING_SET == "ext_counts" else [])
+                       + (ON_FEATURES if MORNING_SET == "ext_on" else []))
 
 LABELS: List[str] = ["y_oc", "y_co", "y_gap", "y_ol", "y_oh", "y_c5", "y_dump", "y_bigdump", "y_squeeze",
                      "y_swing", "y_pump", "y_h5"]
@@ -174,7 +191,24 @@ FEATURE_DOCS: Dict[str, Tuple[str, str]] = {
     "breadth_ma50": ("market", "Share of eligible small caps above their 50-session average."),
     "univ_r1_med": ("market", "Median return of eligible small caps today."),
     "spike_share": ("market", "Share of eligible small caps up 20%+ today (speculative froth)."),
-    "gap_open": ("exhaustion", "Next session's opening gap versus today's close (known at 9:30; live proxy = pre-market price)."),
+    "gap_open": ("exhaustion", "Morning gap versus today's close: the last after-hours / pre-market trade before 9:00 ET "
+                               "(with MORNING_SET \"official\", the 9:30 opening gap in training)."),
+    "ext_hi": ("exhaustion", "Highest after-hours / pre-market trade before 9:00 ET versus today's close."),
+    "ext_lo": ("exhaustion", "Lowest after-hours / pre-market trade before 9:00 ET versus today's close."),
+    "ext_fade": ("exhaustion", "Last extended-hours trade versus the extended-hours high (how much of an overnight spike faded)."),
+    "n_ext": ("flow", "Hourly windows with any trade between the 16:00 close and 9:00 ET (0–9): overnight activity."),
+    "n_pm": ("flow", "Hourly windows with any pre-market trade 4:00–9:00 ET (0–5)."),
+    "ah_ret": ("exhaustion", "Last after-hours trade (16:00–20:00) versus today's close."),
+    "on_filings": ("structure", "SEC filings accepted between the 16:00 close and 9:00 ET (forms the live feed scans)."),
+    "on_offer": ("dilution", "Offering prospectuses (424B*) accepted overnight."),
+    "on_reg": ("dilution", "Registration statements (S-1/F-1/S-3/F-3) accepted overnight."),
+    "on_effect": ("dilution", "SEC notices of effectiveness accepted overnight."),
+    "on_unreg": ("dilution", "8-K item 3.02 (unregistered share sales) accepted overnight."),
+    "on_delist": ("structure", "8-K item 3.01 (listing deficiency / delisting notice) accepted overnight."),
+    "on_finance": ("dilution", "8-K item 1.01 (material agreement — financings, equity lines) accepted overnight."),
+    "on_current": ("structure", "8-K / 6-K current reports accepted overnight."),
+    "on_f144": ("dilution", "Form 144 (insider sale notices) accepted overnight."),
+    "on_late": ("structure", "Late-filing notices (NT 10-K/10-Q/20-F) accepted overnight."),
     "sv_ratio_1": ("flow", "Share of today's FINRA-reported (off-exchange) volume that was sold short (FINRA Reg SHO)."),
     "sv_ratio_5": ("flow", "FINRA short-volume share over the last 5 sessions (total short ÷ total reported)."),
     "sv_ratio_20": ("flow", "FINRA short-volume share over the last 20 sessions (total short ÷ total reported)."),
@@ -182,7 +216,7 @@ FEATURE_DOCS: Dict[str, Tuple[str, str]] = {
     "finra_share": ("flow", "FINRA-reported (off-exchange) volume as a share of today's consolidated volume."),
 }
 
-assert set(FEATURE_DOCS) == set(PANEL_FEATURES) | set(M1_EXTRA), "FEATURE_DOCS out of sync"
+assert set(FEATURE_DOCS) == set(PANEL_FEATURES) | {"gap_open"} | set(EXT_EXTRA) | set(ON_FEATURES), "FEATURE_DOCS out of sync"
 assert all(f in FAMILIES for f, _ in FEATURE_DOCS.values())
 assert len(set(FEATURES)) == len(FEATURES)
 assert len(set(PANEL_FEATURES)) == len(PANEL_FEATURES)
@@ -912,6 +946,9 @@ def build_panel(
         if k in f:
             out[k] = f[k][sel]
     out["gap_open"] = lab["y_gap"][sel]
+    for k in M1_EXTRA:
+        if k not in out:
+            out[k] = np.full(len(sel), np.nan)
     for k in LABELS:
         out[k] = lab[k][sel]
     panel = pd.DataFrame(out)
@@ -985,3 +1022,80 @@ def feature_families() -> Dict[str, List[str]]:
     for name in FEATURES + M1_EXTRA:
         fam[FEATURE_DOCS[name][0]].append(name)
     return fam
+
+
+# ── Overnight filings (what the morning run knows that the evening panel doesn't) ──
+# Filings ACCEPTED between the 16:00 ET close of t and 9:00 ET of the next
+# session, counted by the same buckets as ``event_groups`` and restricted to
+# the forms the live EDGAR feed scans (``sec.CURRENT_FORMS``), so training and
+# the 9:05 run count the same things.
+_ON_K = np.int64(10 ** 8)            # minutes since the epoch stay < 1e8 until ~2160
+
+
+def _accepted_minutes(e: dict) -> Optional[int]:
+    raw = e.get("accepted")
+    if not raw:
+        return None
+    try:
+        ts = pd.Timestamp(raw)
+    except (ValueError, TypeError):
+        return None
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("America/New_York")
+    return int(ts.tz_convert("UTC").value // 60_000_000_000)
+
+
+def next_session_dates(dates) -> np.ndarray:
+    """For each date, the next date in the same set of dates (NaT for the last)."""
+    d = pd.to_datetime(pd.Series(dates)).to_numpy("datetime64[ns]")
+    cal = np.unique(d)
+    pos = np.searchsorted(cal, d, side="right")
+    out = np.full(len(d), np.datetime64("NaT"), dtype="datetime64[ns]")
+    ok = pos < len(cal)
+    out[ok] = cal[pos[ok]]
+    return out
+
+
+def overnight_counts(symbols, t_dates, next_dates, events: Dict[str, List[dict]],
+                     forms: Optional[Set[str]] = None) -> Dict[str, np.ndarray]:
+    """``on_<group>`` counts per row: filings accepted in [t 16:00 ET, next 09:00 ET).
+    Rows whose symbol has no event history at all get NaN (unknown, not zero)."""
+    if forms is None:
+        from .sources.sec import CURRENT_FORMS as forms  # noqa: N811
+    syms = np.asarray(symbols, dtype=object)
+    codes = {s: i for i, s in enumerate(sorted(set(syms.tolist())))}
+    keys: Dict[str, List[int]] = {g: [] for g in ON_GROUPS}
+    seen = set()
+    for sym, evs in (events or {}).items():
+        c = codes.get(sym)
+        if c is None:
+            continue
+        for e in evs or ():
+            form = str(e.get("form") or "").strip().upper()
+            if form not in forms:
+                continue
+            acc = e.get("accession")
+            if acc and (sym, acc) in seen:
+                continue
+            if acc:
+                seen.add((sym, acc))
+            mins = _accepted_minutes(e)
+            if mins is None:
+                continue
+            for g in event_groups(e):
+                if g in keys:
+                    keys[g].append(c * int(_ON_K) + mins)
+    rc = np.array([codes[s] for s in syms], dtype=np.int64)
+    t0 = pd.DatetimeIndex(pd.to_datetime(t_dates)).tz_localize("America/New_York") + pd.Timedelta(hours=16)
+    nd = pd.DatetimeIndex(pd.to_datetime(next_dates))
+    t1 = nd.tz_localize("America/New_York") + pd.Timedelta(hours=9)
+    m0 = (t0.tz_convert("UTC").asi8 // 60_000_000_000).astype(np.int64)
+    m1 = np.where(nd.isna(), m0, t1.tz_convert("UTC").asi8 // 60_000_000_000).astype(np.int64)
+    has = np.array([s in (events or {}) for s in syms], dtype=bool)
+    out: Dict[str, np.ndarray] = {}
+    for g in ON_GROUPS:
+        ek = np.sort(np.asarray(keys[g], dtype=np.int64))
+        lo = np.searchsorted(ek, rc * _ON_K + m0, side="left")
+        hi = np.searchsorted(ek, rc * _ON_K + m1, side="left")
+        out[f"on_{g}"] = np.where(has, (hi - lo).astype(float), np.nan)
+    return out

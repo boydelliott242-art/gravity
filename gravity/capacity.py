@@ -73,18 +73,22 @@ def spread_cap(dv20) -> float:
     """Upper bound on the assumed spread by liquidity tier. The close-high-low
     estimator confuses volatility with spread on very volatile names (it reads
     ~5% for hot stocks trading $5M+/day), so it is only trusted inside
-    [tick, cap]."""
+    [tick, cap]. Real quotes logged by the live job (data/spreads, from
+    2026-10-07) show names under $250K/day quoting 4–9% wide, hence the 6% tier."""
     try:
         v = float(dv20)
     except (TypeError, ValueError):
-        return 0.03
-    return 0.03 if not v >= 1e6 else (0.02 if v < 5e6 else 0.01)
+        return 0.06
+    if not v >= 2.5e5:
+        return 0.06
+    return 0.03 if v < 1e6 else (0.02 if v < 5e6 else 0.01)
 
 
 def spread_used(estimate, price, dv20) -> float:
     """The spread the cost model assumes: the estimate clipped to
-    [one tick, liquidity cap]; the midpoint of that band when the estimator
-    can't read a spread."""
+    [one tick, liquidity cap]; the cap itself (conservative) when the
+    estimator can't read a spread — it reads ~0 exactly on the most volatile
+    names, whose real spreads are wide."""
     lo, hi = tick_floor(price), spread_cap(dv20)
     hi = max(hi, lo)
     try:
@@ -92,7 +96,7 @@ def spread_used(estimate, price, dv20) -> float:
     except (TypeError, ValueError):
         e = float("nan")
     if not (e >= 0.001):
-        return (lo + hi) / 2
+        return hi
     return min(max(e, lo), hi)
 
 
@@ -103,7 +107,8 @@ def fallback_spread(price) -> float:  # kept for callers without volume data
 def round_trip_cost(q, dvx, sigma, spread, hold_days: int = 0, borrow_fee_pct: Optional[float] = None):
     """Impact on both legs + one full spread + borrow for ``hold_days``
     trading days (IBKR annual % fee; intraday round trips pay no borrow).
-    The spread is never capped from above — a cost is at least its spread."""
+    ``spread`` is used as given (callers pass ``spread_used`` or a real quote);
+    only a floor of 0.1% applies."""
     spr = np.maximum(np.nan_to_num(np.asarray(spread, float), nan=0.005), 0.001)
     cost = 2 * impact(q, dvx, sigma) + spr
     if hold_days and borrow_fee_pct is not None:
@@ -162,8 +167,11 @@ def breakeven_size(avg_move: float, dvx, sigma, spread) -> float:
 SIZES = (10_000, 50_000, 100_000, 500_000, 1_000_000)
 
 
-def size_block(price, dv20, dv1, sigma, high, low, close, available, avg_move: Optional[float]) -> dict:
-    """Everything the site shows about trade size for one name."""
+def size_block(price, dv20, dv1, sigma, high, low, close, available, avg_move: Optional[float],
+               quoted: Optional[float] = None) -> dict:
+    """Everything the site shows about trade size for one name. ``quoted`` =
+    the median real bid/ask spread the live job recorded for this name
+    recently; when present it replaces the estimate (never below one tick)."""
     dvx = float(exp_dvol(dv20, dv1))
     cap_mkt = float(market_capacity(dvx, sigma))
     cap_b = borrow_capacity(available, price)
@@ -171,13 +179,17 @@ def size_block(price, dv20, dv1, sigma, high, low, close, available, avg_move: O
     est = ar_spread(high, low, close)
     estimated = est is not None and est >= 0.001
     spr = spread_used(est, price, dv20)
+    source = "estimate" if estimated else "band cap"
+    if quoted is not None and np.isfinite(quoted) and quoted > 0:
+        spr = max(float(quoted), tick_floor(price))
+        source = "quoted"
     limit = "borrow" if (cap_b is not None and cap_b < cap_mkt) else (
         "volume" if MAX_PART * dvx <= cap_mkt + 1e-9 else "impact")
     costs = {str(q): float(round_trip_cost(q, dvx, sigma, spr)) for q in SIZES}
     part = {str(q): (q / dvx if dvx > 0 else None) for q in SIZES}
     be = breakeven_size(avg_move, dvx, sigma, spr) if avg_move else None
     return {"capacity": cap, "cap_market": cap_mkt, "cap_borrow": cap_b, "limit": limit, "exp_dvol": dvx,
-            "spread": spr, "spread_estimated": estimated, "spread_raw": est,
+            "spread": spr, "spread_estimated": estimated, "spread_raw": est, "spread_source": source,
             "spread_band": [tick_floor(price), max(spread_cap(dv20), tick_floor(price))],
             "tier": tier_of(cap), "costs": costs, "participation": part,
             "breakeven": be, "avg_move": avg_move}
@@ -190,7 +202,7 @@ def spread_used_vec(estimate, price, dv20) -> np.ndarray:
     dv = np.asarray(dv20, float)
     tick = np.where(pr < 1, 0.0001, 0.01)
     lo = np.maximum(0.0005, np.where(pr > 0, tick / np.where(pr > 0, pr, 1.0), 0.001))
-    hi = np.where(dv >= 5e6, 0.01, np.where(dv >= 1e6, 0.02, 0.03))
+    hi = np.where(dv >= 5e6, 0.01, np.where(dv >= 1e6, 0.02, np.where(dv >= 2.5e5, 0.03, 0.06)))
     hi = np.maximum(hi, lo)
     ok = np.isfinite(est) & (est >= 0.001)
-    return np.where(ok, np.clip(est, lo, hi), (lo + hi) / 2)
+    return np.where(ok, np.clip(est, lo, hi), hi)
