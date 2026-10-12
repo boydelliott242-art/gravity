@@ -85,12 +85,29 @@ def _row(sym: str, q: Optional[dict], session: Optional[str] = None) -> Optional
             "asof": q.get("asof")}
 
 
+def _read_prev_live() -> dict:
+    try:
+        return json.loads((config.SITE_DATA / "live.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
 def snapshot(today: dict) -> Optional[dict]:
-    """Build live.json content from today.json's #1 + board (≤ 26 names)."""
+    """Build live.json content from today.json's #1 + board. The top 25 are
+    quoted every run (their average is the series the scorecard grades);
+    ranks 26–100 once an hour (Nasdaq rate limits), carried between hours."""
     from .sources import intel
 
     top = (today.get("top") or {}).get("symbol")
-    syms: List[str] = [p["symbol"] for p in today.get("board", [])]
+    ranked = sorted(today.get("board", []), key=lambda p: p.get("rank") or 10**6)
+    head, tail = [p["symbol"] for p in ranked[:25]], [p["symbol"] for p in ranked[25:]]
+    prev_live = _read_prev_live()
+    try:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(prev_live.get("board_ext_asof"))).total_seconds()
+    except (TypeError, ValueError):
+        age = float("inf")
+    hourly = bool(tail) and (prev_live.get("session_date") != today.get("session_date") or age > 55 * 60)
+    syms: List[str] = head + (tail if hourly else [])
     if top and top not in syms:
         syms.insert(0, top)
     if not syms:
@@ -107,7 +124,11 @@ def snapshot(today: dict) -> Optional[dict]:
     for s, r in rows.items():
         if r is not None and s in sp:
             r["spread_now"] = sp[s]["spread"]
-    board = [rows[p["symbol"]] for p in today.get("board", []) if rows.get(p["symbol"])]
+    board = [rows[s] for s in head if rows.get(s)]
+    if hourly:
+        board_ext = [rows[s] for s in tail if rows.get(s)]
+    else:   # carry the last hourly read of ranks 26–100 (same session only)
+        board_ext = prev_live.get("board_ext", []) if prev_live.get("session_date") == today.get("session_date") else []
     top_row = rows.get(top) if top else None
     if top_row is not None:
         top_row["points"] = (quotes.get(top) or {}).get("points") or []
@@ -120,7 +141,11 @@ def snapshot(today: dict) -> Optional[dict]:
         "top": top_row,
         "board": board,
         "board_mean_oc_now": sum(oc) / len(oc) if oc else None,
-        "unquoted": [p["symbol"] for p in today.get("board", []) if not rows.get(p["symbol"])],
+        "board_ext": board_ext,
+        "board_ext_mean_oc_now": (sum(b["oc_now"] for b in board_ext) / len(board_ext)) if board_ext else None,
+        "board_ext_asof": datetime.now(timezone.utc).isoformat(timespec="seconds") if hourly else
+                          (prev_live.get("board_ext_asof") if board_ext else None),
+        "unquoted": [s for s in head if not rows.get(s)],
         "note": "Live and unofficial — the official grade uses completed daily bars after the close.",
     }
 

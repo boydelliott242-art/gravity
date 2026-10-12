@@ -181,5 +181,52 @@ if r9c and r9:
         doc["morning"]["guards"] = r9e
     print("R9 (leak-free) → chosen", chosen, "(kept shape)" if keep_d else "(fell back to honest gap only)")
 
+# ── Round 10: the morning model that can actually run (07:20 CT, pre-market before 8:00 ET) ──
+r10, r10b, r10c = _load("r10.json"), _load("r10b.json"), _load("r10c.json")
+if r10 and r10b and (r10b.get("decision") or {}).get("adopt_pm_only") and r9c:
+    V10 = {**r10["variants"], **r10b["variants"]}
+    V10["B_m1_live_lf"] = r9c["variants"]["B_m1_live_lf"]
+    LAB10 = {
+        "A_m0": "Close only (evening model; the morning fallback)",
+        "B_m1_live_lf": "Old morning model as it ran live (trained on the 9:30 open, fed the pre-market price)",
+        "D2_9": "Extended-hours shape, trades before 9:00 ET (needs the 8:05 CT run)",
+        "D2_8": "Extended-hours shape, trades before 8:00 ET",
+        "D3_8": "Last pre-market trade before 8:00 ET only",
+    }
+
+    def vrow10(k):
+        g = lambda per, f: (V10[k][per]["top1"] or {}).get(f)  # noqa: E731
+        return {"key": k, "label": LAB10[k], "hit": dc(lambda per: g(per, "hit")), "mean_oc": dc(lambda per: g(per, "mean_oc")),
+                "median_oc": dc(lambda per: g(per, "median_oc")), "squeeze": dc(lambda per: g(per, "squeeze")),
+                "net10k": dc(lambda per: g(per, "net_10k")), "net50k": dc(lambda per: g(per, "net_50k")),
+                "auc": dc(lambda per: V10[k][per].get("auc_pub")), "vs_close_only": (r10b.get("paired_vs_A") or {}).get(k)}
+
+    rows10 = [vrow10(k) for k in ("A_m0", "B_m1_live_lf", "D2_9", "D2_8", "D3_8")]
+    doc.setdefault("morning", {})
+    doc["morning"].update({"rows": rows10, "chosen": "D3_8", "round": 10, "cutoff_et": "8:00",
+                           "paired": (r10b.get("paired_vs_A") or {}).get("D3_8")})
+    if r10c:
+        bk = lambda src: {f"top{k}": {per: src.get(f"{per}|top{k}|50k") for per in ("dev", "confirm")} for k in (1, 3, 5, 10)}  # noqa: E731
+        doc["basket"] = {"m1": bk(r10c["D3_8"]["baskets"]), "m0": bk(r10c["A_m0"]["baskets"])}
+    c = lambda per, f: V10["D3_8"][per]["top1"][f]  # noqa: E731
+    a = lambda per, f: V10["A_m0"][per]["top1"][f]  # noqa: E731
+    d9 = lambda per, f: V10["D2_9"][per]["top1"][f]  # noqa: E731
+    pv = (r10b.get("paired_vs_A") or {}).get("D3_8") or {}
+    ci = lambda per: (pv.get(per) or {}).get("ci90") or [None, None]  # noqa: E731
+    head = [
+        f"New: the morning #1 now adds the last PRE-MARKET trade before 8:00 ET, so it can run at 7:20 CT. In the backtest its #1 fell 5%+ "
+        f"open→close on {c('dev', 'hit')*100:.0f}% / {c('confirm', 'hit')*100:.0f}% of sessions (development / confirmation) vs "
+        f"{a('dev', 'hit')*100:.0f}% / {a('confirm', 'hit')*100:.0f}% for the close-only model, averaging {sg(c('dev', 'mean_oc'))} / {sg(c('confirm', 'mean_oc'))} "
+        f"(close-only {sg(a('dev', 'mean_oc'))} / {sg(a('confirm', 'mean_oc'))}); after each pick's estimated cost {sg(c('dev', 'net_10k'))} / {sg(c('confirm', 'net_10k'))} per trade at $10K.",
+        f"Paired day by day with the close-only model: {sg(pv.get('dev', {}).get('mean_diff'))} per trade in development (90% interval {sg(ci('dev')[0])} to {sg(ci('dev')[1])}) "
+        f"and {sg(pv.get('confirm', {}).get('mean_diff'))} in confirmation ({sg(ci('confirm')[0])} to {sg(ci('confirm')[1])}) — better in both windows, though each interval still includes zero.",
+        f"Why not the richer 9:00 ET version (which did better: {d9('confirm', 'hit')*100:.0f}% dumped, {sg(d9('confirm', 'mean_oc'))} in confirmation)? It needs the 8:05 CT run, "
+        "and on 8 and 9 October that run could not finish before the bell while the Mac slept; Yahoo also stopped serving after-hours bars (17:00–18:59 ET) on 7 October. "
+        "The pre-market-only version needs neither — and a feed check switches the morning model off (close-only scores) on any day its inputs look abnormal.",
+    ]
+    old_morning = [v for v in doc["verdict"] if v.startswith(("New: the morning #1", "Paired day by day", "After each pick's own estimated cost", "The catch:", "Skipping the morning", "An earlier version", "Covering at 10:30"))]
+    doc["verdict"] = head + [v for v in doc["verdict"] if v not in old_morning]
+    print("R10: morning model = pre-market only, 8:00 ET cutoff")
+
 (ROOT / "docs" / "data" / "size_research.json").write_text(json.dumps(doc, indent=1))
 print("written", len(json.dumps(doc)))

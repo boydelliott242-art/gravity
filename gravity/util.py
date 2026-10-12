@@ -141,3 +141,22 @@ def to_yahoo(sym: str) -> str:
 def to_canonical(sym: str) -> str:
     """Canonical symbol used everywhere in GRAVITY = Yahoo style."""
     return to_yahoo(sym.strip())
+
+
+def wait_wall(futures, deadline_s: float, poll_s: float = 1.0):
+    """``concurrent.futures.wait`` with the deadline measured on the WALL clock.
+
+    ``wait(timeout=…)`` counts monotonic time, which on macOS stops while the
+    machine sleeps: a 5-minute timeout during lid-closed "DarkWake" slices can
+    last 45 minutes of real time and push the morning run past the bell. This
+    polls in short slices and returns (done, not_done) once the wall-clock
+    deadline has passed, so the run moves on the moment the Mac wakes."""
+    import time as _t
+    from concurrent.futures import FIRST_COMPLETED, wait as _wait
+    pending = set(futures)
+    done = set()
+    end = _t.time() + max(0.0, float(deadline_s))
+    while pending and _t.time() < end:
+        d, pending = _wait(pending, timeout=min(poll_s, max(0.05, end - _t.time())), return_when=FIRST_COMPLETED)
+        done |= d
+    return done, pending

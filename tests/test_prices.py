@@ -774,3 +774,41 @@ def test_benchmark_close_bar_handles_every_quote_state(monkeypatch):
         bar = P._benchmark_close_bar(day)
         got = None if bar is None else float(bar["close"].iloc[0])
         assert got == (pytest.approx(want[name]) if want[name] else None), name
+
+
+# ── split repair (2026-10-12 review): decide once, never re-adjust on merge ──
+def _split_frame(raw: bool, n_pre=30, n_post=10, r=0.05, move=1.0):
+    idx = pd.bdate_range("2026-08-03", periods=n_pre + n_post)
+    pre = 0.5 if raw else 0.5 / r
+    closes = [pre] * n_pre + [0.5 / r * move] * n_post
+    df = pd.DataFrame({"open": closes, "high": closes, "low": closes, "close": closes, "volume": 1e5}, index=idx)
+    return df, str(idx[n_pre].date())
+
+
+def test_split_decided_once_and_tight():
+    df, sd = _split_frame(raw=True)
+    sp = [{"date": sd, "ratio": 0.05}]
+    out, applied, decided = P._decide_splits(df, sp, [])
+    assert applied == [sd] and decided == [sd]
+    assert out["close"].iloc[0] == pytest.approx(10.0)                       # raw 0.5 → adjusted 10
+    again, applied2, _ = P._decide_splits(out, sp, decided)                  # never re-tested
+    assert applied2 == [] and again["close"].iloc[0] == pytest.approx(10.0)
+    adj, sd2 = _split_frame(raw=False, r=0.5, move=3.0)                      # adjusted data + a real 3× move
+    _, applied3, _ = P._decide_splits(adj, [{"date": sd2, "ratio": 0.5}], [])
+    assert applied3 == []                                                    # not mistaken for a raw split
+
+
+def test_incremental_merge_drops_raw_pre_split_bars(monkeypatch, tmp_path):
+    monkeypatch.setattr(P, "CACHE_DIR", tmp_path) if hasattr(P, "CACHE_DIR") else None
+    df, sd = _split_frame(raw=True)
+    sp = [{"date": sd, "ratio": 0.05}]
+    adj, applied, decided = P._decide_splits(df, sp, [])
+    entry = {"df": adj, "splits": sp, "local_adjusted": applied, "split_decided": decided}
+    monkeypatch.setattr(P, "_write_cache", lambda *a, **k: None)
+    raw_window = df.iloc[-15:]                                                # Yahoo still raw before the split
+    out = {}
+    res = P._apply_incremental("AAA", entry, raw_window, sp, None, P._now(), out)
+    assert res == "ok"
+    m = entry["df"]
+    assert m["close"].iloc[0] == pytest.approx(10.0)                         # not divided again
+    assert (m[m.index < pd.Timestamp(sd)]["close"] > 1).all()                # raw 0.5 bars did not overwrite

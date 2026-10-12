@@ -634,7 +634,7 @@ table { border-collapse: collapse; width: 100%; }
 .board tbody tr:hover { background: rgba(214, 222, 235, 0.025); }
 .board tbody td { padding: var(--s2) var(--s2) var(--s2) 0; vertical-align: middle; }
 .board .c-rank { width: 48px; font: 500 12px/1 var(--mono); color: var(--fg-4); }
-.board tr:first-child .c-rank { color: var(--red); }
+.board tbody tr[data-sym]:first-child .c-rank, .board tbody tr.band-row:first-child + tr[data-sym] .c-rank { color: var(--red); }
 .board .c-name { min-width: 200px; }
 .board .tk { font: 500 15px/1.2 var(--mono); color: var(--fg); letter-spacing: 0.02em; }
 .board .tk:hover { text-decoration: underline; text-underline-offset: 4px; text-decoration-thickness: 1px; }
@@ -1284,3 +1284,9 @@ details.rec-block[open] > summary::after { content: " −"; }
 .plan-ctl select { background: var(--bg-2); border: 1px solid var(--line-2); border-radius: 2px; padding: 6px var(--s1); font: 500 12px/1.2 var(--sans); color: var(--fg); }
 #planner .tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 @media (max-width: 640px) { #planner .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+/* rank-band separators on the 100-name board */
+.board tbody tr.band-row td { padding: var(--s2) var(--s1) var(--s1); border-bottom: 1px solid var(--line-2); background: transparent; }
+.board tbody tr.band-row span { font: 500 11px/1.4 var(--mono); letter-spacing: .02em; color: var(--fg-3); }
+.board tbody tr.band-row:hover { background: transparent; cursor: default; }
+@media (max-width: 760px) { .board tbody tr.band-row { display: block; } .board tbody tr.band-row td { display: block; } }

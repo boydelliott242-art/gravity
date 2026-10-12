@@ -57,7 +57,7 @@ def build(limit: int = 40) -> str:
             result = (f"Result: open ${out['open']:.4g} → close ${out['close']:.4g} "
                       f"({out['oc'] * 100:+.1f}% open→close; high {out['oh'] * 100:+.1f}% above the open).")
         else:
-            result = "Graded after the close."
+            result = "Graded the next trading-day evening, once the day's bar is final."
         board = ", ".join(b["symbol"] for b in (rec.get("board") or [])[:10])
         desc = f"{result} Board top 10: {board}. Research, not advice."
         items.append(

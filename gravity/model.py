@@ -111,8 +111,9 @@ _M1_CAVEAT = (
     "M1 uses the real 9:30 open in the backtest; live it uses a pre-market price as a proxy for the "
     "open, which can differ materially. Treat M1 live numbers as less reliable than its backtest."
     if _features_mod.MORNING_SET == "official" else
-    "M1 is trained and tested on what the morning run actually knows at ~9:00 ET: the last after-hours / "
-    "pre-market trade (Yahoo hourly bars), not the 9:30 open"
+    ("M1 is trained and tested on what the morning run actually knows before " + str(int(getattr(_features_mod.config, "MORNING_CUTOFF_ET", 9))) + ":00 ET: "
+     + ("the last pre-market trade (no after-hours inputs)" if _features_mod.MORNING_SET == "pm" else "the last after-hours / pre-market trade")
+     + " (Yahoo hourly bars), not the 9:30 open")
     + (", plus the shape of extended-hours trading (high, low, fade, after-hours move)" if _features_mod.MORNING_SET in ("ext", "ext_counts", "ext_on") else "")
     + (" and filings accepted overnight" if _features_mod.MORNING_SET == "ext_on" else "")
     + ". Live, those inputs come from same-day hourly bars, which Yahoo sometimes revises slightly later; the "
@@ -534,6 +535,34 @@ def _sim(daily: pd.DataFrame, cost: float = COST) -> Dict[str, Any]:
     }
 
 
+RANK_BANDS = ((1, 1), (2, 10), (11, 25), (26, 50), (51, 100), (101, 150), (151, 250), (251, 400))
+
+
+def _rank_bands(day: np.ndarray, prob: np.ndarray, y: np.ndarray, oc: np.ndarray, sq: np.ndarray,
+                mask: Optional[np.ndarray] = None) -> Dict[str, Any]:
+    """Out-of-sample record of each board rank band: rank every scored name
+    by its dump odds within the day (optionally only ``mask`` rows) and report
+    what each band did the next session. This is what a reader of rank 37
+    should expect — not what the #1 did."""
+    ok = np.isfinite(prob) & np.isfinite(oc)
+    if mask is not None:
+        ok &= mask
+    d = pd.DataFrame({"day": day[ok], "p": prob[ok], "y": y[ok], "oc": oc[ok], "sq": sq[ok]})
+    if not len(d):
+        return {}
+    d = d.sort_values(["day", "p"], ascending=[True, False])
+    d["rk"] = d.groupby("day").cumcount() + 1
+    out: Dict[str, Any] = {"base_dump": _f(d["y"].mean()), "base_mean_oc": _f(d["oc"].mean()), "bands": []}
+    for lo, hi in RANK_BANDS:
+        x = d[(d["rk"] >= lo) & (d["rk"] <= hi)]
+        if not len(x):
+            continue
+        out["bands"].append({"lo": lo, "hi": hi, "n": int(len(x)), "n_days": int(x["day"].nunique()),
+                             "hit": _f(x["y"].mean()), "mean_oc": _f(x["oc"].mean()), "median_oc": _f(x["oc"].median()),
+                             "squeeze": _f(x["sq"].mean()), "pump": _f((x["oc"] >= 0.05).mean())})
+    return out
+
+
 def _realistic(daily: pd.DataFrame) -> Dict[str, Any]:
     """Net of each pick's own estimated cost (capacity model: square-root
     impact on both legs + spread) at fixed position sizes, for the published
@@ -820,6 +849,7 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
     y_up5 = Y["y_pump"]
     big_move = np.abs(Y["y_oc"]) >= 0.05
     directional: Dict[str, Any] = {}
+    rank_bands: Dict[str, Any] = {}
     tail: Dict[str, Any] = {}
     caps: Dict[str, Dict[str, Optional[float]]] = {}
     report_oos: Dict[str, Any] = {}
@@ -835,6 +865,10 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
                              {k: v[tested] for k, v in row_costs.items()})
         # Is it a DOWN forecast or just a big-move forecast? (the honest question)
         pt, yo = p[tested], Y["y_oc"][tested]
+        rank_bands[m] = {
+            "board": _rank_bands(row_dates[tested], pt, Y["y_dump"][tested], yo, Y["y_squeeze"][tested]),
+            "published_rule": _rank_bands(row_dates[tested], pt, Y["y_dump"][tested], yo, Y["y_squeeze"][tested], pub_mask[tested]),
+        }
         dec = pd.qcut(pd.Series(pt).rank(method="first"), 10, labels=False)
         directional[m] = {
             "pump_auc": _auc(y_up5[tested], pt),
@@ -954,6 +988,7 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
         "targets": TARGET_TEXT,
         "base_rate": {t: _f(np.nanmean(Y[c])) if np.isfinite(Y[c]).any() else None for t, c in TARGETS.items()},
         "oos": report_oos,
+        "rank_bands": rank_bands,
         "swing": swing,
         "calibration": calib,
         "importance": imp0,

@@ -43,9 +43,22 @@ ET = "America/New_York"
 BATCH = 40
 EXT_FEATURES = ["gap_ext", "ext_hi", "ext_lo", "ext_fade", "n_ext", "n_pm", "ah_ret"]
 _PM = (240, 540)          # bars starting 4:00 … 8:00 ET → trades before 9:00
+_PM8 = (240, 480)         # bars starting 4:00 … 7:00 ET → trades before 8:00 (a 07:20 CT run sees it complete)
 _AH = (960, 1200)         # 16:00 … 19:00
 _REG = (570, 960)
-_RAW = ("ah_last", "pm_last", "ext_last", "ext_high", "ext_low", "n_ext", "n_pm", "close_h_prev")
+_RAW = ("ah_last", "pm_last", "ext_last", "ext_high", "ext_low", "n_ext", "n_pm", "close_h_prev",
+        "pm_last8", "ext_last8", "ext_high8", "ext_low8", "n_pm8")
+
+
+def pm_only() -> bool:
+    """MORNING_SET "pm": the morning model uses only the last PRE-MARKET trade
+    (robust to Yahoo's after-hours outage since 2026-10-07)."""
+    return str(getattr(config, "MORNING_SET", "")) == "pm"
+
+
+def cutoff_suffix() -> str:
+    """'' for the 9:00 ET pre-market cutoff, '8' for 8:00 ET (config.MORNING_CUTOFF_ET)."""
+    return "8" if int(getattr(config, "MORNING_CUTOFF_ET", 9)) == 8 else ""
 
 
 def _frame(h: Optional[pd.DataFrame]) -> pd.DataFrame:
@@ -72,7 +85,10 @@ def ext_row(f: pd.DataFrame, d: pd.Timestamp, prev: Optional[pd.Timestamp]) -> d
     p = f[(f["day"] == d) & (f["m"] >= _PM[0]) & (f["m"] < _PM[1])]
     r = f[(f["day"] == prev) & (f["m"] >= _REG[0]) & (f["m"] < _REG[1])] if prev is not None else f.iloc[:0]
     ext = pd.concat([a, p])
+    p8 = p[p["m"] < _PM8[1]]
+    ext8 = pd.concat([a, p8])
     pm_last = float(p["c"].iloc[-1]) if len(p) else np.nan
+    pm_last8 = float(p8["c"].iloc[-1]) if len(p8) else np.nan
     ah_last = float(a["c"].iloc[-1]) if len(a) else np.nan
     return {"prev": pd.Timestamp(prev) if prev is not None else pd.NaT,
             "ah_last": ah_last, "pm_last": pm_last,
@@ -80,6 +96,9 @@ def ext_row(f: pd.DataFrame, d: pd.Timestamp, prev: Optional[pd.Timestamp]) -> d
             "ext_high": float(ext["h"].max()) if len(ext) else np.nan,
             "ext_low": float(ext["l"].min()) if len(ext) else np.nan,
             "n_ext": float(len(ext)), "n_pm": float(len(p)),
+            "pm_last8": pm_last8, "ext_last8": pm_last8 if np.isfinite(pm_last8) else ah_last,
+            "ext_high8": float(ext8["h"].max()) if len(ext8) else np.nan,
+            "ext_low8": float(ext8["l"].min()) if len(ext8) else np.nan, "n_pm8": float(len(p8)),
             "close_h_prev": float(r.sort_values("m")["c"].iloc[-1]) if len(r) and r["m"].max() >= 930 else np.nan}
 
 
@@ -234,6 +253,50 @@ def update_store(symbols: Iterable[str], today: Optional[date] = None, deadline_
     return store
 
 
+# ── feed health ──────────────────────────────────────────────────────────
+# Yahoo silently stopped serving the 17:00–18:59 ET after-hours bars from the
+# 2026-10-07 evening on: overnight ranges shrank by half for every name. A
+# morning model trained on complete bars must not be fed that, so sessions are
+# graded by how complete their after-hours data is.
+GOOD_SESSION_AH = 0.5      # share of names with ≥ 2 after-hours bars on a normal session (~0.8)
+GUARD_RATIO = 0.5          # live after-hours completeness must be ≥ half the same names' normal level
+GUARD_PM_RATIO = 0.70      # live pre-market coverage must be ≥ 70% of normal: the pre-market model's ONLY
+                           # input. Yahoo's pre-market bars thinned ~20–30% from 2026-10-07; R10d (pre-registered)
+                           # showed the model still beats close-only with 25% of its inputs missing.
+
+
+def session_quality(store: pd.DataFrame) -> pd.Series:
+    """Per session date: share of stored names with ≥ 2 after-hours bars."""
+    if not len(store):
+        return pd.Series(dtype=float)
+    ah = store["n_ext"].astype(float) - store["n_pm"].astype(float)
+    return (ah >= 2).groupby(pd.to_datetime(store["date"])).mean()
+
+
+def feed_check(live: pd.DataFrame, store: pd.DataFrame, n_ref: int = 40) -> Tuple[bool, str]:
+    """Is this morning's extended-hours data as complete as the model's
+    training data? Compares the shortlist's after-hours completeness and
+    pre-market coverage with the SAME names on the last ``n_ref`` normal
+    sessions in the store."""
+    fetched = live[live["fetched"].astype(bool)] if "fetched" in live else live.iloc[:0]
+    if len(fetched) < max(20, 0.8 * len(live)):
+        return False, f"only {len(fetched)}/{len(live)} shortlist names fetched"
+    q = session_quality(store)
+    good = sorted(q[q >= GOOD_SESSION_AH].index)[-n_ref:]
+    ref = store[pd.to_datetime(store["date"]).isin(good) & store["symbol"].isin(fetched.index)]
+    if len(ref) < 200:
+        return True, "no reference sessions for these names — not checked"
+    pm_col = "n_pm" + cutoff_suffix() if ("n_pm" + cutoff_suffix()) in ref.columns else "n_pm"
+    ref_ah = float(((ref["n_ext"] - ref["n_pm"]) >= 2).mean())
+    ref_pm = float((ref[pm_col] >= 1).mean())
+    live_ah = float(((fetched["n_ext"] - fetched["n_pm"]) >= 2).mean())
+    live_pm = float((fetched["n_pm"] >= 1).mean())
+    pm_ratio = GUARD_PM_RATIO if pm_only() else GUARD_RATIO
+    ok = live_pm >= pm_ratio * ref_pm and (pm_only() or live_ah >= GUARD_RATIO * ref_ah)
+    return ok, (f"after-hours completeness {live_ah:.0%} vs {ref_ah:.0%} normal, "
+                f"pre-market coverage {live_pm:.0%} vs {ref_pm:.0%} for the same names")
+
+
 def training_features(rows: pd.DataFrame, store: pd.DataFrame) -> pd.DataFrame:
     """Features for the session AFTER each row's date (what the morning of
     that session knows), aligned to ``rows`` (needs symbol, date). A row is
@@ -246,9 +309,30 @@ def training_features(rows: pd.DataFrame, store: pd.DataFrame) -> pd.DataFrame:
         m = pd.DataFrame({c: np.full(len(rows), np.nan) for c in _RAW})
         m["prev"] = pd.NaT
     else:
-        m = key.merge(store[["symbol", "date"] + cols], on=["symbol", "date"], how="left")[cols]
+        have = [c for c in cols if c in store.columns]
+        m = key.merge(store[["symbol", "date"] + have], on=["symbol", "date"], how="left")[have]
+    for c in cols:
+        if c not in m.columns:      # a store seeded before the 8:00 ET columns existed
+            m[c] = np.nan
     aligned = pd.to_datetime(m["prev"]).to_numpy("datetime64[ns]") == pd.to_datetime(rows["date"]).to_numpy("datetime64[ns]")
-    feats = derive(m["ext_last"], m["ext_high"], m["ext_low"], m["ah_last"], m["n_ext"], m["n_pm"], m["close_h_prev"], aligned)
+    x = cutoff_suffix()
+    if pm_only():
+        col = "n_pm" + x if ("n_pm" + x) in store.columns else "n_pm"
+        cov = (store[col].astype(float) >= 1).groupby(pd.to_datetime(store["date"])).mean() if len(store) else pd.Series(dtype=float)
+        if len(cov) > 20:   # vs the trailing 60-session median: a vendor gap, not "nobody traded"
+            ref = cov.rolling(60, min_periods=20).median().shift(1)
+            bad = set(cov[cov < GUARD_PM_RATIO * ref].index)
+            if bad:
+                aligned &= ~pd.Series(nxt).isin(bad).to_numpy()
+        feats = derive(m["pm_last" + x], m["ext_high" + x], m["ext_low" + x], m["ah_last"], m["n_ext"], m["n_pm" + x],
+                       m["close_h_prev"], aligned)
+        return pd.DataFrame(feats, index=rows.index)
+    q = session_quality(store)
+    bad = set(q[q < GOOD_SESSION_AH].index) if len(q) else set()
+    if bad:     # degraded feed sessions are unknown, not "quiet overnight"
+        aligned &= ~pd.Series(nxt).isin(bad).to_numpy()
+    feats = derive(m["ext_last" + x], m["ext_high" + x], m["ext_low" + x], m["ah_last"], m["n_ext"], m["n_pm" + x],
+                   m["close_h_prev"], aligned)
     return pd.DataFrame(feats, index=rows.index)
 
 
@@ -269,8 +353,13 @@ def live_features(symbols: Iterable[str], session: date, prev_session: date,
         r = ext_row(f, d, p) if len(f) else {"prev": pd.NaT, **{k: np.nan for k in _RAW}}
         rows.append({"symbol": s, "fetched": s in bars, **r})
     df = pd.DataFrame(rows).set_index("symbol")
-    feats = pd.DataFrame(derive(df["ext_last"], df["ext_high"], df["ext_low"], df["ah_last"], df["n_ext"], df["n_pm"],
-                                df["close_h_prev"], df["fetched"].to_numpy(bool)), index=df.index)
+    x = cutoff_suffix()
+    last = df["pm_last" + x] if pm_only() else df["ext_last" + x]
+    feats = pd.DataFrame(derive(last, df["ext_high" + x], df["ext_low" + x], df["ah_last"], df["n_ext"],
+                                df["n_pm" + x], df["close_h_prev"], df["fetched"].to_numpy(bool)), index=df.index)
+    feats["fetched"] = df["fetched"].astype(bool)
+    feats["n_ext_raw"] = df["n_ext"].astype(float)
+    feats["n_pm_raw"] = df["n_pm" + x].astype(float)
     _record_live(session, df, feats)
     net.record_status(STATUS, len(bars) >= max(1, int(0.8 * len(syms))),
                       f"{len(bars)}/{len(syms)} shortlist names with hourly bars in {time.time() - t0:.0f}s; "
@@ -293,7 +382,7 @@ def _record_live(session: date, raw: pd.DataFrame, feats: pd.DataFrame) -> None:
         with open(LIVE_LOG / f"{pd.Timestamp(session).date().isoformat()}.jsonl", "a") as fh:
             for s in raw.index:
                 rec = {"asof": stamp, "symbol": s, **{k: _num(raw.at[s, k]) for k in _RAW}}
-                rec.update({"f_" + k: _num(feats.at[s, k]) for k in feats.columns})
+                rec.update({"f_" + k: _num(feats.at[s, k]) for k in feats.columns if k not in ("fetched",)})
                 fh.write(json.dumps(rec) + "\n")
     except OSError:
         pass

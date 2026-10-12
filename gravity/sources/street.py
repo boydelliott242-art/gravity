@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 NASDAQ_API = "https://api.nasdaq.com/api"
 DANELFIN_API = "https://apirest.danelfin.com/ranking"
 
-ANALYST_MAX_AGE_S = 12 * 3600
+ANALYST_MAX_AGE_S = 72 * 3600       # ratings/targets move rarely; the morning run reuses the evening fetch
 EARNINGS_MAX_AGE_S = 3 * 3600
 MOVERS_MAX_AGE_S = 5 * 60
 DANELFIN_MAX_AGE_S = 20 * 3600       # scores are published once per day

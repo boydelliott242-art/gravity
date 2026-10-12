@@ -78,7 +78,8 @@ STRAGGLERS = 3                         # ≤ this many refusals in a batch = bad
 NASDAQ_FALLBACK_MAX = 250       # cap on Nasdaq history fallbacks per call (3 req/s host)
 SPLITS_CACHE_S = 20 * 3600      # split lists fetched outside load_history
 PREMARKET_WORKERS = 8
-_CACHE_VERSION = 1
+_CACHE_VERSION = 2   # v2: every stored frame is split-adjusted locally (v1 entries are migrated on read)
+_SPLIT_MIN_LOG = math.log(1.5)   # only splits this large are applied locally (the jump test is unambiguous)
 
 #: Stats of the most recent ``load_history`` call (for scripts and the site).
 LAST_RUN: Dict[str, Any] = {}
@@ -274,9 +275,68 @@ def read_cache(symbol: str) -> Optional[Dict[str, Any]]:
     except Exception:  # corrupt/partial pickle → behave as a cache miss
         log.warning("prices: unreadable cache for %s, ignoring", symbol)
         return None
-    if not isinstance(e, dict) or e.get("version") != _CACHE_VERSION or not isinstance(e.get("df"), pd.DataFrame):
+    if not isinstance(e, dict) or not isinstance(e.get("df"), pd.DataFrame):
+        return None
+    if e.get("version") == 1 or (e.get("version") == _CACHE_VERSION and "split_decided" not in e):
+        # frames could stay raw across a split Yahoo reported but did not adjust
+        # (fake 5–50× jumps that topped the dump odds): decide each split once
+        prior = list(e.get("local_adjusted") or [])      # splits an earlier pass already applied
+        e["df"], applied, decided = _decide_splits(e["df"], e.get("splits") or [], prior)
+        e["split_decided"] = decided
+        if applied:
+            e["local_adjusted"] = sorted(set(prior + applied))
+            log.info("prices: %s split(s) %s applied locally", symbol, applied)
+        try:
+            _write_cache(symbol, e)
+        except OSError:
+            pass
+        e["version"] = _CACHE_VERSION
+    if e.get("version") != _CACHE_VERSION:
         return None
     return e
+
+
+def _split_is_raw(df: pd.DataFrame, sd: pd.Timestamp, r: float) -> bool:
+    """Is ``df`` still RAW across the split on ``sd``? Only when the jump
+    between the last traded bar before it and the first traded bar on/after it
+    sits in a tight band around 1/ratio (zero-volume placeholder bars skipped)."""
+    traded = df[(df["volume"] > 0) & (df["close"] > 0)]
+    before, after = traded[traded.index < sd], traded[traded.index >= sd]
+    if before.empty or after.empty:
+        return False
+    jump = float(after["open"].iloc[0]) / float(before["close"].iloc[-1])
+    if not (jump > 0 and math.isfinite(jump)):
+        return False
+    target = math.log(1.0 / r)
+    return abs(math.log(jump) - target) < 0.3 * abs(target)
+
+
+def _decide_splits(df: pd.DataFrame, splits: List[Dict[str, Any]], decided: List[str]) -> Tuple[pd.DataFrame, List[str], List[str]]:
+    """Decide each recorded split ONCE (dates in ``decided`` are never tested
+    again): split-adjust the bars before it only when the frame is clearly raw
+    across it. → (frame, newly applied dates, all decided dates)."""
+    done = set(decided or [])
+    applied: List[str] = []
+    out = df
+    for sp in sorted(splits or [], key=lambda x: x["date"]):
+        d = str(sp.get("date"))
+        if d in done:
+            continue
+        try:
+            r = float(sp.get("ratio") or 0)
+        except (TypeError, ValueError):
+            continue
+        done.add(d)
+        if r <= 0 or abs(math.log(r)) <= _SPLIT_MIN_LOG or out is None or out.empty:
+            continue
+        sd = pd.Timestamp(d)
+        if _split_is_raw(out, sd, r):
+            out = out.copy()
+            m = out.index < sd
+            out.loc[m, ["open", "high", "low", "close"]] = out.loc[m, ["open", "high", "low", "close"]] / r
+            out.loc[m, "volume"] = out.loc[m, "volume"] * r
+            applied.append(d)
+    return out, applied, sorted(done)
 
 
 def _write_cache(symbol: str, entry: Dict[str, Any]) -> None:
@@ -818,6 +878,12 @@ def _apply_incremental(symbol: str, entry: Dict[str, Any], bars: pd.DataFrame,
         log.info("prices: %s cached bars disagree with Yahoo (drift=%s) → full refetch", symbol,
                  "no overlap" if drift is None else f"{drift:.3f}")
         return "drift_refetch"
+    local = sorted(entry.get("local_adjusted") or [])
+    if local and len(bars):
+        # Yahoo may still serve RAW bars from before a split this cache adjusted
+        # itself: never let those overwrite the adjusted bars (no re-test here)
+        last_split = pd.Timestamp(local[-1])
+        bars = bars[bars.index >= last_split]
     merged = clean_bars(pd.concat([entry["df"], bars]), now)
     entry.update(df=merged, splits=_merge_splits(entry.get("splits"), splits), fetched_at=_utc_iso())
     _write_cache(symbol, entry)
@@ -827,11 +893,24 @@ def _apply_incremental(symbol: str, entry: Dict[str, Any], bars: pd.DataFrame,
 
 def _store_full(symbol: str, bars: pd.DataFrame, splits: List[Dict[str, Any]],
                 want_start: Optional[date], out: Dict[str, pd.DataFrame]) -> None:
+    old = read_cache(symbol)
+    if old is not None and len(old["df"]) >= 60 and len(bars) * 2 < len(old["df"]):
+        # a split-day "full" re-fetch sometimes returns only the last few bars:
+        # never replace years of history with it. Keep the cache untouched and
+        # leave the symbol out of this run (the next run re-tries the full fetch).
+        log.warning("prices: %s full re-fetch returned %d bars vs %d cached — kept the cache, skipped this run",
+                    symbol, len(bars), len(old["df"]))
+        return
+    bars, applied, decided = _decide_splits(bars, splits, [])
     entry = {
         "df": bars, "splits": splits, "source": "yahoo", "unadjusted": False,
         "coverage_start": want_start.isoformat() if want_start else None,
         "fetched_at": _utc_iso(), "full_fetched_at": _utc_iso(),
+        "split_decided": decided,
     }
+    if applied:
+        entry["local_adjusted"] = applied
+        log.info("prices: %s split(s) %s applied locally", symbol, applied)
     _write_cache(symbol, entry)
     out[symbol] = _frame_out(dict(entry, symbol=symbol), want_start)
 
@@ -1167,7 +1246,8 @@ def premarket_snapshot(symbols: List[str], deadline_s: float = 240.0) -> Dict[st
     t_start = time.time()
     ex = ThreadPoolExecutor(max_workers=PREMARKET_WORKERS)
     futs = {ex.submit(_nasdaq_quote, s): s for s in syms}
-    done, _late = wait(list(futs), timeout=max(1.0, deadline_s))
+    from ..util import wait_wall
+    done, _late = wait_wall(list(futs), max(1.0, deadline_s))
     payloads = [(futs[f], f.result() if f in done and not f.exception() else None) for f in futs]
     ex.shutdown(wait=False, cancel_futures=True)
     failed, n_ok, statuses = [], 0, set()

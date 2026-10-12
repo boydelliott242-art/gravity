@@ -36,10 +36,13 @@ TRAIN_MAX_CAP = float("inf")         # training loads every listed name, then ke
 MIN_DOLLAR_VOLUME_20D = 50_000       # median daily $ volume to be tradeable at all
 # Morning-model inputs (see features.M1_EXTRA): "official" | "honest" | "ext" | "ext_counts" | "ext_on"
 # "ext" won the leak-free pre-registered comparison (data/research/r9_selection_rule.txt, r9c.json)
-MORNING_SET = "ext"
+MORNING_SET = "pm"
 # Which shortlist names the morning model scores: "shortlist" (all — it was trained
 # with "no extended-hours trade" rows) or "traded" (only names with an extended-hours price)
 MORNING_SCOPE = "shortlist"
+# Pre-market window the morning model uses: trades before 9:00 ET (needs a run after 9:00 ET) or
+# before 8:00 ET (complete by the 07:20 CT run, which finishes before the Mac goes to sleep).
+MORNING_CUTOFF_ET = 8
 HISTORY_PERIOD = "3y"                # daily bars kept per symbol
 
 # ── Outcome definitions (used by labels, evidence, scorecard) ────────────
@@ -61,8 +64,8 @@ ASIA_COUNTRIES = {
 }
 
 # ── Output sizes ─────────────────────────────────────────────────────────
-BOARD_SIZE = 25          # ranked picks shown on the board
-DOSSIER_SIZE = 60        # names that get the full enrichment pass (news, borrow, SI)
+BOARD_SIZE = 100         # ranked picks shown on the board, each with the full dossier
+DOSSIER_SIZE = 60        # legacy pool size (board selection now walks the ranking — cli.BOARD_POOL_MAX)
 TWINS_SIZE = 12          # INHD lookalikes
 CHART_SESSIONS = 120     # daily bars embedded per pick for the chart
 

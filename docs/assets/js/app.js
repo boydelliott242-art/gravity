@@ -83,7 +83,7 @@ function backtestLine(which) {
   const key = honestM1 ? 'm1' : 'm0';
   const m = oos[key];
   if (!m) return '';
-  const scope = honestM1 ? 'this morning rule, trained on extended-hours trades before 9:00 ET (live inputs come from same-day bars, which Yahoo sometimes revises later)'
+  const scope = honestM1 ? (S.model.morning_set === 'pm' ? 'this morning rule, trained on the last pre-market trade before 8:00 ET (live inputs come from same-day bars, which Yahoo sometimes revises later)' : 'this morning rule, trained on extended-hours trades before 9:00 ET (live inputs come from same-day bars, which Yahoo sometimes revises later)')
     : which === 'm1' ? 'the close-only version of this rule (today\'s ranking also used a pre-market price, which has no backtest of its own)'
     : 'this exact rule';
   const hit = isNum(m.pub1_hit) ? m.pub1_hit : m.top1_hit;
@@ -456,7 +456,7 @@ function renderHero() {
   const sqNote = isNum(top.squeeze_danger) ? `${sqWord(top.squeeze_danger)} — a crowding score, not a forecast` : 'Not enough data to score';
   const scored = t.universe && isNum(t.universe.scored) ? t.universe.scored : null;
   const modelLine = top.model_used === 'm1'
-    ? (obj(S.model).morning_set && S.model.morning_set !== 'official' ? 'M1 reading — adds what traded after the close and before 9:00 ET' : 'M1 reading — uses the pre-market price as the expected open')
+    ? (obj(S.model).morning_set === 'pm' ? 'M1 reading — adds the last pre-market trade before 8:00 ET' : obj(S.model).morning_set && S.model.morning_set !== 'official' ? 'M1 reading — adds what traded after the close and before 9:00 ET' : 'M1 reading — uses the pre-market price as the expected open')
     : top.model_used === 'm0' ? 'M0 reading — close-only features (no pre-market print)' : 'Model version not reported';
 
   const aboutNote = `${esc(modelLine)}. Features as of the close on ${esc(fmtDay(t.features_asof, { year: true }))}.${isNum(top.score) ? (top.score >= 100 ? (t.top_tie_count > 1 ? ` Tied with ${esc(int(t.top_tie_count - 1))} other name${t.top_tie_count > 2 ? 's' : ''} for the highest odds of the ${esc(int(scored))} scored — ties are ordered by the model's raw score.` : ` The highest odds of the ${esc(int(scored))} names scored today.`) : ` Higher odds than ${esc(top.score)}% of the ${esc(int(scored))} names scored today.`) : ''}${backtestLine(top.model_used)}${isNum(top.rank) && top.rank > 1 ? ` The ${top.rank - 1} higher-ranked board name${top.rank > 2 ? 's are' : ' is'} skipped because ${top.rank > 2 ? 'they are' : 'it is'} under the Rule 201 short-sale restriction today or trade under $300K a day — the rule the backtest measured.` : ''}`;
@@ -583,6 +583,30 @@ function sortedFiltered(board) {
   });
 }
 
+const BOARD_BANDS = [[1, 1], [2, 10], [11, 25], [26, 50], [51, 100]];
+/** Separator row for a band of board ranks: the backtest record of the universe
+ * ranks its rows hold today (row-weighted blend of the walk-forward bands). */
+function bandRow(band, members, rb, cost) {
+  const lab = band[0] === band[1] ? `Rank ${band[0]}` : `Ranks ${band[0]}–${band[1]}`;
+  const bands = arr(rb.bands);
+  const ur = members.map((p) => p.urank).filter(isNum);
+  if (!bands.length || !ur.length) return `<tr class="band-row"><td colspan="10"><span>${esc(lab)}</span></td></tr>`;
+  const acc = { n: 0, hit: 0, mean: 0, sq: 0, pump: 0 };
+  ur.forEach((u) => {
+    const b = bands.find((x) => u >= x.lo && u <= x.hi) || bands[bands.length - 1];
+    if (!b || !isNum(b.hit)) return;
+    acc.n += 1; acc.hit += b.hit; acc.mean += b.mean_oc; acc.sq += b.squeeze; acc.pump += isNum(b.pump) ? b.pump : 0;
+  });
+  if (!acc.n) return `<tr class="band-row"><td colspan="10"><span>${esc(lab)}</span></td></tr>`;
+  const umin = Math.min(...ur), umax = Math.max(...ur);
+  const span = umin === umax ? `universe rank ${umin}` : `universe ranks ${umin}–${umax}`;
+  const mean = acc.mean / acc.n;
+  const weak = isNum(cost) ? -mean < cost : mean > -0.01;
+  const base = isNum(S.base) ? S.base : rb.base_dump;
+  const txt = `${lab} (${span} today) · in the backtest names at those ranks fell 5%+ open→close ${pct(acc.hit / acc.n, 0)} of the time (average name ${pct(base, 1)}), averaging ${pct(mean, 1, true)} before costs; ${pct(acc.pump / acc.n, 0)} rose 5%+ instead and ${pct(acc.sq / acc.n, 0)} spiked 20%+${weak ? ` — the average move is ${isNum(cost) ? `smaller than a typical ${pct(cost, 1)} round-trip cost at $10K` : 'small'}: a watchlist, not a short signal on its own` : ''}`;
+  return `<tr class="band-row"><td colspan="10"><span>${esc(txt)}</span></td></tr>`;
+}
+
 function boardRow(p, max) {
   const sym = esc(p.symbol);
   const pre = p.premarket;
@@ -610,7 +634,7 @@ function renderBoard() {
   const board = arr(S.today && S.today.board);
   const dek = $('#board-dek');
   if (dek && isNum(S.base)) {
-    dek.textContent = `Ranked by the model's probability of an open→close drop of 5% or more this session. The tick on each bar is the ${pct(S.base, 1)} base rate for the average eligible name.`;
+    dek.textContent = `The top ${board.length || 100}, ranked by the model's probability of an open→close drop of 5% or more this session. The tick on each bar is the ${pct(S.base, 1)} base rate for the average eligible name; each band of ranks shows what that band did in the walk-forward backtest — precision falls with rank, so read rank 70 as a watchlist, not a #1.`;
   }
   if (!S.today) { root.innerHTML = empty('The board could not be loaded.'); return; }
   const chips = FILTERS.map((f) => {
@@ -670,7 +694,21 @@ function drawBoard() {
   let body;
   if (!board.length) body = '<tr class="board-empty"><td colspan="10">No names made the board this session — see the squeeze zone for what was held back.</td></tr>';
   else if (!rows.length) body = '<tr class="board-empty"><td colspan="10">No names match every active filter. Clear a filter to see more.</td></tr>';
-  else body = rows.map((p) => boardRow(p, max)).join('');
+  else if (S.sort.key === 'rank' && S.sort.dir > 0 && !S.filters.size) {
+    // default order: a header row per board-rank band with the out-of-sample record of
+    // the UNIVERSE ranks those rows hold today (the backtest ranks every scored name)
+    const nM1 = board.filter((p) => p.model_used === 'm1').length;
+    const mu = nM1 * 2 > board.length ? 'm1' : 'm0';          // the model that ranked most of the board
+    const rb = obj(obj(obj(S.model).rank_bands)[mu]).board;
+    const cost = obj(obj(obj(obj(S.model).sim)[mu]).realistic)['10000'];
+    const html = [];
+    rows.forEach((p) => {
+      const band = BOARD_BANDS.find((x) => x[0] === p.rank);
+      if (band) html.push(bandRow(band, rows.filter((q) => q.rank >= band[0] && q.rank <= band[1]), obj(rb), isNum(obj(cost).mean_cost) ? cost.mean_cost : null));
+      html.push(boardRow(p, max));
+    });
+    body = html.join('');
+  } else body = rows.map((p) => boardRow(p, max)).join('');
   setHTML($('tbody', table), body);
   const cnt = $('#board-count');
   if (cnt) cnt.textContent = board.length ? `Showing ${rows.length} of ${board.length}` : '';
@@ -810,7 +848,7 @@ function liveBlock(sc) {
   const days = arr(sc && sc.days);
   const head = '<h3 class="rec-sub">Live</h3><p class="note">Every published #1, graded after that session\'s close. Late (after-the-open) runs are excluded.</p>';
   if (!sc) return `<div>${head}${empty(`The scorecard could not be loaded${S.errors['scorecard.json'] ? ` (${esc(S.errors['scorecard.json'])})` : ''}.`)}</div>`;
-  if (!live.n_days) return `<div>${head}${empty('<b>No graded sessions yet.</b> The first #1 is graded after its session closes; results appear here that evening. Nothing is back-filled.')}</div>`;
+  if (!live.n_days) return `<div>${head}${empty('<b>No graded sessions yet.</b> The first #1 is graded after its session closes; results appear here the next trading-day evening, once the day’s bars are final. Nothing is back-filled.')}</div>`;
   const first = days.length ? days[days.length - 1].session_date : null;
   return `<div>${head}
     <dl class="tiles">
@@ -821,7 +859,7 @@ function liveBlock(sc) {
     </dl>
     ${hbars([
       { label: 'Published #1', v: live.top_dump_rate, hot: true },
-      { label: 'Whole board', v: live.board_dump_rate, hot: true },
+      { label: 'Board top 25', v: live.board_dump_rate, hot: true },
       { label: 'All eligible names', v: live.universe_dump_rate },
     ])}
     <p class="note" style="margin-top:8px">Share of sessions that fell 5%+ from open to close.${live.top_squeeze_rate != null ? ` The #1 spiked 20%+ above the open on ${pct(live.top_squeeze_rate)} of graded sessions.` : ''}${live.n_unverified ? ` ${int(live.n_unverified)} session(s) excluded because the pick could not be confirmed public before the open.` : ''} ${live.n_days < 60 ? 'Small sample: these rates will move a lot as days accumulate.' : ''}</p>
@@ -837,7 +875,7 @@ function backtestBlock(m) {
   const base = obj(m.base_rate).dump;
   const cost = isNum(sim.cost_assumption) ? sim.cost_assumption : null;
   const tabs = ['m0', 'm1'].filter((k) => obj(m.sim)[k] || obj(m.oos)[k]);
-  const tabHTML = tabs.map((k) => `<button type="button" role="tab" id="tab-${k}" aria-controls="bt-panel" aria-selected="${k === tab}" tabindex="${k === tab ? 0 : -1}" data-tab="${k}">${k === 'm1' ? (m.morning_set && m.morning_set !== 'official' ? 'M1 · + after-hours & pre-market trading (through 9:00 ET)' : 'M1 · knows the real open (live uses a pre-market proxy)') : 'M0 · close only (evening run; morning fallback)'}</button>`).join('');
+  const tabHTML = tabs.map((k) => `<button type="button" role="tab" id="tab-${k}" aria-controls="bt-panel" aria-selected="${k === tab}" tabindex="${k === tab ? 0 : -1}" data-tab="${k}">${k === 'm1' ? (m.morning_set === 'pm' ? 'M1 · + the last pre-market trade before 8:00 ET' : m.morning_set && m.morning_set !== 'official' ? 'M1 · + after-hours & pre-market trading (through 9:00 ET)' : 'M1 · knows the real open (live uses a pre-market proxy)') : 'M0 · close only (evening run; morning fallback)'}</button>`).join('');
   const nDays = arr(sim.daily).length;
   return `<div>${head}
     <p class="note">Walk-forward, out of sample${m.trained_through ? ` through ${esc(fmtDay(m.trained_through, { weekday: false, year: true }))}` : ''}. Short the #1 at the open, cover at the close${isNum(cost) ? `, ${esc(pct(cost, 0))} round-trip cost` : ''}. The published rule skips names under the Rule 201 short-sale restriction and names trading under $300K a day; it still assumes borrow was always available — often it isn't.${m.publication_rule ? ` <span class="sr-only">${esc(m.publication_rule.text || '')}</span>` : ''}</p>
@@ -963,7 +1001,7 @@ function dayRow(d) {
 function daysBlock(sc) {
   const days = arr(sc && sc.days).filter(Boolean);
   if (!days.length) return '';
-  const head = '<thead><tr><th scope="col">Session</th><th scope="col">#1</th><th scope="col">Odds</th><th scope="col">Open→close</th><th scope="col">Result</th><th scope="col">Board dumped</th><th scope="col">All names</th></tr></thead>';
+  const head = '<thead><tr><th scope="col">Session</th><th scope="col">#1</th><th scope="col">Odds</th><th scope="col">Open→close</th><th scope="col">Result</th><th scope="col">Top 25 dumped</th><th scope="col">All names</th></tr></thead>';
   return `<div class="rec-block reveal">
     <h3 class="rec-sub">Every graded session</h3>
     <p class="note" style="margin-bottom:24px">Newest first. “Dumped” = fell 5%+ from open to close. “Squeezed” = rose 20%+ from the open at some point.</p>
@@ -1087,7 +1125,8 @@ function renderLive() {
       ${stat(`#1 ${esc(top.symbol)} · open → now`, `<span class="${isNum(top.oc_now) && top.oc_now < 0 ? 'red' : ''}">${esc(pct(top.oc_now, 1, true))}</span>`, esc(`${price(top.open)} open → ${price(top.last)} last`))}
       ${stat('High since the open', esc(pct(top.oh_now, 1, true)), 'the rip a short had to sit through')}
       ${stat('Low since the open', esc(pct(top.ol_now, 1, true)), 'the best cover so far')}
-      ${stat('Board, open → now', esc(pct(L.board_mean_oc_now, 1, true)), esc(`${down5} of ${rows.length} down 5%+ so far${arr(L.unquoted).length ? ` · ${arr(L.unquoted).length} with no regular-session quote (halted or no data): ${arr(L.unquoted).slice(0, 6).join(', ')}` : ''}`))}
+      ${stat('Board top 25, open → now', esc(pct(L.board_mean_oc_now, 1, true)), esc(`${down5} of ${rows.length} down 5%+ so far${arr(L.unquoted).length ? ` · ${arr(L.unquoted).length} with no regular-session quote (halted or no data): ${arr(L.unquoted).slice(0, 6).join(', ')}` : ''}`))}
+      ${arr(L.board_ext).length ? stat('Ranks 26–100, open → now', esc(pct(L.board_ext_mean_oc_now, 1, true)), esc(`${arr(L.board_ext).filter((r) => isNum(r.oc_now) && r.oc_now <= -0.05).length} of ${arr(L.board_ext).length} down 5%+ · read hourly${L.board_ext_asof ? `, last ${fmtStamp(L.board_ext_asof)}` : ''}`)) : ''}
     </dl>
     <div class="chart" id="live-chart"></div>` : empty('No live quote for the #1 in this snapshot.')}
     ${rows.length ? `<div class="table-scroll" style="margin-top:32px"><table class="mtable"><caption class="sr-only">Board names, open to now</caption>
@@ -1549,10 +1588,11 @@ function morningBlock(mo) {
     .filter((k) => obj(t.dev)[k] || obj(t.confirm)[k])
     .map((k) => `<tr><th scope="row">Short ${esc(k.replace(' | ', ', if '))}</th><td>${dc({ dev: obj(obj(t.dev)[k]).mean, confirm: tl(k).mean }, sp)}</td><td>${dc({ dev: obj(obj(t.dev)[k]).win, confirm: tl(k).win }, (v) => pct(v, 0))}</td><td>${dc({ dev: obj(obj(t.dev)[k]).n, confirm: tl(k).n }, (v) => int(v))}</td></tr>`).join('');
   const cov = obj(mo.coverage);
-  return `<div class="rec-block reveal"><h3 class="rec-sub">The morning #1: what is actually knowable at 9:05 ET</h3>
-    <p class="note">The morning model used to be trained on the official 9:30 opening gap, which the 9:05 run cannot know; live it was fed the pre-market price instead (the two agree only loosely: correlation ${esc(fixed(cov.corr_gap_ext_vs_open, 2))}). It is now trained and tested on the same kind of input the 9:05 run uses — extended-hours trades before 9:00 ET (live, these come from same-day bars, which Yahoo sometimes revises slightly later). Published #1 each day, development / confirmation; net uses each pick's estimated cost (impact + spread) at that size.</p>
+  const at = mo.round === 10 ? 'the 7:20 CT run' : 'the 9:05 ET run';
+  return `<div class="rec-block reveal"><h3 class="rec-sub">The morning #1: what is actually knowable when ${esc(at)} scores it</h3>
+    <p class="note">The morning model used to be trained on the official 9:30 opening gap, which an early run cannot know; live it was fed the pre-market price instead (the two agree only loosely${isNum(cov.corr_gap_ext_vs_open) ? `: correlation ${esc(fixed(cov.corr_gap_ext_vs_open, 2))}` : ''}). Every model below except the old live one is trained and tested only on what its run can see. Published #1 each day, development / confirmation; net uses each pick's estimated cost (impact + spread) at that size.</p>
     <div class="table-scroll"><table class="mtable"><thead><tr><th scope="col">Morning model</th><th scope="col">#1 dumped</th><th scope="col">#1 avg open→close</th><th scope="col">Spiked +20%</th><th scope="col">Net $10K</th><th scope="col">Net $50K</th><th scope="col">AUC</th></tr></thead><tbody>${rows}</tbody></table></div></div>
-    ${tRows ? `<div class="rec-block reveal"><h3 class="rec-sub">When to get in and out</h3><p class="note">Short return of the published #1 from hourly bars (positive = the price fell), development / confirmation. Before costs. Conditional rows split days by where the price stood at 10:30 versus the open.</p>
+    ${tRows ? `<div class="rec-block reveal"><h3 class="rec-sub">When to get in and out</h3><p class="note">Short return of the published #1 from hourly bars (positive = the price fell), development / confirmation. Before costs. Conditional rows split days by where the price stood at 10:30 versus the open.${mo.round === 10 ? ' Studied on the picks of the 9:00 ET extended-hours model (round 9).' : ''}</p>
     <div class="table-scroll"><table class="mtable"><thead><tr><th scope="col">Trade</th><th scope="col">Avg short return</th><th scope="col">Share of days it paid</th><th scope="col">Days</th></tr></thead><tbody>${tRows}</tbody></table></div></div>` : ''}`;
 }
 

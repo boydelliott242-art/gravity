@@ -87,6 +87,8 @@ PANEL_FEATURES: List[str] = FEATURES + [c for c in FINRA_FEATURES if c not in FE
 #   "ext_counts" — ext + how many hourly windows had trades (more exposed to Yahoo's
 #                same-day revisions; the leak-free research run R9c found no gain from it)
 #   "ext_on"   — ext + filings accepted between the 16:00 close and 9:00 ET
+#   "pm"       — gap from the last PRE-MARKET trade only (no after-hours inputs: Yahoo
+#                stopped serving 17:00–18:59 ET bars on 2026-10-07)
 EXT_EXTRA: List[str] = ["ext_hi", "ext_lo", "ext_fade", "n_ext", "n_pm", "ah_ret"]   # every documented extended-hours input
 EXT_SHAPE: List[str] = ["ext_hi", "ext_lo", "ext_fade", "ah_ret"]
 EXT_COUNTS: List[str] = ["n_ext", "n_pm"]

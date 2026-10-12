@@ -107,7 +107,7 @@ def shortability(sym: str, borrow: Dict[str, dict], borrow_ok: bool) -> dict:
         return {"status": "UNKNOWN", "available": None, "fee_rate": None, "asof": None}
     b = borrow.get(sym)
     if not b:
-        return {"status": "NONE", "available": 0, "fee_rate": None, "asof": None}
+        return {"status": "NONE", "available": 0, "fee_rate": None, "asof": None, "note": "not in IBKR's borrow list"}
     avail = b.get("available")
     fee = _f(b.get("fee_rate"))
     if avail is not None and avail <= 0:
@@ -116,7 +116,10 @@ def shortability(sym: str, borrow: Dict[str, dict], borrow_ok: bool) -> dict:
         status = "HTB"
     else:
         status = "ETB"
-    return {"status": status, "available": avail, "fee_rate": fee, "asof": b.get("asof")}
+    out = {"status": status, "available": avail, "fee_rate": fee, "asof": b.get("asof")}
+    if b.get("ibkr_symbol"):
+        out["note"] = f"listed at IBKR as {b['ibkr_symbol']}"
+    return out
 
 
 def squeeze_danger(

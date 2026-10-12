@@ -63,6 +63,10 @@ def log_picks(today: dict) -> Optional[bool]:
     if prev and prev.get("outcome"):
         log.info("pick log %s already graded — leaving it frozen", session)
         return False
+    if (prev and prev.get("run") == "morning" and today.get("run") == "morning" and not prev.get("unverified")
+            and (prev.get("top") or {}).get("model") == "m1" and (today.get("top") or {}).get("model_used") != "m1"):
+        log.info("pick log %s keeps the earlier morning-model list (this run was close-only)", session)
+        return False
     if prev and prev.get("run") == "morning" and today.get("run") == "evening" and not prev.get("unverified"):
         log.info("pick log %s already has the morning list — an evening build does not replace it", session)
         return False
@@ -74,11 +78,17 @@ def log_picks(today: dict) -> Optional[bool]:
         "first_published_at": (prev or {}).get("first_published_at") or today.get("generated_at"),
         "model": (today.get("model") or {}).get("version"),
         "top": ({k: top.get(k) for k in ("symbol", "prob_dump", "score", "premarket", "squeeze_danger")}
+                | {"model": top.get("model_used")}
                 | {"capacity": (top.get("size") or {}).get("capacity"), "breakeven": (top.get("size") or {}).get("breakeven")}) if top else None,
         "board": [
-            {"rank": b.get("rank"), "symbol": b.get("symbol"), "prob_dump": b.get("prob_dump")}
+            {"rank": b.get("rank"), "urank": b.get("urank"), "symbol": b.get("symbol"), "prob_dump": b.get("prob_dump")}
             for b in today.get("board", [])
         ],
+        "board_size": len(today.get("board", [])),
+        # names held back (no borrow / squeeze danger ≥ 70 / halted) — graded too, to measure the exclusion
+        "zone": [{"symbol": z.get("symbol"), "urank": z.get("urank"), "prob_dump": z.get("prob_dump"),
+                  "squeeze_danger": z.get("squeeze_danger"), "reason": z.get("zone_reason")}
+                 for z in today.get("squeeze_zone", [])],
         "outcome": None,
     }
     _write(p, rec)
@@ -119,14 +129,14 @@ def ungraded_symbols() -> List[str]:
         if not rec or rec.get("outcome"):
             continue
         top = (rec.get("top") or {}).get("symbol")
-        out += ([top] if top else []) + [b.get("symbol") for b in rec.get("board", []) if b.get("symbol")]
+        out += ([top] if top else []) + [b.get("symbol") for b in rec.get("board", []) + rec.get("zone", []) if b.get("symbol")]
     return sorted(set(out))
 
 
 GIVE_UP_SESSIONS = 3   # sessions after which a #1 with no bar is recorded as "no data" instead of waiting
 
 
-def grade(hist: Dict[str, pd.DataFrame], eligible: List[str]) -> int:
+def grade(hist: Dict[str, pd.DataFrame], eligible: List[str], before: Optional[date] = None) -> int:
     """Grade every ungraded pick log whose session has complete data.
 
     Deferred (left ungraded for a later run) unless at least 80% of the
@@ -140,6 +150,8 @@ def grade(hist: Dict[str, pd.DataFrame], eligible: List[str]) -> int:
         rec = _read(p)
         if not rec or rec.get("outcome"):
             continue
+        if before is not None and date.fromisoformat(rec["session_date"]) >= before:
+            continue   # graded the next evening: Yahoo revises a session's bar after its first print
         day = pd.Timestamp(rec["session_date"])
         prev = pd.Timestamp(prev_trading_day(day.date()))
         uni = [_oc(r) for s in eligible if (r := _bar(hist, s, day)) is not None]
@@ -181,16 +193,46 @@ def grade(hist: Dict[str, pd.DataFrame], eligible: List[str]) -> int:
                               "note": f"no price data for {top['symbol']} {GIVE_UP_SESSIONS}+ sessions later (delisted, renamed or under $0.10?)"}
             else:
                 out["top"] = {"missing": True, "halted": True, "note": "no regular-session bar (halted or no trades)"}
-        b_oc = []
-        for b in rec.get("board", []):
-            r = _bar(hist, b["symbol"], day)
-            if r is not None:
-                b_oc.append(_oc(r)["oc"])
-        if b_oc:
-            arr = np.array(b_oc)
-            out["board_n"] = len(arr)
-            out["board_mean_oc"] = float(arr.mean())
-            out["board_dump_rate"] = float((arr <= config.DUMP_THRESHOLD).mean())
+        # per board-rank band (1, 2–10, 11–25, 26–50, 51–100) and the shadow-graded zone
+        bands = []
+        for lo, hi in ((1, 1), (2, 10), (11, 25), (26, 50), (51, 100)):
+            xs, missing_ = [], []
+            for b in rec.get("board", []):
+                if b.get("rank") is not None and lo <= b["rank"] <= hi:
+                    r = _bar(hist, b["symbol"], day)
+                    (xs.append(_oc(r)["oc"]) if r is not None else missing_.append(b["symbol"]))
+            if xs or missing_:
+                a = np.array(xs) if xs else np.array([])
+                bands.append({"lo": lo, "hi": hi, "n": int(len(a)), "missing": missing_,
+                              "dump_rate": float((a <= config.DUMP_THRESHOLD).mean()) if len(a) else None,
+                              "mean_oc": float(a.mean()) if len(a) else None,
+                              "pump_rate": float((a >= 0.05).mean()) if len(a) else None})
+        if bands:
+            out["bands"] = bands
+        zo, z_missing = [], []
+        for z in rec.get("zone", []):
+            r = _bar(hist, z.get("symbol"), day)
+            (zo.append(r) if r is not None else z_missing.append(z.get("symbol")))
+        if zo or z_missing:
+            za = np.array([_oc(r)["oc"] for r in zo]) if zo else np.array([])
+            out["zone"] = {"n": int(len(za)), "missing": z_missing,
+                           "dump_rate": float((za <= config.DUMP_THRESHOLD).mean()) if len(za) else None,
+                           "mean_oc": float(za.mean()) if len(za) else None,
+                           "squeeze_rate": float((np.array([_oc(r)["oh"] for r in zo]) >= config.SQUEEZE_THRESHOLD).mean()) if zo else None}
+        # "board" = the top 25 by rank (comparable with the 25-name boards logged
+        # before 2026-10-12); "board100" = every logged board name
+        ranked = sorted(rec.get("board", []), key=lambda b: (b.get("rank") or 10**6))
+        for key, lim in (("board", 25), ("board100", None)):
+            b_oc = []
+            for b in ranked[:lim] if lim else ranked:
+                r = _bar(hist, b["symbol"], day)
+                if r is not None:
+                    b_oc.append(_oc(r)["oc"])
+            if b_oc and (lim or len(ranked) > 25):
+                arr = np.array(b_oc)
+                out[f"{key}_n"] = len(arr)
+                out[f"{key}_mean_oc"] = float(arr.mean())
+                out[f"{key}_dump_rate"] = float((arr <= config.DUMP_THRESHOLD).mean())
         rec["outcome"] = out
         _write(p, rec)
         n += 1
@@ -208,6 +250,7 @@ def summary() -> dict:
     tops = [d["outcome"]["top"] for d in counted if d["outcome"].get("top") and not d["outcome"]["top"].get("missing")]
     halted = sum(1 for d in counted if (d["outcome"].get("top") or {}).get("missing"))
     boards = [d["outcome"] for d in days if not d.get("unverified") and d["outcome"].get("board_mean_oc") is not None]
+    boards100 = [d["outcome"] for d in days if not d.get("unverified") and d["outcome"].get("board100_mean_oc") is not None]
     live = {
         "n_days": len(counted),
         "n_unverified": len(days) - len(counted),
@@ -218,12 +261,17 @@ def summary() -> dict:
         "top_squeeze_rate": float(np.mean([t["squeezed"] for t in tops])) if tops else None,
         "board_dump_rate": float(np.mean([b["board_dump_rate"] for b in boards])) if boards else None,
         "board_mean_oc": float(np.mean([b["board_mean_oc"] for b in boards])) if boards else None,
+        "board100_days": len(boards100),
+        "board100_dump_rate": float(np.mean([b["board100_dump_rate"] for b in boards100])) if boards100 else None,
+        "board100_mean_oc": float(np.mean([b["board100_mean_oc"] for b in boards100])) if boards100 else None,
         "universe_dump_rate": float(np.mean([d["outcome"]["universe_dump_rate"] for d in days])) if days else None,
         "universe_mean_oc": float(np.mean([d["outcome"]["universe_mean_oc"] for d in days])) if days else None,
     }
+    # the site reads each day's #1 and outcome; the full board lists stay in history/<date>.json
+    slim_days = [{k: v for k, v in d.items() if k not in ("board", "zone")} for d in reversed(days)][:250]
     return {
         "asof": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "days": list(reversed(days))[:250],
+        "days": slim_days,
         "live": live,
     }
 

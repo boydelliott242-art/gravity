@@ -10,6 +10,14 @@ from gravity import features as F
 from gravity.sources import exthours as X
 
 
+@pytest.fixture(autouse=True)
+def _ext_nine_am(monkeypatch):
+    """These tests describe the 9:00 ET / extended-hours definitions unless they say otherwise."""
+    from gravity import config as _cfg
+    monkeypatch.setattr(_cfg, "MORNING_SET", "ext")
+    monkeypatch.setattr(_cfg, "MORNING_CUTOFF_ET", 9)
+
+
 def _bars(rows):
     """rows: (ET timestamp string, o, h, l, c) → yfinance-like hourly frame (UTC index)."""
     idx = pd.DatetimeIndex([pd.Timestamp(t, tz="America/New_York") for t, *_ in rows]).tz_convert("UTC")
@@ -148,3 +156,76 @@ def test_failed_batch_is_not_marked_missing(tmp_path, monkeypatch):
     X.update_store(["ZZZ"], today=pd.Timestamp("2026-10-07"))
     import json as _json
     assert _json.loads((tmp_path / "missing.json").read_text()) == {}
+
+
+def test_wait_wall_returns_at_the_wall_clock_deadline():
+    import time as _t
+    from concurrent.futures import ThreadPoolExecutor
+    from gravity.util import wait_wall
+    ex = ThreadPoolExecutor(2)
+    fast, slow = ex.submit(lambda: 1), ex.submit(_t.sleep, 3)
+    t0 = _t.time()
+    done, pending = wait_wall([fast, slow], 0.5, poll_s=0.1)
+    assert fast in done and slow in pending and _t.time() - t0 < 1.5
+    ex.shutdown(wait=False)
+
+
+def test_eight_am_cutoff_aggregates(monkeypatch):
+    f = X._frame(H)
+    r = X.ext_row(f, pd.Timestamp("2026-10-06"), pd.Timestamp("2026-10-05"))
+    assert r["pm_last8"] == pytest.approx(1.25) and r["n_pm8"] == 1          # the 8:00 bar is excluded
+    assert r["ext_high8"] == pytest.approx(1.30) and r["ext_low8"] == pytest.approx(1.00)
+    store = X.reduce("AAA", H)
+    rows = pd.DataFrame({"symbol": ["AAA", "AAA"], "date": pd.to_datetime(["2026-10-05", "2026-10-06"])})
+    from gravity import config as _cfg
+    monkeypatch.setattr(_cfg, "MORNING_CUTOFF_ET", 8)
+    assert X.training_features(rows, store).loc[0, "gap_ext"] == pytest.approx(0.25)
+    monkeypatch.setattr(_cfg, "MORNING_CUTOFF_ET", 9)
+    assert X.training_features(rows, store).loc[0, "gap_ext"] == pytest.approx(0.16)
+
+
+def test_feed_check_trips_when_after_hours_bars_vanish():
+    days = pd.bdate_range("2026-08-03", periods=45)
+    syms = [f"S{i}" for i in range(30)]
+    store = pd.DataFrame([{"symbol": s, "date": d, "n_ext": 7.0, "n_pm": 4.0} for d in days for s in syms])
+    normal = pd.DataFrame({"fetched": True, "n_ext": 7.0, "n_pm": 4.0}, index=syms)
+    degraded = pd.DataFrame({"fetched": True, "n_ext": 5.0, "n_pm": 4.0}, index=syms)     # only 1 after-hours bar
+    assert X.feed_check(normal, store)[0] is True
+    ok, why = X.feed_check(degraded, store)
+    assert ok is False and "after-hours completeness 0%" in why
+    unfetched = normal.assign(fetched=[i < 10 for i in range(30)])                        # Yahoo answered for 10/30
+    assert X.feed_check(unfetched, store)[0] is False
+
+
+def test_degraded_sessions_are_unknown_in_training():
+    store = X.reduce("AAA", H)
+    store.loc[store["date"] == pd.Timestamp("2026-10-06"), "n_ext"] = store.loc[store["date"] == pd.Timestamp("2026-10-06"), "n_pm"]
+    rows = pd.DataFrame({"symbol": ["AAA", "AAA"], "date": pd.to_datetime(["2026-10-05", "2026-10-06"])})
+    assert np.isnan(X.training_features(rows, store).loc[0, "gap_ext"])   # its after-hours were missing → unknown
+
+
+def test_ibkr_name_fallback_is_strict():
+    from gravity.sources import shortside as S
+    borrow = {"OLDTK": {"name": "ACME WIDGETS CORP"}, "XRPNU": {"name": "XRP NETWORK UNITS"}, "LUCD": {"name": "LUCID DIAGNOSTICS INC"},
+              "FAF": {"name": "FIRST AMERICAN FINANCIAL CORP"}}
+    names = {"ACMW": "Acme Widgets Corp. Class A Ordinary Shares", "XRPN": "XRP Network Units",
+             "LCID": "Lucid Group, Inc. Common Stock", "FFIN": "First Financial Corp. Common Stock"}
+    assert S.map_by_name(borrow, names, set(names)) == {"ACMW": "OLDTK"}
+
+
+
+def test_pre_market_only_mode(monkeypatch):
+    from gravity import config as _cfg
+    monkeypatch.setattr(_cfg, "MORNING_SET", "pm")
+    monkeypatch.setattr(_cfg, "MORNING_CUTOFF_ET", 8)
+    store = X.reduce("AAA", H)
+    rows = pd.DataFrame({"symbol": ["AAA", "AAA"], "date": pd.to_datetime(["2026-10-05", "2026-10-06"])})
+    assert X.training_features(rows, store).loc[0, "gap_ext"] == pytest.approx(0.25)     # 4:00 bar close, not after-hours
+    no_pm = H[~((H.index >= pd.Timestamp("2026-10-06 04:00", tz="America/New_York")) &
+                (H.index < pd.Timestamp("2026-10-06 09:30", tz="America/New_York")))]
+    assert np.isnan(X.training_features(rows, X.reduce("AAA", no_pm)).loc[0, "gap_ext"])  # after-hours alone → no gap
+    # the feed guard ignores after-hours completeness in this mode
+    days = pd.bdate_range("2026-08-03", periods=45)
+    syms = [f"S{i}" for i in range(30)]
+    st = pd.DataFrame([{"symbol": s, "date": d, "n_ext": 7.0, "n_pm": 4.0} for d in days for s in syms])
+    assert X.feed_check(pd.DataFrame({"fetched": True, "n_ext": 4.0, "n_pm": 4.0}, index=syms), st)[0] is True

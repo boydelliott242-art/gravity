@@ -78,11 +78,11 @@ def test_ibkr_symbol(raw, expected):
 def test_parse_ibkr_contract_shape():
     d = S.parse_ibkr(IBKR_TEXT)
     assert set(d) == {"AAPL", "BRK-B", "ABR-PD", "INHD", "NOAV", "BLNK"}
-    assert d["INHD"] == {"fee_rate": 98.8114, "rebate_rate": -94.9314, "available": 35000,
+    assert d["INHD"] == {"name": "INNO HOLDINGS INC", "fee_rate": 98.8114, "rebate_rate": -94.9314, "available": 35000,
                          "asof": "2026-09-30T08:22:51-04:00"}
     assert d["AAPL"]["available"] == 10_000_000 and isinstance(d["AAPL"]["available"], int)
     assert d["NOAV"]["available"] == 0
-    assert d["BLNK"] == {"fee_rate": None, "rebate_rate": None, "available": None,
+    assert d["BLNK"] == {"name": "BLANK AVAIL", "fee_rate": None, "rebate_rate": None, "available": None,
                          "asof": "2026-09-30T08:22:51-04:00"}
 
 

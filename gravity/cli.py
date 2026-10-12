@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 from . import config, net, publish, score, scorecard, twins
-from .util import ET, clean, market_phase, now_et, prev_trading_day, target_session
+from .util import ET, clean, market_phase, now_et, prev_trading_day, target_session, wait_wall
 
 log = logging.getLogger("gravity")
 
@@ -335,7 +335,17 @@ def _morning_inputs(latest: pd.DataFrame, shortlist: List[str], pre: Dict[str, d
         on = features.overnight_counts(np.array(shortlist, dtype=object), [last_date] * n, [pd.Timestamp(session)] * n, ev)
         for c in features.ON_FEATURES:
             sub[c] = on[c]
-    sub["m1_ok"] = True if config.MORNING_SCOPE == "shortlist" else np.isfinite(sub["gap_open"].to_numpy(float))
+    # guard: only names Yahoo actually answered for, and only when the feed is as
+    # complete as the data the model was trained on (Yahoo dropped bars on 2026-10-07)
+    fetched = xf["fetched"].fillna(False).astype(bool).to_numpy() if "fetched" in xf else np.zeros(len(shortlist), bool)
+    live = pd.DataFrame({"fetched": fetched,
+                         "n_ext": xf["n_ext_raw"].to_numpy(float) if "n_ext_raw" in xf else np.nan,
+                         "n_pm": xf["n_pm_raw"].to_numpy(float) if "n_pm_raw" in xf else np.nan}, index=shortlist)
+    ok, why = _safe(exthours.feed_check, live, exthours.load_store(), default=(False, "feed check failed"))
+    net.record_status("Extended-hours feed check", ok, why + ("" if ok else " — morning model off, close-only scores"))
+    log.info("extended-hours feed check: %s (%s)", "ok" if ok else "FAILED", why)
+    base_ok = np.ones(len(shortlist), bool) if ok else np.zeros(len(shortlist), bool)
+    sub["m1_ok"] = base_ok if config.MORNING_SCOPE == "shortlist" else base_ok & np.isfinite(sub["gap_open"].to_numpy(float))
     return sub
 
 
@@ -466,6 +476,11 @@ def _publish_today(today: dict, args: argparse.Namespace, message: str) -> int:
             and not cur.get("sample"):
         log.info("run is after the open — keeping the pre-open page for %s", today["session_date"])
         return 0
+    if (cur.get("session_date") == today["session_date"] and cur.get("run") == "morning" and today.get("run") == "morning"
+            and not cur.get("late") and (cur.get("top") or {}).get("model_used") == "m1"
+            and (today.get("top") or {}).get("model_used") != "m1"):
+        log.info("keeping the earlier morning-model page for %s (this run fell back to close-only scores)", today["session_date"])
+        return 0
     if cur.get("session_date") == today["session_date"] and cur.get("run") == "morning" \
             and today.get("run") == "evening" and not cur.get("late"):
         log.info("an evening build must not replace the morning page for %s — keeping it", today["session_date"])
@@ -511,7 +526,7 @@ def cmd_evening(args: argparse.Namespace) -> int:
         extra = _safe(_prices.load_history, missing, refresh=True, report=False, default={}) or {}
         hist_g.update({s: df for s, df in extra.items() if df is not None and len(df)})
         log.info("grading: loaded bars for %d/%d picks outside today's universe", len(extra), len(missing))
-    n = scorecard.grade(hist_g, elig)
+    n = scorecard.grade(hist_g, elig, before=now_et().date())
     log.info("graded %d session(s)", n)
     publish.write_json("scorecard.json", scorecard.summary())
     if args.retrain or _model_stale(9):
@@ -644,6 +659,32 @@ def _intel():
         return None
 
 
+BOARD_POOL_MAX = 360        # deepest rank the board selection will walk to fill BOARD_SIZE eligible names
+GATE_CHUNK = 60
+
+
+def _nn(v: Any) -> Any:
+    return None if v is None or (isinstance(v, float) and math.isnan(v)) else v
+
+
+def _gate_bad(sym: str, latest: pd.DataFrame, borrow: dict, borrow_ok: bool, E: dict) -> bool:
+    """The board's exclusion rule (no borrow, halted, or squeeze danger ≥ 70),
+    computed exactly as make_pick computes it."""
+    r = latest.loc[sym]
+    short = score.shortability(sym, borrow, borrow_ok)
+    si_rows = E["si"].get(sym) or []
+    fl = E["floats"].get(sym) or {}
+    si_pct = None
+    if si_rows and fl.get("float"):
+        si_pct = (si_rows[0].get("interest") or 0) / fl["float"] if fl["float"] else None
+    if si_pct is None:
+        si_pct = fl.get("short_pct_float")
+    dtc = si_rows[0].get("days_to_cover") if si_rows else None
+    sqd, _ = score.squeeze_danger(_nn(r.get("sq_pct")), short, si_pct, dtc, fl.get("float"), _nn(r.get("short_ratio_5d")))
+    vol = _nn(r.get("volume"))
+    return short.get("status") == "NONE" or (sqd or 0) >= 70 or (vol is not None and float(vol) == 0)
+
+
 def _secs_until_bell(session: date, margin_min: int = 10) -> float:
     """Wall-clock seconds left before ``margin_min`` minutes ahead of that
     session's 9:30 ET open (inf for runs after the close of the previous day
@@ -653,8 +694,13 @@ def _secs_until_bell(session: date, margin_min: int = 10) -> float:
     return float("inf") if left > 12 * 3600 else left
 
 
+_KINDS = ("news", "si", "analyst", "dilution", "insider", "floats", "chatter")
+CHUNK = 20                  # float / chatter lookups per future, so a deadline keeps partial results
+CHATTER_FRESH_TOP = 50      # chatter refetched every run for the top of the list; older cache (12 h) below
+
+
 def enrich(symbols: List[str], latest: pd.DataFrame, cmap: dict, splits: dict,
-           deadline_s: float, deep: Optional[List[str]] = None) -> dict:
+           deadline_s: float, deep: Optional[List[str]] = None, kinds: tuple = _KINDS) -> dict:
     """Per-name lookups (news, short interest, analyst, float, dilution,
     insider sales, chatter), all overlapped under ONE hard deadline — a
     slow feed must never hold the pre-market publish hostage. Anything
@@ -666,29 +712,50 @@ def enrich(symbols: List[str], latest: pd.DataFrame, cmap: dict, splits: dict,
     deep = set(deep or [])
     t_e = time.time()
     ex = ThreadPoolExecutor(max_workers=12)
+    lane_fl = ThreadPoolExecutor(max_workers=1)   # Yahoo float: sequential source, own lane
+    lane_ch = ThreadPoolExecutor(max_workers=1)   # Stocktwits chatter: sequential source, own lane
+    chunks = [symbols[i:i + CHUNK] for i in range(0, len(symbols), CHUNK)]
+    f_fl = [lane_fl.submit(_safe, shortside.float_shares, c, report=False, default={}) for c in chunks] if "floats" in kinds else []
+    f_ch = ([lane_ch.submit(_safe, intel.chatter, c, report=False, default={},
+                            **({} if i * CHUNK < CHATTER_FRESH_TOP else {"max_age_s": 12 * 3600}))
+             for i, c in enumerate(chunks)] if intel is not None and "chatter" in kinds else [])
     F: Dict[str, Dict[str, Any]] = {k: {} for k in ("news", "si", "analyst", "dilution", "insider")}
     for s in symbols:
         name = str(latest.at[s, "name"] or "") if s in latest.index and "name" in latest.columns else ""
         cik = (cmap.get(s) or {}).get("cik")
-        F["news"][s] = ex.submit(_safe, newsmod.headlines, s, name, default=[])
-        F["si"][s] = ex.submit(_safe, shortside.short_interest, s, default=[])
-        F["analyst"][s] = ex.submit(_safe, street.analyst, s)
+        if "news" in kinds:
+            F["news"][s] = ex.submit(_safe, newsmod.headlines, s, name, default=[])
+        if "si" in kinds:
+            F["si"][s] = ex.submit(_safe, shortside.short_interest, s, default=[])
+        if "analyst" in kinds:
+            F["analyst"][s] = ex.submit(_safe, street.analyst, s)
         if intel is not None and cik:
-            F["dilution"][s] = ex.submit(_safe, intel.dilution_intel, s, cik, splits.get(s, []))
-            if s in deep:
+            if "dilution" in kinds:
+                F["dilution"][s] = ex.submit(_safe, intel.dilution_intel, s, cik, splits.get(s, []))
+            if s in deep and "insider" in kinds:
                 F["insider"][s] = ex.submit(_safe, intel.insider_sales, s, cik)
-    f_fl = ex.submit(_safe, shortside.float_shares, symbols, default={})
-    f_ch = ex.submit(_safe, intel.chatter, symbols, default={}) if intel is not None else None
-    allf = [f for d in F.values() for f in d.values()] + [f_fl] + ([f_ch] if f_ch else [])
-    _done, pending = wait(allf, timeout=deadline_s)
+    allf = [f for d in F.values() for f in d.values()] + f_fl + f_ch
+    _done, pending = wait_wall(allf, deadline_s)
     ex.shutdown(wait=False, cancel_futures=True)
+    lane_fl.shutdown(wait=False, cancel_futures=True)
+    lane_ch.shutdown(wait=False, cancel_futures=True)
 
     def res(f, default):
         return (f.result() if f is not None and f.done() and not f.cancelled() else None) or default
 
     out = {k: {s: res(f, [] if k in ("news", "si") else None) for s, f in d.items()} for k, d in F.items()}
-    out["floats"] = res(f_fl, {})
-    out["chatter"] = res(f_ch, {}) if f_ch else {}
+    out["floats"], out["chatter"] = {}, {}
+    for f in f_fl:
+        out["floats"].update(res(f, {}))
+    for f in f_ch:
+        out["chatter"].update(res(f, {}))
+    # chunked sources record their health per chunk — restate it for the whole set
+    if f_fl:
+        n_f = sum(1 for v in out["floats"].values() if v)
+        net.record_status("Yahoo float", n_f >= 0.6 * len(symbols), f"{n_f}/{len(symbols)} names with a float")
+    if f_ch:
+        n_c = sum(1 for v in out["chatter"].values() if v)
+        net.record_status("Stocktwits chatter", n_c >= 0.5 * len(symbols), f"{n_c}/{len(symbols)} names with chatter")
     if pending:
         net.record_status("Enrichment deadline", False, f"{len(pending)} lookups unfinished after {deadline_s:.0f}s — shown as missing")
     log.info("enrichment for %d names in %.0fs (%d unfinished)", len(symbols), time.time() - t_e, len(pending))
@@ -756,10 +823,11 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
 
     # 3) shortlist → pre-market snapshot → M1 where we have a gap proxy
     order = latest.sort_values("prob_dump", ascending=False)
-    shortlist = list(order.index[:300])
-    for s, evs in overnight.items():
-        if s in latest.index and any(e.get("category") in score.SUPPLY_CATS for e in evs) and s not in shortlist:
-            shortlist.append(s)
+    # the morning model must score at least as deep as the board selection walks
+    shortlist = list(order.index[:BOARD_POOL_MAX + 90])
+    supply = [s for s, evs in overnight.items()
+              if s in latest.index and any(e.get("category") in score.SUPPLY_CATS for e in evs)]
+    shortlist += [s for s in supply if s not in shortlist]
     pre: Dict[str, dict] = {}
     want_pre = phase == "pre-market" or run == "morning"
     if want_pre and _secs_until_bell(session) < 60:
@@ -767,14 +835,16 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
         want_pre = False
     if want_pre:
         t_p = time.time()
-        pre = _safe(prices.premarket_snapshot, shortlist, max(60.0, min(900.0, _secs_until_bell(session) - 600.0)), default={}) or {}
+        # Nasdaq's pre-market quote is display-only now (the model reads Yahoo's bars): top 150 + supply filers
+        disp = list(dict.fromkeys(shortlist[:150] + supply))
+        pre = _safe(prices.premarket_snapshot, disp, max(60.0, min(900.0, _secs_until_bell(session) - 600.0)), default={}) or {}
         log.info("pre-market snapshot: %d/%d names in %.0fs", len(pre), len(shortlist), time.time() - t_p)
     from . import features as _features
     # M1 was trained on extended-hours trades through 9:00 ET; an earlier run (07:20 CT)
     # would feed it a shorter window, so it scores close-only and the 9:05 run decides
-    m1_window_ok = now_et().time() >= datetime.min.time().replace(hour=9)
+    m1_window_ok = now_et().time() >= datetime.min.time().replace(hour=int(getattr(config, "MORNING_CUTOFF_ET", 9)))
     if _features.MORNING_SET != "official" and phase == "pre-market" and want_pre and not m1_window_ok:
-        log.info("before 9:00 ET — close-only scores for now; the 9:05 ET run adds the pre-market model")
+        log.info("before %d:00 ET — close-only scores for now; a later run adds the pre-market model", int(getattr(config, "MORNING_CUTOFF_ET", 9)))
         use_open_syms, sub = [], latest.iloc[:0]
     elif _features.MORNING_SET != "official" and phase == "pre-market" and want_pre:
         sub = _morning_inputs(latest, shortlist, pre, events, overnight, last_date, session)
@@ -813,6 +883,14 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
 
     # 5) borrow + short volume for everyone (cheap bulk files)
     borrow = _safe(shortside.ibkr_borrow, default={}) or {}
+    if borrow:
+        names = {s_: str(latest.at[s_, "name"]) for s_ in latest.index if "name" in latest.columns and pd.notna(latest.at[s_, "name"])}
+        mapped = _safe(shortside.map_by_name, borrow, names, set(latest.index), default={}) or {}
+        for s_, ib in mapped.items():
+            borrow[s_] = dict(borrow[ib], ibkr_symbol=ib)
+        if mapped:
+            log.info("IBKR borrow: %d names matched by company name under another ticker (%s)",
+                     len(mapped), ", ".join(f"{k}→{v}" for k, v in list(mapped.items())[:8]))
     borrow_ok = len(borrow) > 1000
     sv = _safe(shortside.finra_short_volume, 5, default=None)
     if sv is not None and len(sv):
@@ -855,19 +933,48 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
 
     # 7) candidates: board pool, swing pool, provisional #1 (for twins)
     order = latest.sort_values("prob_dump", ascending=False)
-    board_pool = list(order.index[: config.DOSSIER_SIZE])
     shortable = latest["borrow_status"].isin(["ETB", "HTB", "UNKNOWN"])
     swing_order = latest[shortable & latest["prob_swing"].notna()].sort_values("prob_swing", ascending=False)
     swing_pool = list(swing_order.index[:25])
     provisional = next((s for s in order.index if latest.at[s, "publishable"] and latest.at[s, "borrow_status"] in ("ETB", "HTB")), None)
     feat_rows = latest.copy()
     tw = twins.find_twins(feat_rows, ref=provisional, session_year=session.year) if provisional else []
-    dossier = list(dict.fromkeys(board_pool + swing_pool + [t["symbol"] for t in tw]))
 
     E: Dict[str, Dict[str, Any]] = {k: {} for k in ("news", "si", "analyst", "dilution", "insider", "floats", "chatter")}
+    budget = lambda: max(20.0, min(ENRICH_DEADLINE_S, _secs_until_bell(session)))  # noqa: E731
+    # Stage A — fill the board: walk the ranking, fetch only what the squeeze gate
+    # needs (short interest, float; cached), keep names that are shortable, not
+    # halted and under squeeze danger 70, until BOARD_SIZE pass (12 more → zone).
+    board_syms: List[str] = []
+    zone_syms: List[str] = []
+    walk = list(order.index)
+    depth = 0
+    while len(board_syms) < config.BOARD_SIZE and depth < min(BOARD_POOL_MAX, len(walk)):
+        cand = walk[depth:depth + GATE_CHUNK]
+        depth += len(cand)
+        need = [s for s in cand if s not in E["si"]]
+        if need and live_extras:
+            _merge(E, enrich(need, latest, cmap, splits, budget(), kinds=("si", "floats")))
+        for s in cand:
+            if _gate_bad(s, latest, borrow, borrow_ok, E):
+                if len(zone_syms) < 12:
+                    zone_syms.append(s)
+            elif len(board_syms) < config.BOARD_SIZE:
+                board_syms.append(s)
+    keep = set(board_syms) | set(zone_syms)
+    board_pool = [s for s in walk[:depth] if s in keep]
+    log.info("board fill: %d eligible from the top %d (+%d squeeze zone)", len(board_syms), depth, len(zone_syms))
+    urank = {s: i + 1 for i, s in enumerate(walk)}
+    dossier = list(dict.fromkeys(board_pool + swing_pool + [t["symbol"] for t in tw]))
+    # Stage B — the full dossier treatment for every name that is shown
     if live_extras:
-        _merge(E, enrich(dossier, latest, cmap, splits, max(20.0, min(ENRICH_DEADLINE_S, _secs_until_bell(session))),
-                         deep=board_pool[:30] + swing_pool[:5]))
+        # stage A's short interest / float stay authoritative for the gated names
+        # (re-fetching could blank them on a deadline and change who passes the gate)
+        _merge(E, enrich(dossier, latest, cmap, splits, budget(), deep=board_pool + swing_pool[:5],
+                         kinds=("news", "analyst", "dilution", "insider", "chatter")))
+        extras = [s for s in dossier if s not in E["si"]]
+        if extras:
+            _merge(E, enrich(extras, latest, cmap, splits, budget(), kinds=("si", "floats")))
     danel = _safe(street.danelfin, dossier[:15], default={}) or {}
 
     # attribution for everything we'll show
@@ -880,7 +987,7 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
 
     # text-classify recent 8-K/6-K for the top of the board so offering language is caught
     todo = []
-    for s in board_pool[:30]:
+    for s in board_pool:
         for e in _filings_for(s, events, overnight)[:4]:
             if e.get("form") in ("8-K", "6-K", "424B5", "424B3") and not e.get("text_tags") and e.get("url"):
                 if (session - date.fromisoformat(e["date"])).days <= 14:
@@ -942,7 +1049,7 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
         cik = cmap.get(sym, {}).get("cik")
         price = m.get("close")
         return {
-            "rank": rank, "symbol": sym, "name": m.get("name"),
+            "rank": rank, "urank": urank.get(sym), "symbol": sym, "name": m.get("name"),
             "exchange": cmap.get(sym, {}).get("exchange"), "country": m.get("country"),
             "sector": m.get("sector"), "industry": m.get("industry"),
             "price": price, "prev_close": price, "market_cap": m.get("market_cap"),
@@ -976,6 +1083,16 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
             "chart": score.chart_rows(hist.get(sym)) if with_chart else [],
         }
 
+    # display-only pre-market quotes for every name that will be shown (the first
+    # snapshot covered the top 150 by the close-only ranking)
+    if want_pre:
+        shown = [s for s in dict.fromkeys(board_pool + swing_pool + [t["symbol"] for t in tw]) if s not in pre]
+        left = _secs_until_bell(session) - 300.0
+        if shown and left > 30:
+            more = _safe(prices.premarket_snapshot, shown, min(120.0, left), default={}) or {}
+            pre.update(more)
+            log.info("pre-market snapshot (shown names): %d/%d", len(more), len(shown))
+
     board, squeeze_zone = [], []
     for sym in board_pool:
         p = make_pick(sym, None, with_chart=True)
@@ -987,6 +1104,9 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
         elif len(board) < config.BOARD_SIZE:
             p["rank"] = len(board) + 1
             board.append(p)
+    net.record_status("Board fill", len(board) >= config.BOARD_SIZE,
+                      f"{len(board)}/{config.BOARD_SIZE} eligible names from the top {depth} by dump odds "
+                      f"({len(squeeze_zone)} held back in the squeeze zone)")
     # The #1 follows the publication rule the backtest measured: no Rule 201
     # restriction and ≥ $300k median daily volume (plus borrow + squeeze < 70).
     top = next((p for p in board if p.get("publishable")), None)
@@ -1037,6 +1157,18 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
         swing_board.append(pk)
         if len(swing_board) >= 15:
             break
+
+    # payload: a swing / lookalike entry whose name is also on the board keeps only
+    # its list fields — the site opens dossiers from the board record
+    on_board = {p["symbol"] for p in board}
+    _SLIM = ("rank", "urank", "board_rank", "symbol", "name", "exchange", "country", "sector", "price", "market_cap",
+             "prob_dump", "prob_swing", "prob_squeeze", "prob_pump", "skew", "lift", "score", "model_used", "ssr",
+             "publishable", "squeeze_danger", "shortability", "flags", "premarket")
+    slim = lambda p: {k: p.get(k) for k in _SLIM if k in p}  # noqa: E731
+    swing_board = [slim(p) if p["symbol"] in on_board else p for p in swing_board]
+    for t in twin_cards:
+        if t["symbol"] in on_board:
+            t["pick"] = slim(t["pick"])
 
     wire = _catalyst_wire(overnight, E["news"], pre, latest, session)
     earnings = []
@@ -1337,7 +1469,11 @@ def _catalyst_wire(overnight, news, pre, latest, session) -> list:
         if k not in seen:
             seen.add(k)
             out.append(w)
-    return out[:80]
+    # with 100+ names the news can crowd out SEC supply filings: keep the most
+    # severe first, then show the survivors newest first
+    keep = sorted(out, key=lambda w: (-(w.get("severity") or 0), -_ts(w.get("time"))))[:80]
+    keep.sort(key=lambda w: _ts(w.get("time")), reverse=True)
+    return keep
 
 
 # ── entry ────────────────────────────────────────────────────────────────

@@ -22,3 +22,21 @@ tails than the close-only model. Candidate tail guards for the morning #1 (skip 
 1. Pick the guard with the best DEV mean open->close of the guarded D2 #1 (ties: lower DEV squeeze rate).
 2. Adopt it only if, in CONFIRM, guarded D2's mean open->close <= unguarded D2's AND its squeeze rate is lower.
 3. If no guard passes, ship D2 unguarded and show the tail risk plainly (it already beats the old live morning model).
+
+R10 — morning cutoff, pre-registered 2026-10-10 23:20 CT, before the 8:00-cutoff data existed:
+Why: the 08:05 CT run (needed for a 9:00 ET pre-market cutoff) failed to publish before the bell on 10-08 and 10-09
+(Mac in clamshell sleep on battery); the 07:20 CT run always completed. Candidate: D2_8 = the chosen morning model
+(honest gap + extended-hours shape, no counts, leak-free) with the pre-market window ending 8:00 ET, runnable at 07:20 CT.
+Compare with D2_9 (same, 9:00 ET cutoff, re-fit on the same fetch) and A_m0 (close only).
+Adopt D2_8 if, for the published #1, its DEV and CONFIRM mean open->close are each <= A_m0's (better than close-only)
+and each within 1.0 pt of D2_9's. Otherwise keep the 9:00 cutoff (and the 07:20 run stays close-only).
+
+R10 result (2026-10-11 09:33 CT): D2_8 adopted by the rule above (dev −4.09 vs A −3.90, confirm −4.31 vs −3.48; within 1 pt of D2_9).
+R10b — pre-registered 2026-10-11 09:45 CT, before it was run: Yahoo stopped serving 17:00–18:59 ET after-hours bars from
+2026-10-07, so D2's after-hours inputs trip the feed guard daily. D3_8 = close-only features + gap from the LAST PRE-MARKET
+trade before 8:00 ET only (NaN when no pre-market trade; no after-hours inputs). Adopt D3_8 instead of D2_8 if its DEV and
+CONFIRM #1 mean open->close are each <= A_m0's and each within 0.5 pt of D2_8's (its inputs survive the after-hours outage).
+
+R10d — pre-registered 2026-10-12 10:05 CT: Yahoo's pre-market coverage fell ~20-30% from 2026-10-07 (live 69% vs 85% normal
+for the same names on 10-12). Test D3_8 with 25% of its finite pre-market gaps blanked at TEST time only (training unchanged).
+If its DEV and CONFIRM #1 mean open->close are each <= A_m0's, the pre-market guard ratio is set to 0.70; otherwise 0.85 stays.

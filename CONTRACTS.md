@@ -471,3 +471,24 @@ def intraday(symbol: str) -> dict | None
 - `docs/data/probs/YYYY-MM-DD.json` (daily universe probabilities) and
   `docs/data/borrow/YYYY-MM-DD.json` (daily IBKR fee/availability for the universe) — history stores.
 - `docs/feed.xml` (RSS of each day's #1), `docs/manifest.webmanifest` + icons (installable on a phone home screen).
+
+## Round 10 additions (2026-10-11)
+
+- **Board of 100** (`config.BOARD_SIZE`). `cli.build_today` walks the ranking (`BOARD_POOL_MAX` = 360) in
+  chunks: stage A fetches only what the exclusion gate needs (short interest, float — disk-cached) and keeps
+  names that are borrowable, not halted and under squeeze danger 70 (`_gate_bad`, the same rule `make_pick`
+  applies) until 100 pass (12 more → squeeze zone); stage B gives every shown name the full dossier
+  (news, analyst, dilution, insider Form 4s, chatter, filing-text classification). Status "Board fill".
+- Every pick carries `urank` — its position in the universe ranking by P(dump) (board ranks skip excluded names).
+- `model.json.rank_bands[m0|m1].board|published_rule` = walk-forward record per universe-rank band
+  (1, 2–10, 11–25, 26–50, 51–100, 101–150, 151–250, 251–400): n, n_days, hit, mean_oc, median_oc, squeeze, pump.
+  The site's band rows blend the bands covering the uranks each board band holds that day.
+- Scorecard: `outcome.board*` = top 25 by rank (continuous with the 25-name history); `board100_*` = all
+  logged names; `outcome.bands[]` per board-rank band (with `missing` names); `outcome.zone` = the shadow-graded
+  squeeze zone. Sessions are graded the evening AFTER (Yahoo revises the first print).
+- `live.json`: top 25 every run; ranks 26–100 (`board_ext`, `board_ext_mean_oc_now`, `board_ext_asof`) when the
+  last read is over 55 min old.
+- Morning model: `MORNING_SET="pm"`, `MORNING_CUTOFF_ET=8` — gap = last PRE-MARKET trade before 8:00 ET vs the
+  hourly series' previous regular close; runs at 07:20 CT. `exthours.feed_check` compares the shortlist's
+  pre-market coverage (and, for after-hours sets, after-hours completeness) with the same names on normal
+  sessions; on failure every name is scored close-only and the status "Extended-hours feed check" says why.

@@ -51,7 +51,7 @@ NASDAQ_SI_URL = "https://api.nasdaq.com/api/quote/{sym}/short-interest?assetClas
 
 # ── Cache policy ─────────────────────────────────────────────────────────
 IBKR_MAX_AGE_S = 30 * 60
-SI_MAX_AGE_S = 12 * 3600             # short interest changes twice a month
+SI_MAX_AGE_S = 72 * 3600             # short interest changes twice a month (FINRA settlement dates)
 FLOAT_MAX_AGE_S = 3 * 24 * 3600
 FINRA_PUBLISH_ET = dtime(18, 0)      # FINRA posts the day's file by ~6 pm ET
 FINRA_SLACK_DAYS = 6                 # extra trading days to probe for gaps
@@ -131,6 +131,7 @@ def parse_ibkr(text: str) -> Optional[Dict[str, Dict[str, Any]]]:
         if not sym:
             continue
         out[sym] = {
+            "name": (rec.get("NAME") or "").strip() or None,
             "fee_rate": num(rec.get("FEERATE")),
             "rebate_rate": num(rec.get("REBATERATE")),
             "available": _parse_available(rec.get("AVAILABLE", "")),
@@ -445,7 +446,7 @@ def _yf_info(symbol: str) -> Optional[dict]:
         return None
 
 
-def float_shares(symbols: List[str], pause_s: float = 0.4) -> Dict[str, Dict[str, Any]]:
+def float_shares(symbols: List[str], pause_s: float = 0.4, report: bool = True) -> Dict[str, Dict[str, Any]]:
     """Float, shares outstanding and short % of float for a shortlist.
 
     ``{sym: {"float", "shares_out", "short_pct_float", "shares_short",
@@ -483,5 +484,54 @@ def float_shares(symbols: List[str], pause_s: float = 0.4) -> Dict[str, Dict[str
     detail = f"{len(out)}/{len(set(map(to_canonical, symbols)))} symbols ({fetched} fetched, {failed} empty)"
     if throttled:
         detail += " (stopped: Yahoo rate limit)"
-    net.record_status("Yahoo float", bool(out) or not symbols, detail)
+    if report:
+        net.record_status("Yahoo float", bool(out) or not symbols, detail)
+    return out
+
+
+
+# only corporate-form and share-description words are dropped — never words that
+# distinguish issuers ("FIRST AMERICAN FINANCIAL" ≠ "FIRST FINANCIAL")
+_NAME_DROP = {"INC", "INCORPORATED", "CORP", "CORPORATION", "CO", "LTD", "LIMITED", "PLC", "LLC", "NV", "SA", "AG",
+              "ORDINARY", "SHARES", "SHARE", "COMMON", "STOCK", "CLASS", "CL", "ADR", "ADS", "SPONSORED", "UNSPONSORED"}
+
+
+def norm_name(name: Optional[str]) -> Optional[str]:
+    """Company name without corporate-form / share-description words ("Acme
+    Widgets Corp. Ordinary Shares" and "ACME WIDGETS CORP" → "ACME WIDGETS");
+    None when too short to trust."""
+    words = re.sub(r"[^A-Z0-9 ]", " ", (name or "").upper()).split()
+    # drop a trailing share-class letter only right after CLASS/CL ("CLASS A ORDINARY SHARES")
+    out, skip = [], False
+    for w in words:
+        if skip and len(w) == 1:
+            skip = False
+            continue
+        skip = w in ("CLASS", "CL")
+        if w not in _NAME_DROP:
+            out.append(w)
+    key = " ".join(out)
+    return key if len(key) >= 5 else None
+
+
+def map_by_name(borrow: Dict[str, Dict[str, Any]], names: Dict[str, str], listed: set) -> Dict[str, str]:
+    """Universe symbols absent from IBKR's file whose company name matches
+    exactly one IBKR row listed under ANOTHER ticker (renamed issuers keep their
+    old symbol at IBKR). Never maps onto a ticker
+    that is itself in the universe. → {universe symbol: IBKR symbol}"""
+    by_name: Dict[str, List[str]] = {}
+    for sym, rec in borrow.items():
+        k = norm_name(rec.get("name"))
+        if k:
+            by_name.setdefault(k, []).append(sym)
+    out: Dict[str, str] = {}
+    for sym, name in names.items():
+        if sym in borrow:
+            continue
+        k = norm_name(name)
+        cands = [c for c in by_name.get(k, []) if c not in listed
+                 and not (c.startswith(sym) or sym.startswith(c))      # units / warrants / rights of the same issuer
+                 and not re.search(r"\b(UNITS?|WARRANTS?|RIGHTS?|WTS?)\b", (borrow[c].get("name") or "").upper())] if k else []
+        if len(cands) == 1:
+            out[sym] = cands[0]
     return out

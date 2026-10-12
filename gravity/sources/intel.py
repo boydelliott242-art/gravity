@@ -894,9 +894,11 @@ def parse_stream(sym: str, payload: Any, now: Optional[datetime] = None) -> Opti
     return row
 
 
-def chatter(symbols: List[str], *, now: Optional[datetime] = None) -> Dict[str, Dict[str, Any]]:
+def chatter(symbols: List[str], *, now: Optional[datetime] = None, max_age_s: Optional[float] = None,
+            report: bool = True) -> Dict[str, Dict[str, Any]]:
     """Stocktwits message pace, sentiment tags and watchers per symbol.
-    ≤ 2 req/s, 30-min cache, stops the batch on HTTP 429."""
+    ≤ 2 req/s, 30-min cache (``max_age_s`` overrides it), stops the batch on HTTP 429."""
+    max_age = STOCKTWITS_MAX_AGE_S if max_age_s is None else max_age_s
     out: Dict[str, Dict[str, Any]] = {}
     fetched = cached = failed = 0
     limited = False
@@ -904,7 +906,7 @@ def chatter(symbols: List[str], *, now: Optional[datetime] = None) -> Dict[str, 
         st_sym = (sym or "").strip().upper().replace("-", ".")
         if not st_sym:
             continue
-        hit = net.cache_get(NS_STOCKTWITS, st_sym, STOCKTWITS_MAX_AGE_S)
+        hit = net.cache_get(NS_STOCKTWITS, st_sym, max_age)
         if hit is not None:
             out[sym] = hit
             cached += 1
@@ -925,7 +927,8 @@ def chatter(symbols: List[str], *, now: Optional[datetime] = None) -> Dict[str, 
     detail = f"{len(out)}/{len(symbols)} symbols ({fetched} fetched, {cached} cached, {failed} failed)"
     if limited:
         detail += "; stopped on HTTP 429 rate limit"
-    net.record_status(ST_CHATTER, bool(out) or (not symbols), detail)
+    if report:
+        net.record_status(ST_CHATTER, bool(out) or (not symbols), detail)
     return out
 
 
