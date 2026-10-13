@@ -24,7 +24,7 @@ from gravity import capacity as CAP, cli, model as M, net  # noqa: E402
 from gravity.util import ET, now_et, num  # noqa: E402
 
 OUT = ROOT / "data" / "spreads_sample"
-TIMES = ("09:50", "10:45", "11:45", "13:00", "14:15", "15:20")
+TIMES = ("09:31", "10:45", "13:00", "15:44")   # the open and the close are when these shorts trade
 
 
 def quote(sym):
