@@ -492,3 +492,39 @@ def intraday(symbol: str) -> dict | None
   hourly series' previous regular close; runs at 07:20 CT. `exthours.feed_check` compares the shortlist's
   pre-market coverage (and, for after-hours sets, after-hours completeness) with the same names on normal
   sessions; on failure every name is scored close-only and the status "Extended-hours feed check" says why.
+
+## Round 11 additions (2026-10-12) — every board name takes a $30K short
+
+- **Universe** (`model.liquid_mask`, shared by training and the live board): the publication rule (no Rule 201
+  next session, ≥ $300K median daily $ volume) AND prior close ≥ `config.BOARD_MIN_PRICE` ($1) AND
+  `model.market_capacity` ≥ `config.BOARD_MIN_USD` ($30K) — the largest short within ≤ 5% of the conservative
+  expected session $ volume and ≤ 0.5% one-way square-root impact (`capacity.market_capacity`). Live, a name
+  also needs IBKR lendable × price ≥ $30K (`cli._lend_short`; failing names go to the squeeze zone with that
+  reason), squeeze danger < 70, borrow not NONE and no halt. Applies to the board, the #1, the swing board and
+  the squeeze zone (all drawn from the same ranking).
+- **Ranker** (R11, `scripts/research/r11_liquid.py`, rule + addenda in `r9_selection_rule.txt`): per model set
+  a HistGradientBoosting regression of each row's within-session open→close PERCENTILE among $30K-ready rows (L4,
+  the rule's pick after the as-traded-price fix), fit only on $30K-ready rows. m0 = close-only features (evening;
+  morning fallback when the feed check fails); m1 = + the 8:00 ET pre-market gap. Overnight filing counts `on_*`
+  (16:00 close → `MORNING_CUTOFF_ET`) were tested as `features.LIQ_M1_EXTRA` and NOT adopted (R11c); the list is
+  empty but the plumbing stays (training panels and morning inputs still carry `on_*`; if they are ever adopted, an
+  incomplete EDGAR current feed makes the morning run keep the close-only ranker). Bundle keys `liq` = {"m0","m1"} and
+  `liq_features` = {"m0": features, "m1": m1_features + LIQ_M1_EXTRA}; `model.predict` adds
+  `liq_edge` = 0.5 − predicted percentile (higher = expected weaker day than peers = better short; NaN with a bundle
+  that predates it, and then the board falls back to dump odds within the same universe). Training panels always
+  carry `on_*` (cutoff 8:00 ET, `features.overnight_counts(..., cutoff_hour)`); `cli._morning_inputs` computes them
+  live with the same cutoff from stored + overnight events (acceptance times).
+- `model.json.liquid` = {size, min_price, rule, ranker, per_session_median, m0|m1: {base_dump, base_mean_oc,
+  base_cost, bands:[{lo,hi,n,n_days,hit,mean_oc,median_oc,squeeze,pump,cost,net,win}], spearman}} with bands
+  (1), (2–10), (11–25), (26–50), (51–100), (101–150), (151–250), (251–400) and the summaries (1–10), (1–100); cost/net = each name's own
+  estimated round-trip cost at $30K and open→close short net of it. `_rank_bands` takes optional `cost`/`bands`.
+- `today.json.model` adds `board_rule`, `board_min_usd`, `board_ranker` ("liq" | "dump"), `board_universe`;
+  each pick adds `liq_edge` and `lend_short` (IBKR lendable $ when below $30K, else null). `urank` = position in
+  the $30K-ready ranking. `size.costs` / `size.participation` include "30000".
+- Pick log: board entries and the top carry `liq_edge` and `cost30` (est. cost at $30K); the record has
+  `board_min_usd` and `ranker`. Grading adds `top.net30`, `board_net30`, `board100_net30`; the summary adds
+  `top_net30`, `board_net30`, `board100_net30`, `net30_days`.
+- Size Lab: `size_research.json.board30k` (old board vs $30K board at $30K a name, per rank band, dev/confirm;
+  six rankers' 100-name net; 5/10-session holds from R12) — built by `build_size_lab.py` from r11.json/r12.json.
+- Research tooling: `scripts/research/quote_sampler.py` records real bid/ask + top-of-book size for every
+  $30K-ready name six times in a session (`data/spreads_sample/`) to calibrate spreads for liquid names.

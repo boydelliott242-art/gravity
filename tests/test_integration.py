@@ -250,3 +250,32 @@ def test_grade_records_a_vanished_pick_instead_of_waiting_forever(pick_log, monk
     top = json.loads((pick_log / "2026-10-01.json").read_text())["outcome"]["top"]
     assert top["missing"] is True and "no price data" in top["note"]
     assert scorecard.ungraded_symbols() == []
+
+
+def test_grade_net_at_board_size(pick_log, monkeypatch):
+    """Round 11: each logged name carries its estimated cost at the board size; grading reports the net."""
+    monkeypatch.setattr(scorecard, "now_et", lambda: datetime(2026, 10, 1, 8, 0, tzinfo=ET))
+    k = str(config.BOARD_MIN_USD)
+    t = _today()
+    t["model"] = {"version": "m1", "board_min_usd": config.BOARD_MIN_USD, "board_ranker": "liq"}
+    t["top"] = {**t["top"], "size": {"costs": {k: 0.01}}, "liq_edge": 0.02}
+    t["board"] = [{"rank": i + 1, "symbol": s, "prob_dump": 0.2, "size": {"costs": {k: 0.02}}} for i, s in enumerate(["AAA", "BBB"])]
+    scorecard.log_picks(t)
+    rec = json.loads((pick_log / "2026-10-01.json").read_text())
+    assert rec["board"][0]["cost30"] == 0.02 and rec["top"]["cost30"] == 0.01 and rec["ranker"] == "liq"
+    day = pd.Timestamp("2026-10-01")
+    def bars(o, h, l, c, v=1e5):
+        return pd.DataFrame({"open": [o], "high": [h], "low": [l], "close": [c], "volume": [v]}, index=[day])
+    hist = {"AAA": bars(10, 10.5, 8, 8.5), "BBB": bars(5, 6.5, 4.9, 5.2)}
+    uni = []
+    for i in range(250):
+        hist[f"U{i}"] = bars(1, 1.1, 0.9, 1.0)
+        uni.append(f"U{i}")
+    assert scorecard.grade(hist, uni + ["AAA", "BBB"]) == 1
+    out = json.loads((pick_log / "2026-10-01.json").read_text())["outcome"]
+    assert out["top"]["net30"] == pytest.approx(0.15 - 0.01)
+    assert out["board_net30"] == pytest.approx(((0.15 - 0.02) + (-0.04 - 0.02)) / 2)
+    live = scorecard.summary()["live"]
+    assert live["top_net30"] == pytest.approx(0.14) and live["board_net30"] == pytest.approx(0.035)
+    b3 = live["board30"]                                   # the $30K-board era on its own
+    assert b3["n_days"] == 1 and b3["since"] == "2026-10-01" and b3["top_net30"] == pytest.approx(0.14)

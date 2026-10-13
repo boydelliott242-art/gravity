@@ -60,7 +60,7 @@ def test_size_block_fields():
     assert b["limit"] == ("borrow" if 105_000 < b["cap_market"] else "impact")
     big = C.size_block(3.0, 5e7, 2e8, 0.03, c * 1.03, c * 0.97, c, 35_000, 0.018)
     assert big["limit"] == "borrow" and big["capacity"] == pytest.approx(105_000)
-    assert set(b["costs"]) == {"10000", "50000", "100000", "500000", "1000000"}
+    assert set(b["costs"]) == {"10000", "30000", "50000", "100000", "500000", "1000000"}
     assert b["costs"]["1000000"] > b["costs"]["10000"]
     assert b["breakeven"] is not None
 

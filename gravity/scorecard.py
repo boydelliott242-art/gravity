@@ -71,6 +71,8 @@ def log_picks(today: dict) -> Optional[bool]:
         log.info("pick log %s already has the morning list — an evening build does not replace it", session)
         return False
     top = today.get("top") or {}
+    size_key = str(config.BOARD_MIN_USD)
+    cost_at = lambda p_: ((p_.get("size") or {}).get("costs") or {}).get(size_key)  # noqa: E731
     rec = {
         "session_date": session,
         "run": today.get("run"),
@@ -79,12 +81,17 @@ def log_picks(today: dict) -> Optional[bool]:
         "model": (today.get("model") or {}).get("version"),
         "top": ({k: top.get(k) for k in ("symbol", "prob_dump", "score", "premarket", "squeeze_danger")}
                 | {"model": top.get("model_used")}
-                | {"capacity": (top.get("size") or {}).get("capacity"), "breakeven": (top.get("size") or {}).get("breakeven")}) if top else None,
+                | {"capacity": (top.get("size") or {}).get("capacity"), "breakeven": (top.get("size") or {}).get("breakeven"),
+                   "cost30": cost_at(top), "liq_edge": top.get("liq_edge")}) if top else None,
         "board": [
-            {"rank": b.get("rank"), "urank": b.get("urank"), "symbol": b.get("symbol"), "prob_dump": b.get("prob_dump")}
+            {"rank": b.get("rank"), "urank": b.get("urank"), "symbol": b.get("symbol"), "prob_dump": b.get("prob_dump"),
+             "liq_edge": b.get("liq_edge"), "cost30": cost_at(b)}
             for b in today.get("board", [])
         ],
         "board_size": len(today.get("board", [])),
+        # round 11: every board name could take this short; cost30 = its estimated round-trip cost at that size
+        "board_min_usd": (today.get("model") or {}).get("board_min_usd"),
+        "ranker": (today.get("model") or {}).get("board_ranker"),
         # names held back (no borrow / squeeze danger ≥ 70 / halted) — graded too, to measure the exclusion
         "zone": [{"symbol": z.get("symbol"), "urank": z.get("urank"), "prob_dump": z.get("prob_dump"),
                   "squeeze_danger": z.get("squeeze_danger"), "reason": z.get("zone_reason")}
@@ -187,6 +194,8 @@ def grade(hist: Dict[str, pd.DataFrame], eligible: List[str], before: Optional[d
                 t = _oc(r)
                 t["dump"] = t["oc"] <= config.DUMP_THRESHOLD
                 t["squeezed"] = t["oh"] >= config.SQUEEZE_THRESHOLD
+                if isinstance(top.get("cost30"), (int, float)):
+                    t["net30"] = -t["oc"] - float(top["cost30"])
                 out["top"] = t
             elif give_up:
                 out["top"] = {"missing": True, "halted": False,
@@ -223,16 +232,20 @@ def grade(hist: Dict[str, pd.DataFrame], eligible: List[str], before: Optional[d
         # before 2026-10-12); "board100" = every logged board name
         ranked = sorted(rec.get("board", []), key=lambda b: (b.get("rank") or 10**6))
         for key, lim in (("board", 25), ("board100", None)):
-            b_oc = []
+            b_oc, b_net = [], []
             for b in ranked[:lim] if lim else ranked:
                 r = _bar(hist, b["symbol"], day)
                 if r is not None:
                     b_oc.append(_oc(r)["oc"])
+                    if isinstance(b.get("cost30"), (int, float)):
+                        b_net.append(-b_oc[-1] - float(b["cost30"]))
             if b_oc and (lim or len(ranked) > 25):
                 arr = np.array(b_oc)
                 out[f"{key}_n"] = len(arr)
                 out[f"{key}_mean_oc"] = float(arr.mean())
                 out[f"{key}_dump_rate"] = float((arr <= config.DUMP_THRESHOLD).mean())
+                if b_net:   # net of each name's own estimated cost at the board size (round 11 logs on)
+                    out[f"{key}_net30"] = float(np.mean(b_net))
         rec["outcome"] = out
         _write(p, rec)
         n += 1
@@ -264,8 +277,30 @@ def summary() -> dict:
         "board100_days": len(boards100),
         "board100_dump_rate": float(np.mean([b["board100_dump_rate"] for b in boards100])) if boards100 else None,
         "board100_mean_oc": float(np.mean([b["board100_mean_oc"] for b in boards100])) if boards100 else None,
+        # round 11 on: every board name could take a $30K short; net of each name's estimated cost at $30K
+        "net30_days": sum(1 for b in boards100 if b.get("board100_net30") is not None),
+        "board100_net30": float(np.mean(v)) if (v := [b["board100_net30"] for b in boards100 if b.get("board100_net30") is not None]) else None,
+        "board_net30": float(np.mean(v)) if (v := [b["board_net30"] for b in boards if b.get("board_net30") is not None]) else None,
+        "top_net30": float(np.mean(v)) if (v := [t["net30"] for t in tops if t.get("net30") is not None]) else None,
         "universe_dump_rate": float(np.mean([d["outcome"]["universe_dump_rate"] for d in days])) if days else None,
         "universe_mean_oc": float(np.mean([d["outcome"]["universe_mean_oc"] for d in days])) if days else None,
+    }
+    # round 11: the board became $30K-only — the same rates for those sessions alone (the totals above mix both eras)
+    d30 = [d for d in counted if d.get("ranker") == "liq"]
+    t30 = [d["outcome"]["top"] for d in d30 if d["outcome"].get("top") and not d["outcome"]["top"].get("missing")]
+    o30 = [d["outcome"] for d in d30]
+    mean = lambda xs: float(np.mean(xs)) if xs else None  # noqa: E731
+    live["board30"] = {
+        "since": min(d["session_date"] for d in d30) if d30 else None,
+        "n_days": len(d30), "top_n": len(t30),
+        "top_dump_rate": mean([t["dump"] for t in t30]), "top_mean_oc": mean([t["oc"] for t in t30]),
+        "top_squeeze_rate": mean([t["squeezed"] for t in t30]),
+        "top_net30": mean([t["net30"] for t in t30 if t.get("net30") is not None]),
+        "board_dump_rate": mean([o["board_dump_rate"] for o in o30 if o.get("board_dump_rate") is not None]),
+        "board100_dump_rate": mean([o["board100_dump_rate"] for o in o30 if o.get("board100_dump_rate") is not None]),
+        "board100_mean_oc": mean([o["board100_mean_oc"] for o in o30 if o.get("board100_mean_oc") is not None]),
+        "board100_net30": mean([o["board100_net30"] for o in o30 if o.get("board100_net30") is not None]),
+        "universe_dump_rate": mean([o["universe_dump_rate"] for o in o30]),
     }
     # the site reads each day's #1 and outcome; the full board lists stay in history/<date>.json
     slim_days = [{k: v for k, v in d.items() if k not in ("board", "zone")} for d in reversed(days)][:250]

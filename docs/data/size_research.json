@@ -1,6 +1,6 @@
 {
- "generated": "2026-10-11",
- "question": "Can GRAVITY's daily #1 be shorted at $500K\u2013$1M without moving the price \u2014 and keep its accuracy?",
+ "generated": "2026-10-13",
+ "question": "How much can each pick take without moving the price \u2014 and does accuracy survive the size?",
  "method": [
   "Walk-forward, out of sample: monthly test folds, 5-session embargo (21 for 20-session holds), isotonic calibration on a later held-out slice \u2014 the production recipe.",
   "Variants were chosen on a DEVELOPMENT window (test months Jan\u2013Oct 2025) and reported on an untouched CONFIRMATION window (Nov 2025 \u2013 Sep 2026), so picking the best of many cannot inflate the result.",
@@ -188,19 +188,19 @@
   }
  },
  "official": {
-  "pub1_hit": 0.510251,
-  "pub1_mean_oc": -0.036482,
-  "pub1_median_oc": -0.052632,
-  "base": 0.09328,
-  "net10k": -0.001268,
-  "cost10k": 0.037751
+  "pub1_hit": 0.498861,
+  "pub1_mean_oc": -0.033704,
+  "pub1_median_oc": -0.049587,
+  "base": 0.093259,
+  "net10k": -0.003223,
+  "cost10k": 0.036927
  },
  "verdict": [
   "New: the morning #1 now adds the last PRE-MARKET trade before 8:00 ET, so it can run at 7:20 CT. In the backtest its #1 fell 5%+ open\u2192close on 52% / 54% of sessions (development / confirmation) vs 49% / 52% for the close-only model, averaging \u22124.9% / \u22125.4% (close-only \u22123.9% / \u22123.5%); after each pick's estimated cost +1.5% / +1.6% per trade at $10K.",
   "Paired day by day with the close-only model: +1.0% per trade in development (90% interval \u22121.1% to +3.1%) and +1.9% in confirmation (\u22120.5% to +4.3%) \u2014 better in both windows, though each interval still includes zero.",
   "Why not the richer 9:00 ET version (which did better: 58% dumped, \u22124.9% in confirmation)? It needs the 8:05 CT run, and on 8 and 9 October that run could not finish before the bell while the Mac slept; Yahoo also stopped serving after-hours bars (17:00\u201318:59 ET) on 7 October. The pre-market-only version needs neither \u2014 and a feed check switches the morning model off (close-only scores) on any day its inputs look abnormal.",
-  "The close-only model (the evening watchlist, and the morning fallback) still finds dumps \u2014 51% of its #1s fell 5%+ open\u2192close vs 9% for the average name (point-in-time backtest), averaging \u22123.6% before costs.",
-  "But these are thin stocks. With each pick's own estimated cost, its average trade nets \u22120.1% at $10K (estimated cost \u2248 3.8% round trip). The live tape records real bid/ask spreads to keep checking the cost model.",
+  "The close-only model (the evening watchlist, and the morning fallback) still finds dumps \u2014 50% of its #1s fell 5%+ open\u2192close vs 9% for the average name (point-in-time backtest), averaging \u22123.4% before costs.",
+  "But these are thin stocks. With each pick's own estimated cost, its average trade nets \u22120.3% at $10K (estimated cost \u2248 3.7% round trip). The live tape records real bid/ask spreads to keep checking the cost model.",
   "Names that can take $500K\u2013$1M: the model still finds dump candidates at about 3\u20135\u00d7 the normal rate, but their average same-day move is too small to pay the costs at that size. No variant \u2014 stops, direction-aware ranking, the pre-market gap, liquid-only models \u2014 fixed that.",
   "20-session shorts in liquid names looked excellent (+4% to +12% per trade) on today's small-cap list, but that list over-represents stocks that had already collapsed. On a point-in-time universe the result is mixed and statistically indistinguishable from zero (about 11 independent trades per period). Not confirmed, not shipped.",
   "So the honest answer to \u201c$500K\u2013$1M without losing accuracy\u201d is no \u2014 not with these signals and free data. GRAVITY shows every pick's capacity, cost at your size and breakeven, so you can size each trade to what the stock can actually absorb."
@@ -576,12 +576,12 @@
    }
   },
   "tails": {
-   "m0_worst": 1.676923,
-   "m1_worst": 1.676923,
-   "m0_median": -0.052632,
-   "m1_median": -0.070303,
-   "m0_mean": -0.03648208883826879,
-   "m1_mean": -0.05648538952164009
+   "m0_worst": 1.436364,
+   "m1_worst": 1.713797,
+   "m0_median": -0.049587,
+   "m1_median": -0.068376,
+   "m0_mean": -0.03370432346241458,
+   "m1_mean": -0.051006309794988616
   },
   "guards": {
    "none": {
@@ -929,5 +929,323 @@
     }
    }
   }
+ },
+ "board30k": {
+  "title": "Round 11 \u2014 every name on the board can take a $30K short",
+  "note": "Walk-forward, out of sample, development / confirmation. Old board = the previous ranking (dump odds) among publishable names (no Rule 201 next session, \u2265 $300K a day) whatever their capacity, measured as if $30K went into each; $30K board = the morning board as the live run builds it (close-only ranker for every $30K-ready name, the morning ranker for its top 450). Net = open\u2192close short minus each name's own estimated round-trip cost at $30K (square-root impact on both legs + spread).",
+  "rows": [
+   {
+    "band": "#1",
+    "old_hit": {
+     "dev": 0.52173912525177,
+     "confirm": 0.536796510219574
+    },
+    "old_mean": {
+     "dev": -0.04936540871858597,
+     "confirm": -0.053647566586732864
+    },
+    "old_net": {
+     "dev": 0.004492408883476386,
+     "confirm": 0.004785363683527706
+    },
+    "new_hit": {
+     "dev": 0.256038635969162,
+     "confirm": 0.2770562767982483
+    },
+    "new_mean": {
+     "dev": 0.0025864888448268175,
+     "confirm": -0.0024678176268935204
+    },
+    "new_cost": {
+     "dev": 0.017418299548706717,
+     "confirm": 0.0185867547708736
+    },
+    "new_net": {
+     "dev": -0.020004787450752206,
+     "confirm": -0.01611893718832878
+    },
+    "new_net_half": {
+     "dev": -0.014243880138440381,
+     "confirm": -0.009869921066955044
+    },
+    "new_squeeze": {
+     "dev": 0.057971014492753624,
+     "confirm": 0.05627705627705628
+    }
+   },
+   {
+    "band": "Ranks 2\u201310",
+    "old_hit": {
+     "dev": 0.4025764763355255,
+     "confirm": 0.41606542468070984
+    },
+    "old_mean": {
+     "dev": -0.013983472250401974,
+     "confirm": -0.020071296021342278
+    },
+    "old_net": {
+     "dev": -0.03508871141876086,
+     "confirm": -0.030816229658623663
+    },
+    "new_hit": {
+     "dev": 0.21739129722118378,
+     "confirm": 0.2308802306652069
+    },
+    "new_mean": {
+     "dev": -0.006722460500895977,
+     "confirm": -0.003935218323022127
+    },
+    "new_cost": {
+     "dev": 0.01815795240387676,
+     "confirm": 0.018022245431303107
+    },
+    "new_net": {
+     "dev": -0.01143549176363233,
+     "confirm": -0.014087026901782372
+    },
+    "new_net_half": {
+     "dev": -0.00521797367218068,
+     "confirm": -0.007872988215236071
+    },
+    "new_squeeze": {
+     "dev": 0.01932367149758454,
+     "confirm": 0.02934102934102934
+    }
+   },
+   {
+    "band": "Ranks 11\u201325",
+    "old_hit": {
+     "dev": 0.34524959325790405,
+     "confirm": 0.3246753215789795
+    },
+    "old_mean": {
+     "dev": -0.009384860284626484,
+     "confirm": -0.004352813586592674
+    },
+    "old_net": {
+     "dev": -0.0383318870641638,
+     "confirm": -0.04758284405634095
+    },
+    "new_hit": {
+     "dev": 0.17423510551452637,
+     "confirm": 0.16421356797218323
+    },
+    "new_mean": {
+     "dev": -0.002354346914216876,
+     "confirm": -0.001103616668842733
+    },
+    "new_cost": {
+     "dev": 0.018343537194215855,
+     "confirm": 0.017900602258197867
+    },
+    "new_net": {
+     "dev": -0.015989190208734433,
+     "confirm": -0.016796985656545926
+    },
+    "new_net_half": {
+     "dev": -0.009588753682759523,
+     "confirm": -0.010550846416362192
+    },
+    "new_squeeze": {
+     "dev": 0.01706924315619968,
+     "confirm": 0.01875901875901876
+    }
+   },
+   {
+    "band": "Ranks 26\u201350",
+    "old_hit": {
+     "dev": 0.28541064262390137,
+     "confirm": 0.28709957003593445
+    },
+    "old_mean": {
+     "dev": -0.005162165034562349,
+     "confirm": -0.0062587377615273
+    },
+    "old_net": {
+     "dev": -0.042764873302929156,
+     "confirm": -0.0444724129424096
+    },
+    "new_hit": {
+     "dev": 0.14009661972522736,
+     "confirm": 0.1483982652425766
+    },
+    "new_mean": {
+     "dev": -0.0019320740830153227,
+     "confirm": -0.0029422850348055363
+    },
+    "new_cost": {
+     "dev": 0.01837074362792245,
+     "confirm": 0.017936988382598888
+    },
+    "new_net": {
+     "dev": -0.016438669478423852,
+     "confirm": -0.014994703484679626
+    },
+    "new_net_half": {
+     "dev": -0.009951877200699726,
+     "confirm": -0.008682027639119589
+    },
+    "new_squeeze": {
+     "dev": 0.00927536231884058,
+     "confirm": 0.007965367965367965
+    }
+   },
+   {
+    "band": "Ranks 51\u2013100",
+    "old_hit": {
+     "dev": 0.24309179186820984,
+     "confirm": 0.23748917877674103
+    },
+    "old_mean": {
+     "dev": -0.003435762831941247,
+     "confirm": -0.004077828023582697
+    },
+    "old_net": {
+     "dev": -0.043037012341735285,
+     "confirm": -0.044211854815491065
+    },
+    "new_hit": {
+     "dev": 0.11159420013427734,
+     "confirm": 0.11861471831798553
+    },
+    "new_mean": {
+     "dev": -0.0007304991595447063,
+     "confirm": -0.0024130921810865402
+    },
+    "new_cost": {
+     "dev": 0.018133277027268538,
+     "confirm": 0.01767798286294517
+    },
+    "new_net": {
+     "dev": -0.01740277778288687,
+     "confirm": -0.015264890650413894
+    },
+    "new_net_half": {
+     "dev": -0.010914861504536499,
+     "confirm": -0.008961967464548935
+    },
+    "new_squeeze": {
+     "dev": 0.00821256038647343,
+     "confirm": 0.006666666666666667
+    }
+   },
+   {
+    "band": "All 100",
+    "old_hit": {
+     "dev": 0.2861352562904358,
+     "confirm": 0.28203463554382324
+    },
+    "old_mean": {
+     "dev": -0.006168318446725607,
+     "confirm": -0.006599413231015205
+    },
+    "old_net": {
+     "dev": -0.04107256749507821,
+     "confirm": -0.043087064284239925
+    },
+    "new_hit": {
+     "dev": 0.13908211886882782,
+     "confirm": 0.14458873867988586
+    },
+    "new_mean": {
+     "dev": -0.0017805766547098756,
+     "confirm": -0.002486507873982191
+    },
+    "new_cost": {
+     "dev": 0.018219253711583235,
+     "confirm": 0.017816198502378002
+    },
+    "new_net": {
+     "dev": -0.016438676925593993,
+     "confirm": -0.015329690837902444
+    },
+    "new_net_half": {
+     "dev": -0.009995769536737774,
+     "confirm": -0.009041385754549491
+    },
+    "new_squeeze": {
+     "dev": 0.011304347826086957,
+     "confirm": 0.011341991341991342
+    }
+   }
+  ],
+  "adopted": "L4",
+  "shipped_variant": "hybrid_L4",
+  "per_session": 1173.0,
+  "variants_all100": {
+   "L0": {
+    "dev": -0.01623842107754715,
+    "confirm": -0.015656161004587447
+   },
+   "L1": {
+    "dev": -0.016945873852280652,
+    "confirm": -0.01615675022211076
+   },
+   "L2": {
+    "dev": -0.016855613879730027,
+    "confirm": -0.016092776367406872
+   },
+   "L3": {
+    "dev": -0.017115423494125943,
+    "confirm": -0.015943161571698353
+   },
+   "L4": {
+    "dev": -0.016570946964846615,
+    "confirm": -0.015365081397362822
+   },
+   "L5": {
+    "dev": -0.017473598958639265,
+    "confirm": -0.015994961471853208
+   }
+  },
+  "horizons_all100": {
+   "5": {
+    "dev": -0.01968584356897059,
+    "confirm": -0.018049957294953636
+   },
+   "10": {
+    "dev": -0.0226258763176714,
+    "confirm": -0.02123572236838693
+   }
+  },
+  "costs": {
+   "adopted": "L4 (production hybrid)",
+   "n": 43800,
+   "share_at_cap": 0.8417351598173516,
+   "share_unreadable": 0.4561415525114155,
+   "share_read_wider_clipped": 0.38559360730593606,
+   "median_read_over_cap_when_clipped": 2.3264895921601707,
+   "mean_spread_used": 0.012723883495449426,
+   "mean_two_way_impact": 0.005282800003059819,
+   "net_by_spread_multiple": {
+    "0.5": {
+     "dev": -0.009995769536737774,
+     "confirm": -0.009041385754549491
+    },
+    "1.0": {
+     "dev": -0.016438676925593993,
+     "confirm": -0.015329690837902444
+    },
+    "2.0": {
+     "dev": -0.02932559039563129,
+     "confirm": -0.027907482537941956
+    }
+   },
+   "old_top1_cap30_share": {
+    "dev": 0.24154589371980675,
+    "confirm": 0.1774891774891775
+   }
+  },
+  "verdict": [
+   "New: all 100 board names (and the #1) pass a $30K test \u2014 at most 5% of the stock's expected volume, at most 0.5% estimated price impact, an as-traded price of $1 or more and no short-sale restriction; live, each board name must also be lendable at IBKR for $30K or more whenever IBKR's list is available (otherwise borrow shows as unknown). About 1173 stocks pass the volume, impact and price test on a typical day, before the borrow, squeeze and halt checks.",
+   "The honest catch: the #1 dumps far less often. In the backtest the $30K board's #1 fell 5%+ open\u2192close on 26% / 28% of sessions (old #1: 52% / 54%); ranks 51\u2013100 on 11% / 12% (old: 24% / 24%). Most of that is liquidity \u2014 the dump-odds model's own #1 among the same $30K-ready names fell 5%+ on 36% / 36% \u2014 and part is the ranker, which was chosen for all 100 names, not for the #1: its #1 dumps less often and netted no better at $30K (\u22122.0% / \u22121.6% versus \u22121.0% / \u22121.6% for the dump-odds #1). Same-or-better accuracy is not available at this size: the big intraday dumps happen in stocks too thin to take $30K.",
+   "The old #1 itself, even charged its large estimated cost, netted +0.4% / +0.5% at $30K \u2014 better than the new #1's \u22122.0% / \u22121.6%. But it could take $30K within the volume and impact limits on only 24% / 18% of days \u2014 the rest of the time a $30K short was exactly the heavy slippage this change exists to avoid, and the cost model is least reliable for such oversized orders.",
+   "Across all 100 at $30K a name, the new board is far better than the old one: per position after estimated costs \u22121.6% / \u22121.5%, versus \u22124.1% / \u22124.3% for the old board, whose thin names would pay about 5.0% to trade $30K.",
+   "But shorting all 100 at $30K still lost money in the backtest: the average name moved only \u22120.2% open\u2192close against about 1.8% estimated cost (\u22120.9% per position if real spreads are half the assumed ones, \u22122.8% if double). The top 10 come closest (\u22121.2% / \u22121.4%; half spreads \u22120.6% / \u22120.8%). Treat the lower ranks as a watchlist.",
+   "The evening watchlist, and the morning page whenever the pre-market feed check fails, use the close-only version of the ranker: its #1 fell 5%+ on 29% / 22% and netted \u22120.1% / \u22123.0%; all 100 netted \u22121.7% / \u22121.6% per position. The morning version above re-scores the top 450 $30K-ready names with the pre-market gap \u2014 exactly as the live run does.",
+   "Six ranking models were compared under a rule written down before the run: rank by development 100-name net, treat gaps under 0.05 pt as ties, break ties by development top-10 net, then require confirmation no worse than the production model. It picked a regression on its within-day percentile. The six spanned \u22121.5% to \u22121.7% per position; a dump classifier trained only on these names, a 3%-drop classifier and an average of three of them were measurably worse than production in at least one window (paired 90% interval below zero); the rest were statistically indistinguishable from production; against production, the adopted ranker's paired 90% interval spans zero in both windows. A second pre-registered step tested adding counts of SEC filings accepted overnight (up to 8:00 ET). Its first run took filing histories only for today's \u2264 $2B universe \u2014 a look-ahead (names that later grew had none), caught in review \u2014 so it was re-run with every stock's history: +0.01 pt / +0.05 pt per position against a bar of +0.05 pt in both windows, so overnight filings are NOT used.",
+   "Holding 5 or 10 sessions instead (tested with the first round's peer-relative regression) did not fix the 100-name board (\u22121.8% to \u22122.3% per position). Exploratory only \u2014 that test was designed after looking at 5-session moves and the top ranks were not its question: the #1 netted +2.9% / +1.5% held 5 sessions and +2.7% / +4.5% held 10; the top 10 \u22121.1% / \u22121.0% and \u22121.1% / \u22120.6%. A 10-session #1 is only about 23 independent trades per window, and 1 in 20 of its positions lost 48% / 32% or more before costs. Not shipped, not a recommendation.",
+   "Costs are the biggest uncertainty, in both directions: on the backtest board the spread used is the liquidity-tier cap (1\u20133%) for 84% of names \u2014 for 46% the estimator could not read a spread, for 39% it read a wider one (median 2.3\u00d7 the cap) that was clipped down. Real bid/ask quotes for this whole universe are being recorded to replace the assumption with measured spreads."
+  ]
  }
 }

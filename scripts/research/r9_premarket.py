@@ -125,7 +125,7 @@ def add_ext(sub: pd.DataFrame) -> pd.DataFrame:
     return sub
 
 
-def add_overnight(sub: pd.DataFrame) -> pd.DataFrame:
+def add_overnight(sub: pd.DataFrame, cutoff_hour: int = 9) -> pd.DataFrame:
     ctx = pickle.load(open(cli.CONTEXT_PATH, "rb"))
     events = ctx.get("events") or {}
     codes = {s: i for i, s in enumerate(sorted(sub["symbol"].unique()))}
@@ -150,7 +150,7 @@ def add_overnight(sub: pd.DataFrame) -> pd.DataFrame:
     rc = sub["symbol"].map(codes).to_numpy(np.int64)
     t0 = pd.DatetimeIndex(sub["date"]).tz_localize(ET) + pd.Timedelta(hours=16)
     dd = pd.DatetimeIndex(sub["D"])
-    t1 = dd.tz_localize(ET) + pd.Timedelta(hours=9)
+    t1 = dd.tz_localize(ET) + pd.Timedelta(hours=cutoff_hour)
     m0 = (t0.tz_convert("UTC").asi8 // 60_000_000_000).astype(np.int64)
     m1 = np.where(dd.isna(), m0, (t1.tz_convert("UTC").asi8 // 60_000_000_000)).astype(np.int64)
     has = sub["symbol"].isin(set(events)).to_numpy()

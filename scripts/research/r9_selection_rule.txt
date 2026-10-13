@@ -40,3 +40,64 @@ CONFIRM #1 mean open->close are each <= A_m0's and each within 0.5 pt of D2_8's 
 R10d — pre-registered 2026-10-12 10:05 CT: Yahoo's pre-market coverage fell ~20-30% from 2026-10-07 (live 69% vs 85% normal
 for the same names on 10-12). Test D3_8 with 25% of its finite pre-market gaps blanked at TEST time only (training unchanged).
 If its DEV and CONFIRM #1 mean open->close are each <= A_m0's, the pre-market guard ratio is set to 0.70; otherwise 0.85 stays.
+
+R11 — $30K-ready board, written 2026-10-12 ~15:09 CT, before any R11 variant was run (the job started 15:11:52 CT —
+data/jobs/r11.log; the "15:35" first written here was a wrong clock reading, corrected 20:30 CT; not committed to git
+before the run):
+User requirement: every one of the 100 board names must take a $30K short without heavy slippage or manipulation-prone
+microstructure. Universe L ("$30K-ready"): the published rule (no SSR next session, >= $300K median $ volume) AND
+capacity >= $30K (<= 5% of the conservative expected session $ volume AND <= 0.5% one-way square-root impact) AND prior
+close >= $1. Live it also needs IBKR lendable >= $30K, squeeze danger < 70 and no halt (no history for those).
+Metric: mean net short return per $30K position (open->close minus the current conservative round-trip cost at $30K),
+over ranks 1-100 of L each session ("ALL100"). All candidates walk-forward on the production folds, with the pre-market
+model's inputs (close features + gap from the last pre-market trade before 8:00 ET):
+  L0 production D3_8 ranked within L | L1 dump classifier fit on L rows only | L2 <= -3% classifier on L rows |
+  L3 regression on the session-demeaned open->close (L rows, clipped +-30%) | L4 regression on the within-session
+  percentile of open->close (L rows) | L5 rank-average of L0, L1 and L3.
+1. Winner = best DEV ALL100 net (ties within 0.05 pt -> better DEV top-10 net).
+2. Adopt the winner if its CONFIRM ALL100 net >= L0's AND its CONFIRM top-10 net >= L0's - 0.25 pt; else L0.
+3. Stage 2: W_on = winner + overnight filing counts, adopted only if its DEV and CONFIRM ALL100 net each improve by
+   >= 0.05 pt. W_m0 = winner recipe on close-only features = fallback when the pre-market feed check fails, if its
+   CONFIRM ALL100 net >= A_m0-within-L's; else A_m0 within L.
+Reported regardless: dump rate, mean/median move, squeeze rate and net per rank band, and the old (pre-$30K) board
+measured at $30K per name.
+
+R11 result (2026-10-12 15:19 CT): every candidate's ALL100 net at $30K is -1.5% to -1.7% per position (gross edge
++0.2-0.3% vs ~1.8% conservative cost). Rule: L0/L3/L4/L2 tie on DEV ALL100 (within 0.05 pt); L3 best DEV top-10 ->
+dev winner L3; CONFIRM ALL100 L3 -1.527 >= L0 -1.535 and top-10 -1.283 >= -1.456-0.25 -> L3 ADOPTED. Stage 2: overnight
+filings not adopted (DEV +0.02 pt < 0.05); fallback W_m0 (L3 recipe, close-only) adopted (CONFIRM -1.594 >= A_m0 -1.600).
+Old board measured at $30K/name: -4.1% (dev) / -4.3% (confirm) per position.
+
+R12 — holding period for the $30K board, written 2026-10-12 15:22 CT (the "15:40" first written here was a wrong clock
+reading), seconds before the job started (15:22:17 CT, data/jobs/r12.log). Disclosure: written AFTER the R11 results and
+after an exploratory look at the 5-session moves of the R11 board picks (#1 and top 10 looked better over 5 sessions), so
+R12 is not a blind test:
+Same universe L and L3 recipe (regression on the session-demeaned return, L rows, clipped +-50%), target = short from
+the next open to the close H sessions later, H in {5, 10}; walk-forward on the production folds with embargo max(5, H).
+Cost per position = the $30K round-trip cost once + a 5%/yr borrow allowance for H sessions.
+A "$30K swing board" (hold H sessions) is offered on the site only if, for some H, ALL100 net per position is > 0 in BOTH
+DEV and CONFIRM AND its net per held session (net / H) beats the same-day board's (R11 L3) in both. Otherwise report only.
+
+R11/R12 addendum (2026-10-12 ~17:14 CT; re-run launched 20:24 CT after a network outage) — bug fix found in review, before any production use: the $1 floor was applied to
+the split-ADJUSTED close, which builds in later reverse splits (future information; 11% of the backtest #1 picks were
+under $1 as traded). The floor now uses the as-traded price. R11 and R12 are re-run unchanged otherwise; the same
+pre-registered rules decide. Results above this addendum are superseded by the re-run.
+Also fixed in the same re-run (review): stage 2's overnight filings now stop at 8:00 ET, the morning model's cutoff
+(was 9:00 ET — look-ahead); R12's embargo is max(5, H+1) sessions (a halted symbol's label can run past H).
+
+R11 re-run outcome (2026-10-12 20:32/20:40 CT, r11.json): dev winner L4 (L0 -1.624 and L4 -1.657 tie within 0.05 pt;
+L4 better DEV top-10 -1.250 vs -1.377); CONFIRM ALL100 L4 -1.537 >= L0 -1.566 and top-10 -1.418 >= -1.564-0.25 -> L4
+ADOPTED. Stage 2: W_on (L4 + overnight counts to 8:00 ET) +0.053 / +0.077 pt -> adopted; fallback W_m0 adopted (CONFIRM
+-1.609 >= A_m0 -1.629). R12 re-run: no holding period offered (ALL100 -1.80 to -2.26 per position).
+R11c — pre-registered 2026-10-12 ~21:01 CT, before it was run (job started 21:01:3x CT): second review found that stage 2's filing events came from
+data/state/context.pkl (today's <= $2B universe only), so names that later grew past $2B had on_* = NaN — a look-ahead
+marker — and production (events for every symbol) cannot reproduce it. Stage 2 is re-tested with production's own code:
+sec.events_for_universe for every panel symbol + features.overnight_counts(cutoff_hour=8). Same threshold: adopt
+overnight filings only if DEV and CONFIRM ALL100 net each improve by >= 0.05 pt over L4; otherwise the morning ranker is
+L4 on close features + the pre-market gap only. Reported, no decision: the production-style hybrid (morning ranker only on
+the top 450 by the close-only ranker).
+R11c outcome (2026-10-12 21:06 CT, r11c.json): with every stock's filing history, L4 + overnight filings vs L4 = +0.014 pt
+(DEV, 90% CI -0.036..+0.063) / +0.051 pt (CONFIRM) -> DEV below the +0.05 bar -> overnight filings NOT adopted. Shipped:
+morning $30K ranker = L4 on close features + the 8:00 ET pre-market gap; evening / feed-check fallback = L4 close-only.
+Production-faithful board (morning ranker on the top 450 by the close-only ranker, the rest close-only): ALL100 net
+-1.64 / -1.53 per position; #1 dumped 25.6% / 27.7%, net -2.00 / -1.61.

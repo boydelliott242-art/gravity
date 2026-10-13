@@ -303,11 +303,12 @@ def _add_morning_features(panel: pd.DataFrame, events: Dict[str, List[dict]]) ->
     for c in features.EXT_EXTRA:
         if c in features.M1_EXTRA:
             panel[c] = f[c].astype(np.float32).to_numpy()
-    if any(c in features.M1_EXTRA for c in features.ON_FEATURES):
-        nxt = features.next_session_dates(panel["date"])
-        on = features.overnight_counts(panel["symbol"].to_numpy(), panel["date"], nxt, events)
-        for c in features.ON_FEATURES:
-            panel[c] = on[c].astype(np.float32)
+    # overnight filing counts up to the morning cutoff: the $30K morning ranker's inputs (and M1's if ext_on)
+    nxt = features.next_session_dates(panel["date"])
+    on = features.overnight_counts(panel["symbol"].to_numpy(), panel["date"], nxt, events,
+                                   cutoff_hour=int(getattr(config, "MORNING_CUTOFF_ET", 9)))
+    for c in features.ON_FEATURES:
+        panel[c] = on[c].astype(np.float32)
     log.info("morning features (%s): %.0f%% of rows have an extended-hours price (%.0fs)", features.MORNING_SET,
              100 * float(np.isfinite(panel["gap_open"]).mean()), time.time() - t0)
 
@@ -329,12 +330,14 @@ def _morning_inputs(latest: pd.DataFrame, shortlist: List[str], pre: Dict[str, d
     for c in features.EXT_EXTRA:
         if c in features.M1_EXTRA:
             sub[c] = xf[c].to_numpy(float) if c in xf else np.nan
-    if any(c in features.M1_EXTRA for c in features.ON_FEATURES):
-        ev = {s: list(events.get(s, [])) + list(overnight.get(s, [])) for s in shortlist}
-        n = len(shortlist)
-        on = features.overnight_counts(np.array(shortlist, dtype=object), [last_date] * n, [pd.Timestamp(session)] * n, ev)
-        for c in features.ON_FEATURES:
-            sub[c] = on[c]
+    # filings accepted from the last close to the morning cutoff (as in training; later ones are ignored).
+    # Names with no filing history at all stay unknown (NaN), exactly as training sees them.
+    ev = {s: list(events.get(s, [])) + list(overnight.get(s, [])) for s in shortlist if s in events or s in overnight}
+    n = len(shortlist)
+    on = features.overnight_counts(np.array(shortlist, dtype=object), [last_date] * n, [pd.Timestamp(session)] * n, ev,
+                                   cutoff_hour=int(getattr(config, "MORNING_CUTOFF_ET", 9)))
+    for c in features.ON_FEATURES:
+        sub[c] = on[c]
     # guard: only names Yahoo actually answered for, and only when the feed is as
     # complete as the data the model was trained on (Yahoo dropped bars on 2026-10-07)
     fetched = xf["fetched"].fillna(False).astype(bool).to_numpy() if "fetched" in xf else np.zeros(len(shortlist), bool)
@@ -667,10 +670,28 @@ def _nn(v: Any) -> Any:
     return None if v is None or (isinstance(v, float) and math.isnan(v)) else v
 
 
+def _lend_short(sym: str, borrow: dict, borrow_ok: bool, price: Any) -> Optional[float]:
+    """IBKR's lendable dollars when they are fewer than a BOARD_MIN_USD short
+    needs (None when enough, or when the borrow list / price is unknown)."""
+    if not borrow_ok:
+        return None
+    b = borrow.get(sym)
+    try:
+        avail, px = float(b["available"]), float(price)
+    except (TypeError, KeyError, ValueError):
+        return None
+    if not (math.isfinite(avail) and math.isfinite(px)) or px <= 0:
+        return None
+    return avail * px if avail * px < config.BOARD_MIN_USD else None
+
+
 def _gate_bad(sym: str, latest: pd.DataFrame, borrow: dict, borrow_ok: bool, E: dict) -> bool:
-    """The board's exclusion rule (no borrow, halted, or squeeze danger ≥ 70),
-    computed exactly as make_pick computes it."""
+    """The board's exclusion rule (no borrow, IBKR can't lend a BOARD_MIN_USD
+    short, halted, or squeeze danger ≥ 70), computed exactly as make_pick
+    computes it."""
     r = latest.loc[sym]
+    if _lend_short(sym, borrow, borrow_ok, _nn(r.get("close"))) is not None:
+        return True
     short = score.shortability(sym, borrow, borrow_ok)
     si_rows = E["si"].get(sym) or []
     fl = E["floats"].get(sym) or {}
@@ -799,6 +820,8 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
     since = datetime.combine(last_date.date(), datetime.min.time(), tzinfo=ET).replace(hour=16)
     t_s = time.time()
     overnight_list = _safe(sec.latest_filings, since.astimezone(timezone.utc), default=[]) or []
+    # was EDGAR's current feed read completely? (the $30K morning ranker counts overnight filings from it)
+    sec_feed_ok = bool(((getattr(sec, "_parts", None) or {}).get("latest") or (False,))[0])
     ft = _safe(sec.fulltext_catalysts, last_date.date().isoformat(), session.isoformat(), default=[]) or []
     merged = _safe(sec.merge_events, overnight_list, ft, default=None)
     if merged is None:
@@ -812,7 +835,7 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
              len(overnight), len(overnight_list), len(ft), time.time() - t_s)
 
     # 2) model pass 1 (M0) on everything
-    OUT = ["prob_dump", "prob_bigdump", "prob_squeeze", "exp_oc", "prob_swing", "prob_pump", "skew"]
+    OUT = ["prob_dump", "prob_bigdump", "prob_squeeze", "exp_oc", "prob_swing", "prob_pump", "skew", "liq_edge"]
     pred = model.predict(bundle, latest, use_open=False)
     latest = latest.join(pred[[c for c in OUT if c in pred.columns]], rsuffix="_m")
     for c in OUT:
@@ -820,13 +843,20 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
             latest[c] = np.nan
     latest["model_used"] = "m0"
     latest["prob_dump_m0"] = latest["prob_dump"]
+    # the board universe (R11): names that take a BOARD_MIN_USD short without moving the price,
+    # ranked by the $30K ranker (expected open→close shortfall versus the typical such name)
+    latest["liq_ok"] = model.liquid_mask(latest)
+    rank_col = "liq_edge" if latest["liq_edge"].notna().any() else "prob_dump"
+    if rank_col != "liq_edge":
+        log.warning("model bundle has no $30K ranker — board ranked by dump odds until the next train")
+    log.info("$%s-ready universe: %d of %d names", f"{config.BOARD_MIN_USD:,}", int(latest["liq_ok"].sum()), len(latest))
 
     # 3) shortlist → pre-market snapshot → M1 where we have a gap proxy
-    order = latest.sort_values("prob_dump", ascending=False)
+    order = latest[latest["liq_ok"]].sort_values(rank_col, ascending=False)
     # the morning model must score at least as deep as the board selection walks
     shortlist = list(order.index[:BOARD_POOL_MAX + 90])
     supply = [s for s, evs in overnight.items()
-              if s in latest.index and any(e.get("category") in score.SUPPLY_CATS for e in evs)]
+              if s in latest.index and bool(latest.at[s, "liq_ok"]) and any(e.get("category") in score.SUPPLY_CATS for e in evs)]
     shortlist += [s for s in supply if s not in shortlist]
     pre: Dict[str, dict] = {}
     want_pre = phase == "pre-market" or run == "morning"
@@ -854,10 +884,18 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
         use_open_syms = [s for s in shortlist if s in pre and pre[s].get("gap_pct") is not None and phase == "pre-market"]
         sub = latest.loc[use_open_syms].copy()
         sub["gap_open"] = [pre[s]["gap_pct"] for s in use_open_syms]
+    # the $30K morning ranker reads overnight filing counts: if EDGAR's current feed was incomplete it
+    # would see "no filings" for names that did file, so it falls back to the close-only ranker
+    liq_on_feed = bool(features.LIQ_M1_EXTRA) and any(c in features.LIQ_M1_EXTRA for c in features.ON_FEATURES)
+    keep_liq_m0 = liq_on_feed and not sec_feed_ok
+    if use_open_syms and liq_on_feed:
+        net.record_status("Overnight filings for the $30K ranker", sec_feed_ok,
+                          "EDGAR current feed complete" if sec_feed_ok else
+                          "EDGAR current feed incomplete — the $30K board uses the close-only ranker this run")
     if use_open_syms:
         p1 = model.predict(bundle, sub, use_open=True)
         for c in OUT:
-            if c in p1.columns:
+            if c in p1.columns and not (c == "liq_edge" and keep_liq_m0):
                 latest.loc[use_open_syms, c] = p1[c].values
         latest.loc[use_open_syms, "model_used"] = "m1"
 
@@ -900,10 +938,12 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
         latest["short_ratio_5d"] = np.nan
     latest["borrow_status"] = [score.shortability(s, borrow, borrow_ok)["status"] for s in latest.index]
     today_iso, run_day = session.isoformat(), now_et().date().isoformat()
+    _liq = ((bundle.get("report") or {}).get("liquid") or {}).get("m1" if use_open_syms else "m0") or {}
+    _lb = {(b_.get("lo"), b_.get("hi")): b_ for b_ in (_liq.get("bands") or [])}
     _pub = ((bundle.get("report") or {}).get("oos") or {}).get("m0") or {}
-    _mv = _pub.get("pub1_mean_oc")
-    avg_move = (-float(_mv)) if (_mv is not None and _mv < 0) else None   # the published #1's historical average drop
-    _m10 = _pub.get("top10_mean_oc")
+    _mv = (_lb.get((1, 1)) or {}).get("mean_oc") if _lb else _pub.get("pub1_mean_oc")
+    avg_move = (-float(_mv)) if (_mv is not None and _mv < 0) else None   # the board #1's historical average drop
+    _m10 = (_lb.get((1, 10)) or {}).get("mean_oc") if _lb else _pub.get("top10_mean_oc")
     avg_move_10 = (-float(_m10)) if (_m10 is not None and _m10 < 0) else None  # a top-10 pick's
 
     from . import live as _live
@@ -931,10 +971,10 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
         signs = {}
     latest = latest.join(score.family_scores(latest, feature_docs, signs))
 
-    # 7) candidates: board pool, swing pool, provisional #1 (for twins)
-    order = latest.sort_values("prob_dump", ascending=False)
+    # 7) candidates: board pool, swing pool, provisional #1 (for twins) — all $30K-ready
+    order = latest[latest["liq_ok"]].sort_values(rank_col, ascending=False)
     shortable = latest["borrow_status"].isin(["ETB", "HTB", "UNKNOWN"])
-    swing_order = latest[shortable & latest["prob_swing"].notna()].sort_values("prob_swing", ascending=False)
+    swing_order = latest[shortable & latest["liq_ok"] & latest["prob_swing"].notna()].sort_values("prob_swing", ascending=False)
     swing_pool = list(swing_order.index[:25])
     provisional = next((s for s in order.index if latest.at[s, "publishable"] and latest.at[s, "borrow_status"] in ("ETB", "HTB")), None)
     feat_rows = latest.copy()
@@ -1057,6 +1097,7 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
             "prob_dump": m.get("prob_dump"), "prob_bigdump": m.get("prob_bigdump"),
             "prob_squeeze": m.get("prob_squeeze"), "exp_oc": m.get("exp_oc"),
             "prob_swing": m.get("prob_swing"), "prob_pump": m.get("prob_pump"), "skew": m.get("skew"),
+            "liq_edge": m.get("liq_edge"), "lend_short": _lend_short(sym, borrow, borrow_ok, price),
             "lift": m.get("lift"), "score": None if m.get("score") is None else int(m["score"]),
             "model_used": m.get("model_used"),
             "ssr": bool(m.get("ssr")), "publishable": bool(m.get("publishable")),
@@ -1096,7 +1137,8 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
     board, squeeze_zone = [], []
     for sym in board_pool:
         p = make_pick(sym, None, with_chart=True)
-        bad = p["shortability"]["status"] == "NONE" or (p["squeeze_danger"] or 0) >= 70 or "HALTED" in p["flags"]
+        bad = (p["shortability"]["status"] == "NONE" or (p["squeeze_danger"] or 0) >= 70 or "HALTED" in p["flags"]
+               or p.get("lend_short") is not None)
         if bad:
             if len(squeeze_zone) < 12:
                 p["zone_reason"] = _zone_reason(p)
@@ -1105,7 +1147,8 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
             p["rank"] = len(board) + 1
             board.append(p)
     net.record_status("Board fill", len(board) >= config.BOARD_SIZE,
-                      f"{len(board)}/{config.BOARD_SIZE} eligible names from the top {depth} by dump odds "
+                      f"{len(board)}/{config.BOARD_SIZE} eligible names from the top {depth} of "
+                      f"{int(latest['liq_ok'].sum())} ${config.BOARD_MIN_USD // 1000}K-ready names "
                       f"({len(squeeze_zone)} held back in the squeeze zone)")
     # The #1 follows the publication rule the backtest measured: no Rule 201
     # restriction and ≥ $300k median daily volume (plus borrow + squeeze < 70).
@@ -1150,7 +1193,8 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
     for s in swing_pool:
         pk = make_pick(s, None, with_chart=True)
         # a week-long short sits through every squeeze: same exclusions as the board
-        if pk["shortability"]["status"] == "NONE" or (pk["squeeze_danger"] or 0) >= 70 or "HALTED" in pk["flags"]:
+        if (pk["shortability"]["status"] == "NONE" or (pk["squeeze_danger"] or 0) >= 70 or "HALTED" in pk["flags"]
+                or pk.get("lend_short") is not None):
             continue
         pk["rank"] = len(swing_board) + 1
         pk["board_rank"] = rank_of.get(s)
@@ -1193,6 +1237,10 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
             "oos_auc": ((report.get("oos") or {}).get("m1" if use_open_syms else "m0") or {}).get("auc"),
             "prob_cap": {m_: ((bundle.get(m_) or {}).get("dump") or {}).get("cap") for m_ in ("m0", "m1")},
             "publication_rule": (report.get("publication_rule") or {}).get("text"),
+            "board_rule": (report.get("liquid") or {}).get("rule"),
+            "board_min_usd": config.BOARD_MIN_USD,
+            "board_ranker": "liq" if rank_col == "liq_edge" else "dump",
+            "board_universe": int(latest["liq_ok"].sum()),
         },
         "top_tie_count": tie_n,
         "size_summary": size_summary,
@@ -1402,6 +1450,9 @@ def _zone_reason(p: dict) -> str:
     sh = p["shortability"]
     if sh["status"] == "NONE":
         return "No shares available to borrow at IBKR — you likely can't short it."
+    if p.get("lend_short") is not None:
+        return (f"IBKR can lend only about ${p['lend_short']:,.0f} — less than a "
+                f"${config.BOARD_MIN_USD:,.0f} short needs.")
     if "HALTED" in p["flags"]:
         return "Halted / no trades last session."
     parts = p.get("squeeze_parts") or {}

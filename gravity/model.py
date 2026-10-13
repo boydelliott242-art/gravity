@@ -47,7 +47,7 @@ import numpy as np
 import pandas as pd
 
 from . import config
-from .features import (FAMILIES, FEATURE_DOCS, FEATURES, FINRA_FEATURES, LABELS, M1_EXTRA,
+from .features import (FAMILIES, FEATURE_DOCS, FEATURES, FINRA_FEATURES, LABELS, LIQ_M1_EXTRA, M1_EXTRA,
                        PUMP_THRESHOLD, SWING_THRESHOLD)
 from .util import clean
 
@@ -69,6 +69,7 @@ LIQ_FLOOR = 300_000                           # published #1 needs ≥ $300k 20-
 CAP_FROM = 0.5                                # probabilities above this are capped at their realised OOS rate
 SIM_FRACTION = 0.10                           # compounded curve: risk 10% of equity per day
 REALISTIC_SIZES = (10_000, 50_000)            # per-pick cost model sizes reported in the sim
+LIQ_SIZE = config.BOARD_MIN_USD               # every board name must take this short without moving the price
 TIE_EPS = 1e-6                                # isotonic ties broken by the raw score (moves p by < 1e-6)
 BUNDLE_NAME = "bundle.pkl"
 DEFAULT_SITE_JSON = config.SITE_DATA / "model.json"
@@ -177,6 +178,58 @@ def publishable(df: pd.DataFrame) -> np.ndarray:
     history — that part of the rule is unvalidated."""
     dv = _numcol(df, "dvol20")
     return (~ssr_next(df)) & np.isfinite(dv) & (dv >= LIQ_FLOOR)
+
+
+def market_capacity(df: pd.DataFrame) -> np.ndarray:
+    """Largest short (USD) each row's next session absorbs within ≤ 5% of the
+    conservative expected $ volume and ≤ 0.5% one-way square-root impact
+    (capacity.market_capacity; no borrow limit — that is applied live)."""
+    from . import capacity as CAP
+    close, vol = _numcol(df, "close"), _numcol(df, "volume")
+    dv20, sig = _numcol(df, "dvol20"), _numcol(df, "vol20")
+    dvx = CAP.exp_dvol(np.nan_to_num(dv20, nan=0.0), np.nan_to_num(close * vol, nan=0.0))
+    cap = np.asarray(CAP.market_capacity(dvx, sig), float)
+    return np.where(np.isfinite(sig) & np.isfinite(dv20), cap, 0.0)
+
+
+def liquid_mask(df: pd.DataFrame) -> np.ndarray:
+    """The "$30K-ready" universe the board is drawn from (R11): the publication
+    rule (no Rule 201 next session, ≥ LIQ_FLOOR median $ volume) AND an
+    as-traded prior close ≥ BOARD_MIN_PRICE AND market capacity ≥ BOARD_MIN_USD. Live, a name
+    also needs IBKR lendable ≥ BOARD_MIN_USD, squeeze danger < 70 and no halt."""
+    # the price floor uses the AS-TRADED price: split-adjusted closes build in later reverse splits
+    # (a $0.30 stock that reverse-splits 1:50 next year shows a $15 adjusted close today)
+    px = _numcol(df, "price") if "price" in df.columns else _numcol(df, "close")
+    px = np.where(np.isfinite(px), px, _numcol(df, "close"))
+    with np.errstate(invalid="ignore"):
+        return (publishable(df) & np.isfinite(px) & (px >= config.BOARD_MIN_PRICE)
+                & (market_capacity(df) >= LIQ_SIZE))
+
+
+def _liq_target(day: np.ndarray, oc: np.ndarray, liq: np.ndarray) -> np.ndarray:
+    """Within-session percentile (0–1] of open→close among $30K-ready rows;
+    NaN elsewhere (R11 winner, L4). A rank target ignores the market's move
+    and the size of outliers — the board only needs which names do worse than
+    their peers that session."""
+    out = np.full(len(oc), np.nan)
+    m = np.asarray(liq, bool) & np.isfinite(oc)
+    if m.any():
+        out[m] = pd.Series(oc[m]).groupby(np.asarray(day)[m]).rank(pct=True).to_numpy()
+    return out
+
+
+def _fit_liq(X: np.ndarray, y: np.ndarray, idx: np.ndarray, ncols: int, s: Dict[str, Any],
+             rng: np.random.Generator):
+    """The $30K-board ranker: regression of the within-session open→close
+    percentile on the $30K-ready rows in ``idx`` (NaN targets are skipped)."""
+    from sklearn.ensemble import HistGradientBoostingRegressor
+
+    idx = idx[np.isfinite(y[idx])]
+    if len(idx) < 1000:
+        return None
+    if len(idx) > int(s["max_fit_rows"]):
+        idx = np.sort(rng.choice(idx, int(s["max_fit_rows"]), replace=False))
+    return HistGradientBoostingRegressor(**s["hgb"]).fit(X[idx, :ncols], y[idx])
 
 
 # ── Small helpers ────────────────────────────────────────────────────────
@@ -536,10 +589,12 @@ def _sim(daily: pd.DataFrame, cost: float = COST) -> Dict[str, Any]:
 
 
 RANK_BANDS = ((1, 1), (2, 10), (11, 25), (26, 50), (51, 100), (101, 150), (151, 250), (251, 400))
+LIQ_BANDS = ((1, 1), (2, 10), (11, 25), (26, 50), (51, 100), (101, 150), (151, 250), (251, 400), (1, 10), (1, 100))
 
 
 def _rank_bands(day: np.ndarray, prob: np.ndarray, y: np.ndarray, oc: np.ndarray, sq: np.ndarray,
-                mask: Optional[np.ndarray] = None) -> Dict[str, Any]:
+                mask: Optional[np.ndarray] = None, cost: Optional[np.ndarray] = None,
+                bands: Sequence[Tuple[int, int]] = ()) -> Dict[str, Any]:
     """Out-of-sample record of each board rank band: rank every scored name
     by its dump odds within the day (optionally only ``mask`` rows) and report
     what each band did the next session. This is what a reader of rank 37
@@ -547,19 +602,26 @@ def _rank_bands(day: np.ndarray, prob: np.ndarray, y: np.ndarray, oc: np.ndarray
     ok = np.isfinite(prob) & np.isfinite(oc)
     if mask is not None:
         ok &= mask
-    d = pd.DataFrame({"day": day[ok], "p": prob[ok], "y": y[ok], "oc": oc[ok], "sq": sq[ok]})
+    d = pd.DataFrame({"day": day[ok], "p": prob[ok], "y": y[ok], "oc": oc[ok], "sq": sq[ok],
+                      "c": cost[ok] if cost is not None else np.nan})
     if not len(d):
         return {}
     d = d.sort_values(["day", "p"], ascending=[True, False])
     d["rk"] = d.groupby("day").cumcount() + 1
     out: Dict[str, Any] = {"base_dump": _f(d["y"].mean()), "base_mean_oc": _f(d["oc"].mean()), "bands": []}
-    for lo, hi in RANK_BANDS:
+    if cost is not None:
+        out["base_cost"] = _f(d["c"].mean())
+    for lo, hi in (bands or RANK_BANDS):
         x = d[(d["rk"] >= lo) & (d["rk"] <= hi)]
         if not len(x):
             continue
-        out["bands"].append({"lo": lo, "hi": hi, "n": int(len(x)), "n_days": int(x["day"].nunique()),
-                             "hit": _f(x["y"].mean()), "mean_oc": _f(x["oc"].mean()), "median_oc": _f(x["oc"].median()),
-                             "squeeze": _f(x["sq"].mean()), "pump": _f((x["oc"] >= 0.05).mean())})
+        row = {"lo": lo, "hi": hi, "n": int(len(x)), "n_days": int(x["day"].nunique()),
+               "hit": _f(x["y"].mean()), "mean_oc": _f(x["oc"].mean()), "median_oc": _f(x["oc"].median()),
+               "squeeze": _f(x["sq"].mean()), "pump": _f((x["oc"] >= 0.05).mean())}
+        if cost is not None:
+            net = -x["oc"] - x["c"]
+            row.update({"cost": _f(x["c"].mean()), "net": _f(net.mean()), "win": _f((net > 0).mean())})
+        out["bands"].append(row)
     return out
 
 
@@ -777,13 +839,14 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
     rng = np.random.default_rng(int(s["seed"]))
     f0: List[str] = list(features) if features is not None else list(M0_FEATURES)
     f1: List[str] = f0 + [c for c in M1_EXTRA if c not in f0]
-    unknown = [c for c in f1 if c not in FEATURE_DOCS]
+    fl1: List[str] = f1 + [c for c in LIQ_M1_EXTRA if c not in f1]   # the $30K morning ranker's inputs
+    unknown = [c for c in fl1 if c not in FEATURE_DOCS]
     if unknown:
         raise ValueError(f"unknown feature columns: {unknown[:10]}")
     # morning-only extras (extended-hours shape, overnight filings) come from
     # sources outside the panel builder; if they are absent, M1 trains on NaN
     # for them (the model treats NaN as "not traded / unknown") rather than failing
-    extra_absent = [c for c in M1_EXTRA if c != "gap_open" and c not in panel.columns]
+    extra_absent = [c for c in dict.fromkeys(M1_EXTRA + LIQ_M1_EXTRA) if c != "gap_open" and c not in panel.columns]
     if extra_absent:
         log.warning("train: morning inputs %s absent from the panel — NaN in this fit", extra_absent)
         panel = panel.assign(**{c: np.nan for c in extra_absent})
@@ -801,9 +864,15 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
     row_dates = pd.to_datetime(lab["date"]).to_numpy(dtype="datetime64[ns]")
     dates = np.unique(row_dates)
     di = np.searchsorted(dates, row_dates)
-    X = _matrix(lab, f1)
+    X = _matrix(lab, fl1)          # f1 columns first: the classifiers use X[:, :n0] / X[:, :n1]
     Y = _label_arrays(lab)
-    n0, n1 = len(f0), len(f1)
+    n0, n1, nl1 = len(f0), len(f1), len(fl1)
+    liq_cols = {"m0": n0, "m1": nl1}
+    # the $30K board (R11): ranker trained only on $30K-ready rows, target = within-session open→close percentile
+    liq = liquid_mask(lab)
+    y_liq = _liq_target(row_dates, Y["y_oc"], liq)
+    oos_liq = {m: np.full(len(lab), np.nan) for m in ("m0", "m1")}
+    rng_l = np.random.default_rng(int(s["seed"]) + 11)   # own stream: the classifiers' subsamples are unchanged
     log.info("train: %d labeled rows, %d symbols, %d sessions (%s → %s)", len(lab), lab["symbol"].nunique(),
              len(dates), _day(dates[0]), _day(dates[-1]))
 
@@ -831,6 +900,10 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
             for c in OUT_COLUMNS:
                 oos[m][c][te_idx] = pr[c]
             row[f"auc_{m}"] = _auc(Y["y_dump"][te_idx], pr["prob_dump"])
+            reg = _fit_liq(X, y_liq, np.r_[fit_idx, cal_idx], liq_cols[m], s, rng_l)
+            te_l = te_idx[liq[te_idx]]
+            if reg is not None and len(te_l):
+                oos_liq[m][te_l] = 0.5 - reg.predict(X[te_l, :liq_cols[m]])
         row["seconds"] = round(time.time() - t_f, 1)
         fold_rows.append(row)
         log.info("fold %d/%d test %s→%s  n_fit=%d n_test=%d  AUC m0 %.3f m1 %.3f  (%.1fs)", k + 1, len(folds),
@@ -929,6 +1002,29 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
         }
     report_oos["extra"] = extra
 
+    # the $30K board: each rank band's walk-forward record among $30K-ready names, net of each
+    # name's own estimated round-trip cost at LIQ_SIZE (square-root impact on both legs + spread)
+    cost_liq = np.asarray(CAP.round_trip_cost(LIQ_SIZE, _dvx, _numcol(lab, "vol20"), _spr), float)
+    per_day = pd.Series(liq[tested]).groupby(row_dates[tested]).sum()
+    liquid: Dict[str, Any] = {
+        "size": LIQ_SIZE, "min_price": config.BOARD_MIN_PRICE,
+        "rule": (f"Every name can take a ${LIQ_SIZE:,.0f} short without moving the price: ≤ 5% of its conservative "
+                 f"expected session dollar volume and ≤ 0.5% estimated one-way price impact (square-root law), a price "
+                 f"≥ ${config.BOARD_MIN_PRICE:.0f}, no Rule 201 restriction and ≥ ${LIQ_FLOOR:,.0f} median daily volume. "
+                 f"Live it must also be lendable at IBKR for ≥ ${LIQ_SIZE:,.0f}, under squeeze danger 70 and not halted."),
+        "ranker": ("gradient-boosted regression of where each stock's open→close lands among that session's "
+                   "$30K-ready stocks (its percentile), trained only on $30K-ready names; chosen by a rule written "
+                   "down before the comparison (round 11)"),
+        "per_session_median": _f(per_day.median()) if len(per_day) else None,
+    }
+    for m in ("m0", "m1"):
+        sc = oos_liq[m]
+        t = tested & liq & np.isfinite(sc)
+        liquid[m] = _rank_bands(row_dates[t], sc[t], Y["y_dump"][t], Y["y_oc"][t], Y["y_squeeze"][t],
+                                cost=cost_liq[t], bands=LIQ_BANDS)
+        liquid[m]["spearman"] = (_f(pd.Series(sc[t]).corr(pd.Series(0.5 - y_liq[t]), method="spearman"))
+                                 if t.sum() > 10 else None)
+
     # 2) production fit: same recipe, window extended to the last labeled session
     t_fin = time.time()
     last = len(dates) - 1
@@ -939,6 +1035,7 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
     fit_idx = np.flatnonzero(di <= fit_end)
     cal_idx = np.flatnonzero(di >= cal_start)
     prod = {m: _fit_set(X, Y, fit_idx, cal_idx, nc, s, rng) for m, nc in (("m0", n0), ("m1", n1))}
+    prod_liq = {m: _fit_liq(X, y_liq, np.r_[fit_idx, cal_idx], liq_cols[m], s, rng_l) for m in ("m0", "m1")}
     for m in prod:
         for t in TARGETS:
             if prod[m].get(t) is not None:
@@ -975,6 +1072,10 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
         "prob_bigdump is capped at prob_dump (a −15% day is also a −5% day).",
         f"Production model: fit through {_day(dates[fit_end])}, calibrated on "
         f"{_day(dates[cal_start])} → {_day(dates[last])} — the exact recipe the walk-forward evaluated.",
+        "$30K board ranker: a regression of each name's within-session open→close percentile among "
+        "$30K-ready names, fit only on $30K-ready rows (fit + calibration window), one per model set "
+        "(close-only and pre-market). liq_edge = 0.5 − predicted percentile (higher = expected to do worse "
+        "than the typical such name).",
         "Top-k and simulation rankings use each day's eligible names only (price ≥ $0.10, 20-day median "
         "dollar volume ≥ $50k, ≥ 60 prior sessions); no shortability filter.",
     ]
@@ -989,6 +1090,7 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
         "base_rate": {t: _f(np.nanmean(Y[c])) if np.isfinite(Y[c]).any() else None for t, c in TARGETS.items()},
         "oos": report_oos,
         "rank_bands": rank_bands,
+        "liquid": liquid,
         "swing": swing,
         "calibration": calib,
         "importance": imp0,
@@ -1014,7 +1116,7 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
             "oos_start": fold_rows[0]["test_start"] if fold_rows else None,
             "oos_end": fold_rows[-1]["test_end"] if fold_rows else None,
             "oos_rows": int(tested.sum()),
-            "fits_per_fold": 2 * (len(TARGETS) + 1), "final_fits": 2 * (len(TARGETS) + 1),
+            "fits_per_fold": 2 * (len(TARGETS) + 2), "final_fits": 2 * (len(TARGETS) + 2),
         },
         "folds": fold_rows,
         "production": {"fit_through": _day(dates[fit_end]), "calibration_start": _day(dates[cal_start]),
@@ -1023,7 +1125,7 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
         "training_notes": notes,
         "caveats": CAVEATS,
         "params": {"hgb": s["hgb"], "max_fit_rows": s["max_fit_rows"], "cost": COST, "oc_clip": list(OC_CLIP)},
-        "features": {"m0": f0, "m1": f1},
+        "features": {"m0": f0, "m1": f1, "liq_m0": f0, "liq_m1": fl1},
         "morning_set": _features_mod.MORNING_SET,
         "sklearn_version": sklearn.__version__,
         "timing": {"walk_forward_s": round(wf_s, 1), "final_fit_s": round(fin_s, 1),
@@ -1038,6 +1140,8 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
         "m1_features": f1,
         "m0": prod["m0"],
         "m1": prod["m1"],
+        "liq": prod_liq,
+        "liq_features": {"m0": f0, "m1": fl1},
         "report": report,
         "sklearn_version": sklearn.__version__,
     }
@@ -1104,6 +1208,18 @@ def predict(bundle: Dict[str, Any], rows: pd.DataFrame, use_open: bool) -> pd.Da
             which[mask] = m
     out = pd.DataFrame(vals, index=rows.index)[OUT_COLUMNS]
     out["model"] = which
+    # $30K-board score: 0.5 − expected open→close percentile among $30K-ready stocks
+    # (higher = better short); NaN for a bundle trained before the ranker existed
+    edge = np.full(n, np.nan)
+    liq = (bundle or {}).get("liq") or {}
+    if n and liq:
+        lf = (bundle.get("liq_features") or {}).get("m1") or f1   # older bundles: the classifier's M1 columns
+        Xl = X if list(lf) == list(f1) else _matrix(rows, lf)     # + overnight filing counts (absent → NaN)
+        for m, mask, Xm, cols in (("m0", ~use1, X, len(f0)), ("m1", use1, Xl, len(lf))):
+            reg = liq.get(m)
+            if reg is not None and mask.any():
+                edge[mask] = 0.5 - reg.predict(Xm[mask, :cols])
+    out["liq_edge"] = edge
     return out
 
 

@@ -164,7 +164,7 @@ def breakeven_size(avg_move: float, dvx, sigma, spread) -> float:
     return float(dvx * (room / (2 * Y_IMPACT * sig)) ** 2)
 
 
-SIZES = (10_000, 50_000, 100_000, 500_000, 1_000_000)
+SIZES = (10_000, 30_000, 50_000, 100_000, 500_000, 1_000_000)
 
 
 def size_block(price, dv20, dv1, sigma, high, low, close, available, avg_move: Optional[float],

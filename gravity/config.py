@@ -65,6 +65,12 @@ ASIA_COUNTRIES = {
 
 # ── Output sizes ─────────────────────────────────────────────────────────
 BOARD_SIZE = 100         # ranked picks shown on the board, each with the full dossier
+# Every name on the board (and the #1) must take a short of at least BOARD_MIN_USD without moving
+# the price: <= 5% of its conservative expected session $ volume, <= 0.5% estimated one-way impact
+# (capacity.market_capacity), IBKR lendable >= BOARD_MIN_USD, and a price >= BOARD_MIN_PRICE.
+# Ranking inside that universe: R11 (data/research/r9_selection_rule.txt, r11.json).
+BOARD_MIN_USD = 30_000
+BOARD_MIN_PRICE = 1.0
 DOSSIER_SIZE = 60        # legacy pool size (board selection now walks the ranking — cli.BOARD_POOL_MAX)
 TWINS_SIZE = 12          # INHD lookalikes
 CHART_SESSIONS = 120     # daily bars embedded per pick for the chart

@@ -228,5 +228,142 @@ if r10 and r10b and (r10b.get("decision") or {}).get("adopt_pm_only") and r9c:
     doc["verdict"] = head + [v for v in doc["verdict"] if v not in old_morning]
     print("R10: morning model = pre-market only, 8:00 ET cutoff")
 
+# ── Round 11/12: every board name able to take a $30K short ──
+f11, f12, f11c = R / "r11.json", R / "r12.json", R / "r11c.json"
+if f11.exists():
+    r11 = json.loads(f11.read_text())
+    r12 = json.loads(f12.read_text()) if f12.exists() else {}
+    r11c = json.loads(f11c.read_text()) if f11c.exists() else {}
+    rc = json.loads((R / "r11_costs.json").read_text()) if (R / "r11_costs.json").exists() else {}
+    won = r11["decision"]["adopted"]
+    on = bool(r11c.get("decision", {}).get("overnight_filings")) if r11c else bool(r11["decision"].get("overnight_filings"))
+    V, VC = r11["variants"], r11c.get("variants", {})
+    # what production actually publishes each morning: close-only ranker for every $30K-ready name, the morning
+    # ranker for the top 450 of them (R11c hybrid); the evening watchlist / feed-check fallback = close-only ranker
+    ship_key = ("hybrid_L4_on_allsym" if on else "hybrid_L4") if VC else ("W_on" if on else won)
+    new = VC.get(ship_key) or V[won]
+    m0v = VC.get("L4_m0") or V.get("W_m0")
+    old = r11["before"]["old_board_at_30k"]
+    dump_l = V["L0"]                                    # the dump-odds model ranked within the same $30K-ready names
+    rows30 = []
+    for k, lab in (("1-1", "#1"), ("2-10", "Ranks 2–10"), ("11-25", "Ranks 11–25"), ("26-50", "Ranks 26–50"),
+                   ("51-100", "Ranks 51–100"), ("1-100", "All 100")):
+        g = lambda src, f: dc(lambda per: src[per][k][f])  # noqa: E731
+        rows30.append({"band": lab, "old_hit": g(old, "hit"), "old_mean": g(old, "mean_oc"), "old_net": g(old, "net30"),
+                       "new_hit": g(new, "hit"), "new_mean": g(new, "mean_oc"), "new_cost": g(new, "cost30"),
+                       "new_net": g(new, "net30"), "new_net_half": g(new, "net30_halfspread"), "new_squeeze": g(new, "squeeze")})
+    nv = lambda per, k, f: new[per][k][f]  # noqa: E731
+    ov = lambda per, k, f: old[per][k][f]  # noqa: E731
+    two = lambda src, k, f, fmt=sg: f"{fmt(src['dev'][k][f])} / {fmt(src['confirm'][k][f])}"  # noqa: E731
+    pc = lambda x: f"{x*100:.0f}%"  # noqa: E731
+    pt2 = lambda x: f"{'+' if x >= 0 else '−'}{abs(x)*100:.2f} pt"  # noqa: E731
+    allv = {c: dc(lambda per: V[c][per]["1-100"]["net30"]) for c in ("L0", "L1", "L2", "L3", "L4", "L5")}
+    lo_all = min(min(v.values()) for v in allv.values()); hi_all = max(max(v.values()) for v in allv.values())
+    pv = r11.get("paired_vs_L0", {})
+    worse = [c for c, x in pv.items() if c in allv and any(x[per]["ci90"][1] < 0 for per in ("dev", "confirm"))]
+    better = [c for c, x in pv.items() if c in allv and any(x[per]["ci90"][0] > 0 for per in ("dev", "confirm"))]
+    names = {"L0": "the production dump model", "L1": "a dump classifier trained only on these names",
+             "L2": "a 3%-drop classifier", "L3": "a regression on each stock's move versus its peers",
+             "L4": "a regression on its within-day percentile", "L5": "an average of three of them"}
+    andj = lambda xs: (", ".join(xs[:-1]) + " and " + xs[-1]) if len(xs) > 1 else (xs[0] if xs else "")  # noqa: E731
+    hz = {H: dc(lambda per: r12[f"H{H}"][per]["1-100"]["net"]) for H in (5, 10) if f"H{H}" in r12}
+    hz_lo = min((min(v.values()) for v in hz.values()), default=None); hz_hi = max((max(v.values()) for v in hz.values()), default=None)
+    nb = rc.get("net_by_spread_multiple", {})
+    verdict = [
+        f"New: all 100 board names (and the #1) pass a $30K test — at most 5% of the stock's expected volume, at most 0.5% "
+        f"estimated price impact, an as-traded price of $1 or more and no short-sale restriction; live, each board name must "
+        f"also be lendable at IBKR for $30K or more whenever IBKR's list is available (otherwise borrow shows as unknown). "
+        f"About {r11['universe']['per_session_median']:.0f} stocks pass the volume, impact and price test on a typical day, "
+        f"before the borrow, squeeze and halt checks.",
+        f"The honest catch: the #1 dumps far less often. In the backtest the $30K board's #1 fell 5%+ open→close on "
+        f"{two(new, '1-1', 'hit', pc)} of sessions (old #1: {two(old, '1-1', 'hit', pc)}); ranks 51–100 on "
+        f"{two(new, '51-100', 'hit', pc)} (old: {two(old, '51-100', 'hit', pc)}). Most of that is liquidity — the dump-odds "
+        f"model's own #1 among the same $30K-ready names fell 5%+ on {two(dump_l, '1-1', 'hit', pc)} — and part is the ranker, "
+        f"which was chosen for all 100 names, not for the #1: its #1 dumps less often and netted "
+        + ("better" if all(new[p]['1-1']['net30'] > dump_l[p]['1-1']['net30'] for p in ('dev', 'confirm')) else
+           "worse" if all(new[p]['1-1']['net30'] < dump_l[p]['1-1']['net30'] - 0.0005 for p in ('dev', 'confirm')) else "no better")
+        + f" at $30K ({two(new, '1-1', 'net30')} versus {two(dump_l, '1-1', 'net30')} for the dump-odds #1). Same-or-better "
+        f"accuracy is not available at this size: the big "
+        f"intraday dumps happen in stocks too thin to take $30K.",
+        f"The old #1 itself, even charged its large estimated cost, netted {two(old, '1-1', 'net30')} at $30K — better than "
+        f"the new #1's {two(new, '1-1', 'net30')}. But it could take $30K within the volume and impact limits on only "
+        + (f"{pc(rc['old_top1_cap30_share']['dev'])} / {pc(rc['old_top1_cap30_share']['confirm'])} of days"
+           if rc.get("old_top1_cap30_share") else "a minority of days")
+        + " — the rest of the time a $30K short was exactly the heavy slippage this change exists to avoid, and the cost "
+        "model is least reliable for such oversized orders.",
+        f"Across all 100 at $30K a name, the new board is far better than the old one: per position after estimated costs "
+        f"{two(new, '1-100', 'net30')}, versus {two(old, '1-100', 'net30')} for the old board, whose thin names would pay "
+        f"about {ov('confirm', '1-100', 'cost30')*100:.1f}% to trade $30K.",
+        f"But shorting all 100 at $30K still lost money in the backtest: the average name moved only "
+        f"{sg(nv('confirm', '1-100', 'mean_oc'))} open→close against about {nv('confirm', '1-100', 'cost30')*100:.1f}% "
+        f"estimated cost"
+        + (f" ({sg(nb['0.5']['confirm'])} per position if real spreads are half the assumed ones, {sg(nb['2.0']['confirm'])} if double)"
+           if nb.get("0.5") and nb.get("2.0") else f" (half spreads: {sg(nv('confirm', '1-100', 'net30_halfspread'))})")
+        + f". The top 10 come closest ({two(new, '1-10', 'net30')}; half spreads {two(new, '1-10', 'net30_halfspread')}). "
+        f"Treat the lower ranks as a watchlist.",
+    ]
+    if m0v:
+        verdict.append(
+            f"The evening watchlist, and the morning page whenever the pre-market feed check fails, use the close-only version "
+            f"of the ranker: its #1 fell 5%+ on {two(m0v, '1-1', 'hit', pc)} and netted {two(m0v, '1-1', 'net30')}; all 100 "
+            f"netted {two(m0v, '1-100', 'net30')} per position. The morning version above re-scores the top 450 $30K-ready names "
+            f"with the pre-market gap" + (" and overnight filings" if on else "") + " — exactly as the live run does.")
+    rule = (f"Six ranking models were compared under a rule written down before the run: rank by development 100-name net, "
+            f"treat gaps under 0.05 pt as ties, break ties by development top-10 net, then require confirmation no worse than "
+            f"the production model. It picked {names.get(won, won)}. The six spanned {sg(hi_all)} to {sg(lo_all)} per position")
+    rule += ("; " + (f"{andj([names.get(c, c) for c in worse])} {'was' if len(worse) == 1 else 'were'} measurably worse than "
+                     f"production in at least one window (paired 90% interval below zero)" if worse else "")
+             + ("; " if worse and better else "")
+             + (f"{andj([names.get(c, c) for c in better])} measurably better in at least one window" if better else "")
+             + ("; the rest were statistically indistinguishable from production" if (worse or better) else
+                "; none was statistically distinguishable from production")) if pv else ""
+    pw = pv.get(won)
+    if pw:
+        spans = all(pw[per]["ci90"][0] <= 0 <= pw[per]["ci90"][1] for per in ("dev", "confirm"))
+        rule += (f"; against production, the adopted ranker's paired 90% interval {'spans zero in both windows' if spans else 'excludes zero in at least one window'}")
+    rule += "."
+    if r11c:
+        g0 = {per: VC["L4_on_allsym"][per]["1-100"]["net30"] - VC["L4"][per]["1-100"]["net30"] for per in ("dev", "confirm")}
+        rule += (f" A second pre-registered step tested adding counts of SEC filings accepted overnight (up to 8:00 ET). Its "
+                 f"first run took filing histories only for today's ≤ $2B universe — a look-ahead (names that later grew had "
+                 f"none), caught in review — so it was re-run with every stock's history: {pt2(g0['dev'])} / "
+                 f"{pt2(g0['confirm'])} per position against a bar of +0.05 pt in both windows, so overnight filings are "
+                 + ("ON in the morning ranker." if on else "NOT used."))
+    verdict.append(rule)
+    if hz_lo is not None:
+        h5, h10 = r12.get("H5", {}), r12.get("H10", {})
+        sent = (f"Holding 5 or 10 sessions instead (tested with the first round's peer-relative regression) did not fix the "
+                f"100-name board ({sg(hz_hi)} to {sg(hz_lo)} per position).")
+        if h5.get("dev", {}).get("1-1") and h10.get("dev", {}).get("1-1"):
+            sent += (f" Exploratory only — that test was designed after looking at 5-session moves and the top ranks were not "
+                     f"its question: the #1 netted {sg(h5['dev']['1-1']['net'])} / {sg(h5['confirm']['1-1']['net'])} held 5 "
+                     f"sessions and {sg(h10['dev']['1-1']['net'])} / {sg(h10['confirm']['1-1']['net'])} held 10; the top 10 "
+                     f"{sg(h5['dev']['1-10']['net'])} / {sg(h5['confirm']['1-10']['net'])} and {sg(h10['dev']['1-10']['net'])} / "
+                     f"{sg(h10['confirm']['1-10']['net'])}. A 10-session #1 is only about {h10['confirm']['1-1']['n'] // 10} "
+                     f"independent trades per window, and 1 in 20 of its positions lost "
+                     f"{h10['dev']['1-1']['p95_adverse']*100:.0f}% / {h10['confirm']['1-1']['p95_adverse']*100:.0f}% or more "
+                     f"before costs. Not shipped, not a recommendation.")
+        verdict.append(sent)
+    if rc:
+        verdict.append(
+            f"Costs are the biggest uncertainty, in both directions: on the backtest board the spread used is the "
+            f"liquidity-tier cap (1–3%) for {rc['share_at_cap']*100:.0f}% of names — for {rc['share_unreadable']*100:.0f}% the "
+            f"estimator could not read a spread, for {rc['share_read_wider_clipped']*100:.0f}% it read a wider one (median "
+            f"{rc['median_read_over_cap_when_clipped']:.1f}× the cap) that was clipped down. Real bid/ask quotes for this whole "
+            f"universe are being recorded to replace the assumption with measured spreads.")
+    doc["board30k"] = {
+        "title": "Round 11 — every name on the board can take a $30K short",
+        "note": ("Walk-forward, out of sample, development / confirmation. Old board = the previous ranking (dump odds) among "
+                 "publishable names (no Rule 201 next session, ≥ $300K a day) whatever their capacity, measured as if $30K "
+                 "went into each; $30K board = the morning board as the live run builds it (close-only ranker for every "
+                 "$30K-ready name, the morning ranker for its top 450). Net = open→close short minus each name's own "
+                 "estimated round-trip cost at $30K (square-root impact on both legs + spread)."),
+        "rows": rows30, "adopted": won + (" + overnight filings" if on else ""), "shipped_variant": ship_key,
+        "per_session": r11["universe"]["per_session_median"],
+        "variants_all100": allv, "horizons_all100": hz, "costs": rc, "verdict": verdict,
+    }
+    doc["question"] = "How much can each pick take without moving the price — and does accuracy survive the size?"
+    print("R11: $30K board block added (shipped", ship_key + ")")
+
 (ROOT / "docs" / "data" / "size_research.json").write_text(json.dumps(doc, indent=1))
 print("written", len(json.dumps(doc)))

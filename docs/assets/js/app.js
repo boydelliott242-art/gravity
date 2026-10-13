@@ -74,8 +74,31 @@ function fmtProb(p, d = 0) {
   return `${isNum(cap) && p.prob_dump >= cap - 1e-4 ? '≥' : ''}${pct(p.prob_dump, d)}`;
 }
 
+/** The $30K board's walk-forward record (model.json "liquid") for the model that ranked it. */
+function liqReport(which) {
+  const liq = obj(obj(S.model).liquid);
+  const honestM1 = which === 'm1' && obj(S.model).morning_set && S.model.morning_set !== 'official';
+  const key = honestM1 && liq.m1 ? 'm1' : 'm0';
+  return { liq, key, rep: obj(liq[key]) };
+}
+const liqBand = (rep, lo, hi) => arr(rep.bands).find((b) => b && b.lo === lo && b.hi === hi) || null;
+const BOARD_MIN = () => (isNum(obj(obj(S.today).model).board_min_usd) ? S.today.model.board_min_usd : isNum(obj(obj(S.model).liquid).size) ? S.model.liquid.size : 30000);
+
 /** One honest sentence about how the #1 has fared historically (model.json walk-forward). */
 function backtestLine(which) {
+  const { liq, key: lkey, rep } = liqReport(which);
+  const b1 = liqBand(rep, 1, 1);
+  const tmod = obj(obj(S.today).model);
+  if (isNum(tmod.board_min_usd) && tmod.board_ranker !== 'liq') {
+    return ` This board is limited to names that can take a ${sizeLabel(tmod.board_min_usd)} short, but the ${sizeLabel(tmod.board_min_usd)} ranker was unavailable this run, so it is ranked by dump odds — a combination with no backtest of its own.`;
+  }
+  if (b1 && isNum(b1.hit) && tmod.board_ranker === 'liq') {
+    const sz = sizeLabel(isNum(liq.size) ? liq.size : BOARD_MIN());
+    const onF = arr(obj(obj(S.model).features).liq_m1).includes('on_filings');
+    const scope = lkey === 'm1' ? `the morning version of this rule (adds the last pre-market trade${onF ? ' and SEC filings accepted overnight, both' : ''} before 8:00 ET)` : 'this rule (close-only inputs)';
+    const net = isNum(b1.net) ? ` — after each pick's own estimated cost at ${sz} (average ${pct(b1.cost, 1)}) that is ${Math.abs(b1.net) < 0.0005 ? 'roughly breakeven' : `${pct(b1.net, 1, true)} per trade`}` : '';
+    return ` Backtest of ${scope} among names that could take a ${sz} short without moving the price (point-in-time universe, no Rule-201 names): the #1 fell 5%+ open→close on ${Math.round(b1.hit * 100)}% of sessions${isNum(b1.squeeze) ? `, spiked 20%+ above the open on ${Math.round(b1.squeeze * 100)}%` : ''}${isNum(b1.mean_oc) ? `, averaging ${pct(b1.mean_oc, 1, true)} open→close before costs` : ''}${net}. A tilt in the odds, never a sure thing.`;
+  }
   const oos = (S.model && S.model.oos) || {};
   // M1's walk-forward only describes the live rule when it was trained on what the
   // 9:05 run knows (morning_set ≠ "official"); otherwise quote M0 and say so.
@@ -459,7 +482,12 @@ function renderHero() {
     ? (obj(S.model).morning_set === 'pm' ? 'M1 reading — adds the last pre-market trade before 8:00 ET' : obj(S.model).morning_set && S.model.morning_set !== 'official' ? 'M1 reading — adds what traded after the close and before 9:00 ET' : 'M1 reading — uses the pre-market price as the expected open')
     : top.model_used === 'm0' ? 'M0 reading — close-only features (no pre-market print)' : 'Model version not reported';
 
-  const aboutNote = `${esc(modelLine)}. Features as of the close on ${esc(fmtDay(t.features_asof, { year: true }))}.${isNum(top.score) ? (top.score >= 100 ? (t.top_tie_count > 1 ? ` Tied with ${esc(int(t.top_tie_count - 1))} other name${t.top_tie_count > 2 ? 's' : ''} for the highest odds of the ${esc(int(scored))} scored — ties are ordered by the model's raw score.` : ` The highest odds of the ${esc(int(scored))} names scored today.`) : ` Higher odds than ${esc(top.score)}% of the ${esc(int(scored))} names scored today.`) : ''}${backtestLine(top.model_used)}${isNum(top.rank) && top.rank > 1 ? ` The ${top.rank - 1} higher-ranked board name${top.rank > 2 ? 's are' : ' is'} skipped because ${top.rank > 2 ? 'they are' : 'it is'} under the Rule 201 short-sale restriction today or trade under $300K a day — the rule the backtest measured.` : ''}`;
+  const liqRanked = obj(t.model).board_ranker === 'liq';
+  const ur = isNum(top.urank) ? top.urank : 1;
+  const rankNote = liqRanked
+    ? ` ${ur > 1 ? `#${esc(ur)} of the ${esc(int(t.model.board_universe))} names that pass the ${esc(sizeLabel(BOARD_MIN()))} volume, impact and price test, by where its open→close is expected to land among them — the ${esc(ur - 1)} ranked above it ${ur > 2 ? 'are' : 'is'} held back (borrow, IBKR lendable, squeeze danger or halt)` : `Ranked first of the ${esc(int(t.model.board_universe))} names that pass the ${esc(sizeLabel(BOARD_MIN()))} volume, impact and price test, by where its open→close is expected to land among them`}${isNum(top.score) ? `; its dump odds are higher than ${esc(top.score)}% of all ${esc(int(scored))} names scored` : ''}.`
+    : null;
+  const aboutNote = `${esc(modelLine)}. Features as of the close on ${esc(fmtDay(t.features_asof, { year: true }))}.${rankNote != null ? rankNote : isNum(top.score) ? (top.score >= 100 ? (t.top_tie_count > 1 ? ` Tied with ${esc(int(t.top_tie_count - 1))} other name${t.top_tie_count > 2 ? 's' : ''} for the highest odds of the ${esc(int(scored))} scored — ties are ordered by the model's raw score.` : ` The highest odds of the ${esc(int(scored))} names scored today.`) : ` Higher odds than ${esc(top.score)}% of the ${esc(int(scored))} names scored today.`) : ''}${backtestLine(top.model_used)}${isNum(top.rank) && top.rank > 1 ? ` The ${top.rank - 1} higher-ranked board name${top.rank > 2 ? 's are' : ' is'} skipped because ${top.rank > 2 ? 'they are' : 'it is'} under the Rule 201 short-sale restriction today or trade under $300K a day — the rule the backtest measured.` : ''}`;
   const weighed = attributionBars(top.attribution);
 
   setHTML(body, `
@@ -552,6 +580,7 @@ const FILTERS = [
 const SORTS = {
   rank: { label: 'Rank', get: (p) => p.rank, dir: 1 },
   prob: { label: 'Dump odds', get: (p) => p.prob_dump, dir: -1 },
+  edge: { label: 'Expected vs peers', get: (p) => (isNum(p.liq_edge) ? -p.liq_edge : null), dir: 1 },
   lift: { label: 'Lift', get: (p) => p.lift, dir: -1 },
   gap: { label: 'Pre-market gap', get: (p) => (p.premarket ? p.premarket.gap_pct : null), dir: -1 },
   fee: { label: 'Borrow fee', get: (p) => obj(p.shortability).fee_rate, dir: 1 },
@@ -586,24 +615,33 @@ function sortedFiltered(board) {
 const BOARD_BANDS = [[1, 1], [2, 10], [11, 25], [26, 50], [51, 100]];
 /** Separator row for a band of board ranks: the backtest record of the universe
  * ranks its rows hold today (row-weighted blend of the walk-forward bands). */
-function bandRow(band, members, rb, cost) {
+function bandRow(band, members, rb, cost, liqSize) {
   const lab = band[0] === band[1] ? `Rank ${band[0]}` : `Ranks ${band[0]}–${band[1]}`;
-  const bands = arr(rb.bands);
+  // disjoint bands only (the $30K report also carries 1–10 and 1–100 summaries)
+  const bands = arr(rb.bands).filter((b, i, all) => !all.some((o, j) => j !== i && o.lo >= b.lo && o.hi <= b.hi && (o.lo !== b.lo || o.hi !== b.hi)));
   const ur = members.map((p) => p.urank).filter(isNum);
   if (!bands.length || !ur.length) return `<tr class="band-row"><td colspan="10"><span>${esc(lab)}</span></td></tr>`;
-  const acc = { n: 0, hit: 0, mean: 0, sq: 0, pump: 0 };
+  const acc = { n: 0, hit: 0, mean: 0, sq: 0, pump: 0, nn: 0, net: 0, cost: 0 };
   ur.forEach((u) => {
     const b = bands.find((x) => u >= x.lo && u <= x.hi) || bands[bands.length - 1];
     if (!b || !isNum(b.hit)) return;
     acc.n += 1; acc.hit += b.hit; acc.mean += b.mean_oc; acc.sq += b.squeeze; acc.pump += isNum(b.pump) ? b.pump : 0;
+    if (isNum(b.net) && isNum(b.cost)) { acc.nn += 1; acc.net += b.net; acc.cost += b.cost; }
   });
   if (!acc.n) return `<tr class="band-row"><td colspan="10"><span>${esc(lab)}</span></td></tr>`;
   const umin = Math.min(...ur), umax = Math.max(...ur);
-  const span = umin === umax ? `universe rank ${umin}` : `universe ranks ${umin}–${umax}`;
+  const word = liqSize ? `${sizeLabel(liqSize)}-ready rank` : 'universe rank';
+  const span = umin === umax ? `${word} ${umin}` : `${word}s ${umin}–${umax}`;
   const mean = acc.mean / acc.n;
-  const weak = isNum(cost) ? -mean < cost : mean > -0.01;
-  const base = isNum(S.base) ? S.base : rb.base_dump;
-  const txt = `${lab} (${span} today) · in the backtest names at those ranks fell 5%+ open→close ${pct(acc.hit / acc.n, 0)} of the time (average name ${pct(base, 1)}), averaging ${pct(mean, 1, true)} before costs; ${pct(acc.pump / acc.n, 0)} rose 5%+ instead and ${pct(acc.sq / acc.n, 0)} spiked 20%+${weak ? ` — the average move is ${isNum(cost) ? `smaller than a typical ${pct(cost, 1)} round-trip cost at $10K` : 'small'}: a watchlist, not a short signal on its own` : ''}`;
+  const base = liqSize && isNum(rb.base_dump) ? rb.base_dump : isNum(S.base) ? S.base : rb.base_dump;
+  let txt;
+  if (liqSize && acc.nn) {
+    const net = acc.net / acc.nn, c = acc.cost / acc.nn;
+    txt = `${lab} (${span} today) · in the backtest names at those ranks fell 5%+ open→close ${pct(acc.hit / acc.n, 0)} of the time (average ${sizeLabel(liqSize)}-ready name ${pct(base, 1)}), averaging ${pct(mean, 1, true)} before costs; after each name's own estimated ${sizeLabel(liqSize)} round-trip cost (average ${pct(c, 1)}) that is ${pct(net, 1, true)} per trade · ${pct(acc.pump / acc.n, 0)} rose 5%+ instead, ${pct(acc.sq / acc.n, 0)} spiked 20%+${net < 0 ? ' — the estimated cost is bigger than the average move: a watchlist, not a short signal on its own' : ''}`;
+  } else {
+    const weak = isNum(cost) ? -mean < cost : mean > -0.01;
+    txt = `${lab} (${span} today) · in the backtest names at those ranks fell 5%+ open→close ${pct(acc.hit / acc.n, 0)} of the time (average name ${pct(base, 1)}), averaging ${pct(mean, 1, true)} before costs; ${pct(acc.pump / acc.n, 0)} rose 5%+ instead and ${pct(acc.sq / acc.n, 0)} spiked 20%+${weak ? ` — the average move is ${isNum(cost) ? `smaller than a typical ${pct(cost, 1)} round-trip cost at $10K` : 'small'}: a watchlist, not a short signal on its own` : ''}`;
+  }
   return `<tr class="band-row"><td colspan="10"><span>${esc(txt)}</span></td></tr>`;
 }
 
@@ -616,7 +654,7 @@ function boardRow(p, max) {
   return `<tr data-sym="${sym}">
     <td class="c-rank">${isNum(p.rank) ? pad2(p.rank) : DASH}</td>
     <td class="c-name"><button type="button" class="tk" data-open="${sym}">${sym}</button><span class="nm">${txt(nm)}</span>${arr(p.flags).length ? flagChips(p.flags, 4) : ''}</td>
-    <td class="c-prob"><span class="pv">${esc(fmtProb(p))}</span>${probBar(p.prob_dump, S.base, max)}</td>
+    <td class="c-prob"${isNum(p.liq_edge) ? ` title="${esc(`Expected to land around the ${ordinal(Math.round((0.5 - p.liq_edge) * 100))} percentile of ${sizeLabel(BOARD_MIN())}-ready stocks by open→close (lower = weaker day; the board's ranking)`)}"` : ''}><span class="pv">${esc(fmtProb(p))}</span>${probBar(p.prob_dump, S.base, max)}</td>
     <td class="c-lift">${esc(liftTxt(p.lift))}</td>
     <td class="c-fam">${familyBars(p.families)}</td>
     <td class="c-gap">${esc(gap)}</td>
@@ -634,7 +672,12 @@ function renderBoard() {
   const board = arr(S.today && S.today.board);
   const dek = $('#board-dek');
   if (dek && isNum(S.base)) {
-    dek.textContent = `The top ${board.length || 100}, ranked by the model's probability of an open→close drop of 5% or more this session. The tick on each bar is the ${pct(S.base, 1)} base rate for the average eligible name; each band of ranks shows what that band did in the walk-forward backtest — precision falls with rank, so read rank 70 as a watchlist, not a #1.`;
+    const tm = obj(S.today && S.today.model);
+    dek.textContent = tm.board_ranker === 'liq'
+      ? `The top ${board.length || 100} of the ${isNum(tm.board_universe) ? int(tm.board_universe) : 'eligible'} stocks that can each take a ${sizeLabel(BOARD_MIN())} short without moving the price (at most 5% of expected volume, at most 0.5% estimated impact, $1+); board names must also be lendable at IBKR for ${sizeLabel(BOARD_MIN())}+ when IBKR's list is available. Ranked by where each stock's open→close is expected to land among those peers; the bars show dump odds, with a tick at the ${pct(S.base, 1)} base rate for the average eligible name. Each band of ranks shows that band's walk-forward record after estimated ${sizeLabel(BOARD_MIN())} costs — precision falls with rank, so read the lower ranks as a watchlist.`
+      : isNum(tm.board_min_usd)
+      ? `The top ${board.length || 100} of the stocks that can each take a ${sizeLabel(tm.board_min_usd)} short without moving the price — ranked by dump odds this run because the ${sizeLabel(tm.board_min_usd)} ranker was unavailable (no backtest of this combination; band rows show labels only). The tick on each bar is the ${pct(S.base, 1)} base rate for the average eligible name.`
+      : `The top ${board.length || 100}, ranked by the model's probability of an open→close drop of 5% or more this session. The tick on each bar is the ${pct(S.base, 1)} base rate for the average eligible name; each band of ranks shows what that band did in the walk-forward backtest — precision falls with rank, so read rank 70 as a watchlist, not a #1.`;
   }
   if (!S.today) { root.innerHTML = empty('The board could not be loaded.'); return; }
   const chips = FILTERS.map((f) => {
@@ -649,11 +692,11 @@ function renderBoard() {
       <label class="board-sort">My size <select id="board-size">${SIZE_OPTS.map((v) => `<option value="${v}"${v === S.size ? ' selected' : ''}>${sizeLabel(v)}</option>`).join('')}</select></label>
       <p class="board-count" id="board-count" aria-live="polite"></p>
     </div>
-    <div class="board-scroll"><table class="board" id="board-table"><caption class="sr-only">Today's board, ranked by modeled dump odds. Select a ticker for its dossier.</caption><thead></thead><tbody></tbody></table></div>`;
+    <div class="board-scroll"><table class="board" id="board-table"><caption class="sr-only">${obj(obj(S.today).model).board_ranker === 'liq' ? "Today's board: names that can each take a $30K short, ranked by where their open→close is expected to land among such names." : "Today's board, ranked by modeled dump odds."} Select a ticker for its dossier.</caption><thead></thead><tbody></tbody></table></div>`;
   drawBoard();
   const bs = $('#board-size');
   if (bs) bs.addEventListener('change', () => {
-    S.size = Number(bs.value) || 50000;
+    S.size = Number(bs.value) || 30000;
     saveSize(S.size);
     safe('board', renderBoard);
     const hs = $('#hero-size');
@@ -699,12 +742,18 @@ function drawBoard() {
     // the UNIVERSE ranks those rows hold today (the backtest ranks every scored name)
     const nM1 = board.filter((p) => p.model_used === 'm1').length;
     const mu = nM1 * 2 > board.length ? 'm1' : 'm0';          // the model that ranked most of the board
-    const rb = obj(obj(obj(S.model).rank_bands)[mu]).board;
+    const tmod = obj(obj(S.today).model);
+    const liqOn = tmod.board_ranker === 'liq';
+    const liqRep = obj(obj(obj(S.model).liquid)[mu]);
+    // a $30K-limited board ranked by dump odds (fallback) has no matching backtest: band labels only
+    const noBt = isNum(tmod.board_min_usd) && !(liqOn && arr(liqRep.bands).length);
+    const rb = noBt ? {} : liqOn ? liqRep : obj(obj(obj(S.model).rank_bands)[mu]).board;
+    const liqSize = liqOn && arr(liqRep.bands).length ? BOARD_MIN() : null;
     const cost = obj(obj(obj(obj(S.model).sim)[mu]).realistic)['10000'];
     const html = [];
     rows.forEach((p) => {
       const band = BOARD_BANDS.find((x) => x[0] === p.rank);
-      if (band) html.push(bandRow(band, rows.filter((q) => q.rank >= band[0] && q.rank <= band[1]), obj(rb), isNum(obj(cost).mean_cost) ? cost.mean_cost : null));
+      if (band) html.push(bandRow(band, rows.filter((q) => q.rank >= band[0] && q.rank <= band[1]), obj(rb), isNum(obj(cost).mean_cost) ? cost.mean_cost : null, liqSize));
       html.push(boardRow(p, max));
     });
     body = html.join('');
@@ -862,8 +911,26 @@ function liveBlock(sc) {
       { label: 'Board top 25', v: live.board_dump_rate, hot: true },
       { label: 'All eligible names', v: live.universe_dump_rate },
     ])}
-    <p class="note" style="margin-top:8px">Share of sessions that fell 5%+ from open to close.${live.top_squeeze_rate != null ? ` The #1 spiked 20%+ above the open on ${pct(live.top_squeeze_rate)} of graded sessions.` : ''}${live.n_unverified ? ` ${int(live.n_unverified)} session(s) excluded because the pick could not be confirmed public before the open.` : ''} ${live.n_days < 60 ? 'Small sample: these rates will move a lot as days accumulate.' : ''}</p>
+    <p class="note" style="margin-top:8px">Share of sessions that fell 5%+ from open to close.${live.top_squeeze_rate != null ? ` The #1 spiked 20%+ above the open on ${pct(live.top_squeeze_rate)} of graded sessions.` : ''}${(() => { const b3 = obj(live.board30); if (!b3.n_days) return obj(obj(S.today).model).board_ranker === 'liq' ? ` From ${esc(fmtDay(S.today.session_date, { weekday: false }))} the board is ${esc(sizeLabel(BOARD_MIN()))}-only (liquid names, which dump less often); the rates above so far grade the earlier any-liquidity board.` : ''; return ` The rates above mix two eras: before ${esc(fmtDay(b3.since, { weekday: false }))} the any-liquidity dump-odds board, since then the ${esc(sizeLabel(BOARD_MIN()))} board. ${esc(sizeLabel(BOARD_MIN()))} board alone (${esc(int(b3.n_days))} graded session${b3.n_days === 1 ? '' : 's'}): #1 dumped ${esc(pct(b3.top_dump_rate))}, averaged ${esc(pct(b3.top_mean_oc, 1, true))}${isNum(b3.top_net30) ? ` (${esc(pct(b3.top_net30, 1, true))} after est. ${esc(sizeLabel(BOARD_MIN()))} cost)` : ''}; all board names dumped ${esc(pct(b3.board100_dump_rate))}${isNum(b3.board100_net30) ? `, ${esc(pct(b3.board100_net30, 1, true))} per name after est. cost` : ''}; all eligible names ${esc(pct(b3.universe_dump_rate))}.`; })()}${live.n_unverified ? ` ${int(live.n_unverified)} session(s) excluded because the pick could not be confirmed public before the open.` : ''} ${live.n_days < 60 ? 'Small sample: these rates will move a lot as days accumulate.' : ''}</p>
   </div>`;
+}
+
+/** The $30K board's own walk-forward record (model.json "liquid"), per model tab. */
+function liqTiles(tab) {
+  const liq = obj(obj(S.model).liquid);
+  const rep = obj(liq[tab]);
+  const b1 = liqBand(rep, 1, 1), b10 = liqBand(rep, 1, 10), b100 = liqBand(rep, 1, 100);
+  if (!b1 || !isNum(b1.hit)) return '';
+  const sz = sizeLabel(isNum(liq.size) ? liq.size : 30000);
+  const red = (v) => `<span class="${isNum(v) && v < 0 ? 'red' : ''}">${esc(pct(v, 1, true))}</span>`;
+  return `<p class="eyebrow" style="margin:0 0 8px">The ${esc(sz)} board — what is published: every name can take ${esc(sz)} without moving the price</p>
+    <dl class="tiles">
+      ${stat('#1 dumped', esc(pct(b1.hit)), esc(`average ${sz}-ready name ${pct(rep.base_dump, 1)} · spiked 20%+ on ${pct(b1.squeeze)}`))}
+      ${stat(`#1 net at ${sz}`, red(b1.net), esc(`short gain ${pct(-b1.mean_oc, 1, true)} minus est. cost ${pct(b1.cost, 1)} · won ${pct(b1.win)}`))}
+      ${b10 ? stat(`Top 10 net at ${sz}`, red(b10.net), esc(`dumped ${pct(b10.hit)} · average move ${pct(b10.mean_oc, 1, true)}`)) : ''}
+      ${b100 ? stat(`All 100 net at ${sz}`, red(b100.net), esc(`dumped ${pct(b100.hit)} · average move ${pct(b100.mean_oc, 1, true)} · per name per session`)) : ''}
+    </dl>
+    <p class="eyebrow" style="margin:16px 0 8px">The dump-odds model on every eligible name, any liquidity — the odds shown on each card</p>`;
 }
 
 function backtestBlock(m) {
@@ -881,13 +948,14 @@ function backtestBlock(m) {
     <p class="note">Walk-forward, out of sample${m.trained_through ? ` through ${esc(fmtDay(m.trained_through, { weekday: false, year: true }))}` : ''}. Short the #1 at the open, cover at the close${isNum(cost) ? `, ${esc(pct(cost, 0))} round-trip cost` : ''}. The published rule skips names under the Rule 201 short-sale restriction and names trading under $300K a day; it still assumes borrow was always available — often it isn't.${m.publication_rule ? ` <span class="sr-only">${esc(m.publication_rule.text || '')}</span>` : ''}</p>
     <div class="tabs" role="tablist" aria-label="Model version">${tabHTML}</div>
     <div id="bt-panel" role="tabpanel" aria-labelledby="tab-${tab}">
+      ${liqTiles(tab)}
       <dl class="tiles">
-        ${stat('Published #1 dumped', esc(pct(isNum(oos.pub1_hit) ? oos.pub1_hit : oos.top1_hit)), esc(`raw #1 ${pct(oos.top1_hit)} · average name ${pct(base, 1)}`))}
+        ${stat(obj(obj(S.model).liquid)[tab] ? '#1 by dump odds dumped' : 'Published #1 dumped', esc(pct(isNum(oos.pub1_hit) ? oos.pub1_hit : oos.top1_hit)), esc(`raw #1 ${pct(oos.top1_hit)} · average name ${pct(base, 1)}`))}
         ${stat('…and spiked 20%+', esc(pct(isNum(oos.pub1_squeeze_rate) ? oos.pub1_squeeze_rate : oos.top1_squeeze_rate)), 'above the open, same session — the move that stops shorts out')}
         ${realisticTiles(sim, cost)}
       </dl>
       ${swingTiles()}
-      ${nDays ? '<div class="chart" id="eq-chart"></div><div class="legend"><span><i></i>Published rule, net of each pick\'s own est. cost at $10K</span><span><i class="g"></i>Raw #1 (incl. Rule 201 names), flat 1% cost</span></div>' : empty('No simulated days in this report.')}
+      ${nDays ? '<div class="chart" id="eq-chart"></div><div class="legend"><span><i></i>#1 by dump odds (no Rule 201, ≥ $300K/day, any size), net of each pick\'s own est. cost at $10K</span><span><i class="g"></i>Raw #1 (incl. Rule 201 names), flat 1% cost</span></div>' : empty('No simulated days in this report.')}
     </div>
   </div>`;
 }
@@ -1041,8 +1109,8 @@ function mountRecordCharts() {
     });
     S.disposers.record.push(equityChart(eq, daily.map((r) => r[0]), [
       { name: 'Raw #1, net', cls: 'l-gross', values: gross },
-      { name: 'Published rule, net', cls: 'l-net', values: net },
-    ], { label: `Cumulative sum of daily short returns, ${S.tab.toUpperCase()}: the published rule versus the raw #1, both net of cost` }));
+      { name: '#1 by dump odds (no Rule 201, ≥ $300K/day), net', cls: 'l-net', values: net },
+    ], { label: `Cumulative sum of daily short returns, ${S.tab.toUpperCase()}: the dump-odds #1 (no Rule 201, at least $300K a day, any size) versus the raw #1, both net of cost` }));
   }
   const cal = $('#cal-chart');
   if (cal) {
@@ -1450,11 +1518,11 @@ function historyHTML(p) {
 }
 
 /* ── trade size (§ size) ───────────────────────────────────────────────── */
-const SIZE_KEY = 'gravity:size:v1';
-const SIZE_OPTS = [10000, 50000, 100000, 500000, 1000000];
+const SIZE_KEY = 'gravity:size:v2';
+const SIZE_OPTS = [10000, 30000, 50000, 100000, 500000, 1000000];
 function loadSize() {
   try { const v = Number(localStorage.getItem(SIZE_KEY)); if (SIZE_OPTS.includes(v)) return v; } catch { /* storage blocked */ }
-  return 50000;
+  return 30000;
 }
 function saveSize(v) { try { localStorage.setItem(SIZE_KEY, String(v)); } catch { /* storage blocked */ } }
 const sizeLabel = (v) => (v >= 1e6 ? `$${v / 1e6}M` : `$${Math.round(v / 1e3)}K`);
@@ -1462,7 +1530,9 @@ const sizeLabel = (v) => (v >= 1e6 ? `$${v / 1e6}M` : `$${Math.round(v / 1e3)}K`
 /** Estimated round-trip cost at the selected size, or null. */
 function costAt(p, size = S.size) {
   const c = obj(obj(p && p.size).costs)[String(size)];
-  return isNum(c) ? c : null;
+  if (isNum(c)) return c;
+  const f = costFn(p);                  // older feeds lack this size: same square-root law as capacity.py
+  return f ? f(size) : null;
 }
 function fitsSize(p, size = S.size) {
   const cap = obj(p && p.size).capacity;
@@ -1562,7 +1632,9 @@ function renderPlanner() {
   const mu = obj(obj(S.today).top).model_used === 'm1' ? 'm1' : 'm0';
   const bk = obj(bkAll[mu] || (mu === 'm1' ? bkAll : null));
   const hist = obj(bk[`top${pl.k}`]);
-  const modelName = mu === 'm1' ? 'the morning model' : 'the close-only model (today\'s board)';
+  const liqBoard = obj(obj(S.today).model).board_ranker === 'liq';
+  const modelName = liqBoard ? `the previous dump-odds board (any liquidity) — not today's ${sizeLabel(BOARD_MIN())} board, whose own record is in the table above`
+    : mu === 'm1' ? 'the morning model' : 'the close-only model (today\'s board)';
   const histLine = isNum(obj(hist.confirm).net_per_dollar)
     ? `<p class="note">History for a similar rule with ${modelName} (top ${pl.k} eligible names each day, each capped at its capacity up to $50K, walk-forward): net after each name's estimated cost ${esc(pct(obj(hist.dev).net_per_dollar, 2, true))} per dollar deployed in development, ${esc(pct(hist.confirm.net_per_dollar, 2, true))} in confirmation; ${esc(pct(obj(hist.confirm).day_win, 0))} of confirmation days made money. History, not a promise.</p>` : '';
   const rows = b.rows.map((r, i) => `<tr${i === 0 ? ' class="hot"' : ''}><th scope="row"><a href="#/${encodeURIComponent(r.p.symbol)}" data-open="${esc(r.p.symbol)}">${esc(r.p.symbol)}</a> <span class="nm">#${esc(r.p.rank)}</span></th><td>${r.cap > 0 ? esc(money(r.q)) : `<span class="muted">${r.why === 'breakeven' ? 'cost > avg move' : 'too thin'}</span>`}</td><td>${r.cap > 0 ? `${esc(money(r.cap))} <span class="nm">${esc(r.why)}</span>` : '&lt; $1K'}</td><td>${r.q > 0 ? esc(pct(r.cost, 1)) : DASH}</td><td>${esc(fmtProb(r.p))}</td></tr>`).join('');
@@ -1581,7 +1653,7 @@ function morningBlock(mo) {
   if (!mo || !arr(mo.rows).length) return '';
   const dc = (o, f) => `${esc(f(obj(o).dev))} <span class="muted">/</span> ${esc(f(obj(o).confirm))}`;
   const sp = (v) => pct(v, 1, true);
-  const rows = arr(mo.rows).map((r) => `<tr${r.key === mo.chosen ? ' class="hot"' : ''}><th scope="row">${esc(r.label)}${r.key === mo.chosen ? ' <span class="nm">now live</span>' : ''}</th><td>${dc(r.hit, (v) => pct(v, 0))}</td><td>${dc(r.mean_oc, sp)}</td><td>${dc(r.squeeze, (v) => pct(v, 0))}</td><td>${dc(r.net10k, sp)}</td><td>${dc(r.net50k, sp)}</td><td>${dc(r.auc, (v) => fixed(v, 3))}</td></tr>`).join('');
+  const rows = arr(mo.rows).map((r) => `<tr${r.key === mo.chosen ? ' class="hot"' : ''}><th scope="row">${esc(r.label)}${r.key === mo.chosen ? ` <span class="nm">${obj(obj(S.today).model).board_ranker === 'liq' ? 'live dump odds' : 'now live'}</span>` : ''}</th><td>${dc(r.hit, (v) => pct(v, 0))}</td><td>${dc(r.mean_oc, sp)}</td><td>${dc(r.squeeze, (v) => pct(v, 0))}</td><td>${dc(r.net10k, sp)}</td><td>${dc(r.net50k, sp)}</td><td>${dc(r.auc, (v) => fixed(v, 3))}</td></tr>`).join('');
   const t = obj(mo.timing);
   const tl = (k) => obj(obj(t.confirm)[k]);
   const tRows = ['open→close', 'open→10:30', 'open→12:30', '10:30→close', 'open→close | up at 10:30', '10:30→close | up at 10:30', 'open→close | down at 10:30', '10:30→close | down at 10:30']
@@ -1590,10 +1662,22 @@ function morningBlock(mo) {
   const cov = obj(mo.coverage);
   const at = mo.round === 10 ? 'the 7:20 CT run' : 'the 9:05 ET run';
   return `<div class="rec-block reveal"><h3 class="rec-sub">The morning #1: what is actually knowable when ${esc(at)} scores it</h3>
-    <p class="note">The morning model used to be trained on the official 9:30 opening gap, which an early run cannot know; live it was fed the pre-market price instead (the two agree only loosely${isNum(cov.corr_gap_ext_vs_open) ? `: correlation ${esc(fixed(cov.corr_gap_ext_vs_open, 2))}` : ''}). Every model below except the old live one is trained and tested only on what its run can see. Published #1 each day, development / confirmation; net uses each pick's estimated cost (impact + spread) at that size.</p>
+    <p class="note">The morning model used to be trained on the official 9:30 opening gap, which an early run cannot know; live it was fed the pre-market price instead (the two agree only loosely${isNum(cov.corr_gap_ext_vs_open) ? `: correlation ${esc(fixed(cov.corr_gap_ext_vs_open, 2))}` : ''}). Every model below except the old live one is trained and tested only on what its run can see. Published #1 each day under the dump-odds rule (any liquidity — since round 11 these models supply the dump odds on each card, while the $30K board above has its own ranker), development / confirmation; net uses each pick's estimated cost (impact + spread) at that size.</p>
     <div class="table-scroll"><table class="mtable"><thead><tr><th scope="col">Morning model</th><th scope="col">#1 dumped</th><th scope="col">#1 avg open→close</th><th scope="col">Spiked +20%</th><th scope="col">Net $10K</th><th scope="col">Net $50K</th><th scope="col">AUC</th></tr></thead><tbody>${rows}</tbody></table></div></div>
     ${tRows ? `<div class="rec-block reveal"><h3 class="rec-sub">When to get in and out</h3><p class="note">Short return of the published #1 from hourly bars (positive = the price fell), development / confirmation. Before costs. Conditional rows split days by where the price stood at 10:30 versus the open.${mo.round === 10 ? ' Studied on the picks of the 9:00 ET extended-hours model (round 9).' : ''}</p>
     <div class="table-scroll"><table class="mtable"><thead><tr><th scope="col">Trade</th><th scope="col">Avg short return</th><th scope="col">Share of days it paid</th><th scope="col">Days</th></tr></thead><tbody>${tRows}</tbody></table></div></div>` : ''}`;
+}
+
+/** Round 11: the $30K board vs the old board, both measured at $30K a name. */
+function board30Block(b) {
+  if (!b || !arr(b.rows).length) return '';
+  const dc = (o, f) => `${esc(f(obj(o).dev))} <span class="muted">/</span> ${esc(f(obj(o).confirm))}`;
+  const sp = (v) => pct(v, 1, true);
+  const pc = (v) => pct(v, 0);
+  const rows = arr(b.rows).map((r) => `<tr><th scope="row">${esc(r.band)}</th><td>${dc(r.old_hit, pc)}</td><td>${dc(r.old_net, sp)}</td><td>${dc(r.new_hit, pc)}</td><td>${dc(r.new_mean, sp)}</td><td>${dc(r.new_cost, (v) => pct(v, 1))}</td><td>${dc(r.new_net, sp)}</td><td>${dc(r.new_net_half, sp)}</td></tr>`).join('');
+  return `<div class="rec-block reveal"><h3 class="rec-sub">${esc(b.title || 'The $30K board')}</h3><p class="note">${esc(b.note || '')}</p>
+    <div class="table-scroll"><table class="mtable"><caption class="sr-only">Old board versus the $30K board, both at $30K a name</caption><thead><tr><th scope="col">Board ranks</th><th scope="col">Old board dumped</th><th scope="col">Old board net at $30K</th><th scope="col">$30K board dumped</th><th scope="col">Avg open→close</th><th scope="col">Est. cost at $30K</th><th scope="col">Net at $30K</th><th scope="col">Net if spreads are half</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <ul class="notes verdict" style="margin-top:16px">${arr(b.verdict).map((v) => `<li>${esc(v)}</li>`).join('')}</ul></div>`;
 }
 
 function renderSizeLab() {
@@ -1619,6 +1703,7 @@ function renderSizeLab() {
       ${stat('Avg move, a top-10 pick', esc(pct(-ss.avg_move_top10, 1, true)), 'open→close before costs, walk-forward backtest')}
     </dl>` : '';
   root.innerHTML = `
+    ${board30Block(r.board30k)}
     ${today}
     <div id="planner" class="reveal"></div>
     ${morningBlock(r.morning)}

@@ -94,6 +94,10 @@ EXT_SHAPE: List[str] = ["ext_hi", "ext_lo", "ext_fade", "ah_ret"]
 EXT_COUNTS: List[str] = ["n_ext", "n_pm"]
 ON_GROUPS: List[str] = ["filings", "offer", "reg", "effect", "unreg", "delist", "finance", "current", "f144", "late"]
 ON_FEATURES: List[str] = [f"on_{g}" for g in ON_GROUPS]
+# Extra inputs of the $30K board's MORNING ranker beyond M1_EXTRA. Overnight filing counts (ON_FEATURES, to the
+# morning cutoff) were tested and NOT adopted: R11c, with every stock's filing history, +0.01 / +0.05 pt < the
+# pre-registered +0.05 pt in both windows (the first stage-2 pass was inflated by a look-ahead). Empty = gap only.
+LIQ_M1_EXTRA: List[str] = []
 MORNING_SET = str(getattr(config, "MORNING_SET", "official"))
 M1_EXTRA: List[str] = (["gap_open"]
                        + (EXT_SHAPE if MORNING_SET in ("ext", "ext_counts", "ext_on") else [])
@@ -1059,8 +1063,8 @@ def next_session_dates(dates) -> np.ndarray:
 
 
 def overnight_counts(symbols, t_dates, next_dates, events: Dict[str, List[dict]],
-                     forms: Optional[Set[str]] = None) -> Dict[str, np.ndarray]:
-    """``on_<group>`` counts per row: filings accepted in [t 16:00 ET, next 09:00 ET).
+                     forms: Optional[Set[str]] = None, cutoff_hour: int = 9) -> Dict[str, np.ndarray]:
+    """``on_<group>`` counts per row: filings accepted in [t 16:00 ET, next ``cutoff_hour``:00 ET).
     Rows whose symbol has no event history at all get NaN (unknown, not zero)."""
     if forms is None:
         from .sources.sec import CURRENT_FORMS as forms  # noqa: N811
@@ -1090,7 +1094,7 @@ def overnight_counts(symbols, t_dates, next_dates, events: Dict[str, List[dict]]
     rc = np.array([codes[s] for s in syms], dtype=np.int64)
     t0 = pd.DatetimeIndex(pd.to_datetime(t_dates)).tz_localize("America/New_York") + pd.Timedelta(hours=16)
     nd = pd.DatetimeIndex(pd.to_datetime(next_dates))
-    t1 = nd.tz_localize("America/New_York") + pd.Timedelta(hours=9)
+    t1 = nd.tz_localize("America/New_York") + pd.Timedelta(hours=cutoff_hour)
     m0 = (t0.tz_convert("UTC").asi8 // 60_000_000_000).astype(np.int64)
     m1 = np.where(nd.isna(), m0, t1.tz_convert("UTC").asi8 // 60_000_000_000).astype(np.int64)
     has = np.array([s in (events or {}) for s in syms], dtype=bool)
