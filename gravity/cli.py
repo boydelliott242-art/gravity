@@ -670,9 +670,11 @@ def _nn(v: Any) -> Any:
     return None if v is None or (isinstance(v, float) and math.isnan(v)) else v
 
 
-def _lend_short(sym: str, borrow: dict, borrow_ok: bool, price: Any) -> Optional[float]:
-    """IBKR's lendable dollars when they are fewer than a BOARD_MIN_USD short
-    needs (None when enough, or when the borrow list / price is unknown)."""
+def _lend_short(sym: str, borrow: dict, borrow_ok: bool, price: Any, min_usd: Optional[float] = None) -> Optional[float]:
+    """IBKR's lendable dollars when they are fewer than a ``min_usd`` short
+    (default BOARD_MIN_USD) needs (None when enough, or when the borrow list /
+    price is unknown)."""
+    need = config.BOARD_MIN_USD if min_usd is None else min_usd
     if not borrow_ok:
         return None
     b = borrow.get(sym)
@@ -682,15 +684,16 @@ def _lend_short(sym: str, borrow: dict, borrow_ok: bool, price: Any) -> Optional
         return None
     if not (math.isfinite(avail) and math.isfinite(px)) or px <= 0:
         return None
-    return avail * px if avail * px < config.BOARD_MIN_USD else None
+    return avail * px if avail * px < need else None
 
 
-def _gate_bad(sym: str, latest: pd.DataFrame, borrow: dict, borrow_ok: bool, E: dict) -> bool:
-    """The board's exclusion rule (no borrow, IBKR can't lend a BOARD_MIN_USD
-    short, halted, or squeeze danger ≥ 70), computed exactly as make_pick
-    computes it."""
+def _gate_bad(sym: str, latest: pd.DataFrame, borrow: dict, borrow_ok: bool, E: dict,
+              min_usd: Optional[float] = None) -> bool:
+    """The board's exclusion rule (no borrow, IBKR can't lend a ``min_usd``
+    short — BOARD_MIN_USD by default, ONE_MIN_USD for the ONE — halted, or
+    squeeze danger ≥ 70), computed exactly as make_pick computes it."""
     r = latest.loc[sym]
-    if _lend_short(sym, borrow, borrow_ok, _nn(r.get("close"))) is not None:
+    if _lend_short(sym, borrow, borrow_ok, _nn(r.get("close")), min_usd) is not None:
         return True
     short = score.shortability(sym, borrow, borrow_ok)
     si_rows = E["si"].get(sym) or []
@@ -835,7 +838,8 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
              len(overnight), len(overnight_list), len(ft), time.time() - t_s)
 
     # 2) model pass 1 (M0) on everything
-    OUT = ["prob_dump", "prob_bigdump", "prob_squeeze", "exp_oc", "prob_swing", "prob_pump", "skew", "liq_edge"]
+    OUT = ["prob_dump", "prob_bigdump", "prob_squeeze", "exp_oc", "prob_swing", "prob_pump", "skew", "liq_edge",
+           "one_dump", "one_d3"]
     pred = model.predict(bundle, latest, use_open=False)
     latest = latest.join(pred[[c for c in OUT if c in pred.columns]], rsuffix="_m")
     for c in OUT:
@@ -850,11 +854,24 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
     if rank_col != "liq_edge":
         log.warning("model bundle has no $30K ranker — board ranked by dump odds until the next train")
     log.info("$%s-ready universe: %d of %d names", f"{config.BOARD_MIN_USD:,}", int(latest["liq_ok"].sum()), len(latest))
+    # the ONE (R13): consensus of three dump models among $30K-ready names; picked among $100K-ready ones
+    latest["one_ok"] = model.one_mask(latest)
+
+    def _one_scores() -> None:
+        parts = [pd.to_numeric(latest[c], errors="coerce").to_numpy(float) for c in model.ONE_PARTS]
+        sc, dfc = model.one_score(np.zeros(len(latest)), parts, latest["liq_ok"].to_numpy(bool))
+        latest["one_score"], latest["one_deficit"] = sc, dfc
+
+    _one_scores()
+    log.info("$%s-ready (ONE) universe: %d names", f"{config.ONE_MIN_USD:,}", int(latest["one_ok"].sum()))
 
     # 3) shortlist → pre-market snapshot → M1 where we have a gap proxy
     order = latest[latest["liq_ok"]].sort_values(rank_col, ascending=False)
     # the morning model must score at least as deep as the board selection walks
     shortlist = list(order.index[:BOARD_POOL_MAX + 90])
+    # ... and as deep as the ONE could reach: its top 150 by the close-only consensus
+    one_pre = latest[latest["one_ok"] & latest["one_score"].notna()].sort_values("one_score", ascending=False)
+    shortlist += [s for s in one_pre.index[:150] if s not in shortlist]
     supply = [s for s, evs in overnight.items()
               if s in latest.index and bool(latest.at[s, "liq_ok"]) and any(e.get("category") in score.SUPPLY_CATS for e in evs)]
     shortlist += [s for s in supply if s not in shortlist]
@@ -898,6 +915,8 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
             if c in p1.columns and not (c == "liq_edge" and keep_liq_m0):
                 latest.loc[use_open_syms, c] = p1[c].values
         latest.loc[use_open_syms, "model_used"] = "m1"
+    _one_scores()          # the ONE's consensus with the morning scores (before the catalyst overlay below)
+    latest["prob_dump_model"] = latest["prob_dump"]      # the ONE's tie-break: the model's own odds, pre-overlay
 
     # 4) flag supply filings the model hasn't seen (probability unchanged — see score.overlay_catalysts)
     lift = _evidence_lift()
@@ -976,7 +995,10 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
     shortable = latest["borrow_status"].isin(["ETB", "HTB", "UNKNOWN"])
     swing_order = latest[shortable & latest["liq_ok"] & latest["prob_swing"].notna()].sort_values("prob_swing", ascending=False)
     swing_pool = list(swing_order.index[:25])
-    provisional = next((s for s in order.index if latest.at[s, "publishable"] and latest.at[s, "borrow_status"] in ("ETB", "HTB")), None)
+    one_order = latest[latest["one_ok"] & latest["one_score"].notna()].sort_values(
+        ["one_score", "one_deficit", "prob_dump_model"], ascending=[False, True, False])
+    provisional = next((s for s in one_order.index if latest.at[s, "borrow_status"] in ("ETB", "HTB")), None) or \
+        next((s for s in order.index if latest.at[s, "publishable"] and latest.at[s, "borrow_status"] in ("ETB", "HTB")), None)
     feat_rows = latest.copy()
     tw = twins.find_twins(feat_rows, ref=provisional, session_year=session.year) if provisional else []
 
@@ -1005,12 +1027,31 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
     board_pool = [s for s in walk[:depth] if s in keep]
     log.info("board fill: %d eligible from the top %d (+%d squeeze zone)", len(board_syms), depth, len(zone_syms))
     urank = {s: i + 1 for i, s in enumerate(walk)}
-    dossier = list(dict.fromkeys(board_pool + swing_pool + [t["symbol"] for t in tw]))
+    # the ONE: walk its consensus order, same gates as the board but IBKR must lend ONE_MIN_USD
+    one_walk = list(one_order.index[:40])
+    one_sym: Optional[str] = None
+    one_rank: Optional[int] = None
+    one_held: List[str] = []
+    for i in range(0, len(one_walk), 10):
+        cand = one_walk[i:i + 10]
+        need = [s for s in cand if s not in E["si"]]
+        if need and live_extras:
+            _merge(E, enrich(need, latest, cmap, splits, budget(), kinds=("si", "floats")))
+        for k, s in enumerate(cand, start=i + 1):
+            if _gate_bad(s, latest, borrow, borrow_ok, E, min_usd=config.ONE_MIN_USD):
+                one_held.append(s)
+            else:
+                one_sym, one_rank = s, k
+                break
+        if one_sym:
+            break
+    log.info("the ONE: %s (consensus rank %s; %d held back: %s)", one_sym, one_rank, len(one_held), ", ".join(one_held[:8]))
+    dossier = list(dict.fromkeys(([one_sym] if one_sym else []) + board_pool + swing_pool + [t["symbol"] for t in tw]))
     # Stage B — the full dossier treatment for every name that is shown
     if live_extras:
         # stage A's short interest / float stay authoritative for the gated names
         # (re-fetching could blank them on a deadline and change who passes the gate)
-        _merge(E, enrich(dossier, latest, cmap, splits, budget(), deep=board_pool + swing_pool[:5],
+        _merge(E, enrich(dossier, latest, cmap, splits, budget(), deep=([one_sym] if one_sym else []) + board_pool + swing_pool[:5],
                          kinds=("news", "analyst", "dilution", "insider", "chatter")))
         extras = [s for s in dossier if s not in E["si"]]
         if extras:
@@ -1027,7 +1068,7 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
 
     # text-classify recent 8-K/6-K for the top of the board so offering language is caught
     todo = []
-    for s in board_pool:
+    for s in ([one_sym] if one_sym and one_sym not in board_pool else []) + board_pool:
         for e in _filings_for(s, events, overnight)[:4]:
             if e.get("form") in ("8-K", "6-K", "424B5", "424B3") and not e.get("text_tags") and e.get("url"):
                 if (session - date.fromisoformat(e["date"])).days <= 14:
@@ -1127,7 +1168,8 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
     # display-only pre-market quotes for every name that will be shown (the first
     # snapshot covered the top 150 by the close-only ranking)
     if want_pre:
-        shown = [s for s in dict.fromkeys(board_pool + swing_pool + [t["symbol"] for t in tw]) if s not in pre]
+        shown = [s for s in dict.fromkeys(([one_sym] if one_sym else []) + board_pool + swing_pool + [t["symbol"] for t in tw])
+                 if s not in pre]
         left = _secs_until_bell(session) - 300.0
         if shown and left > 30:
             more = _safe(prices.premarket_snapshot, shown, min(120.0, left), default={}) or {}
@@ -1150,13 +1192,44 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
                       f"{len(board)}/{config.BOARD_SIZE} eligible names from the top {depth} of "
                       f"{int(latest['liq_ok'].sum())} ${config.BOARD_MIN_USD // 1000}K-ready names "
                       f"({len(squeeze_zone)} held back in the squeeze zone)")
-    # The #1 follows the publication rule the backtest measured: no Rule 201
-    # restriction and ≥ $300k median daily volume (plus borrow + squeeze < 70).
-    top = next((p for p in board if p.get("publishable")), None)
-    if top is not None and avg_move is not None:
-        # the published #1 is measured against the #1's own historical move
-        _row = {k: (None if (not isinstance(v, (list, dict)) and pd.isna(v)) else v) for k, v in latest.loc[top["symbol"]].items()}
-        top["size"] = size_of(top["symbol"], _row, avg_move, "#1") or top.get("size")
+    # The #1 on the main page is the ONE (R13): the best consensus among names that take a ONE_MIN_USD
+    # short; if none passed its gates, the board's first name (publication rule, borrow, squeeze < 70).
+    top = None
+    one_rep = ((bundle.get("report") or {}).get("one") or {})
+    if one_sym:
+        on_board = next((p for p in board if p["symbol"] == one_sym), None)
+        top = dict(on_board) if on_board is not None else make_pick(one_sym, None, with_chart=True)
+        m_used = "m1" if latest.at[one_sym, "model_used"] == "m1" else "m0"
+        dfc = _nn(latest.at[one_sym, "one_deficit"])
+        tier = model.one_tier(dfc)
+        rec = (one_rep.get(m_used) or {})
+        liq_rows = latest[latest["liq_ok"]]
+        part_rank = {c: int((pd.to_numeric(liq_rows[c], errors="coerce") > float(latest.at[one_sym, c])).sum()) + 1
+                     for c in model.ONE_PARTS if pd.notna(latest.at[one_sym, c])}
+        top["one"] = {"score": _nn(latest.at[one_sym, "one_score"]), "deficit": dfc, "tier": tier,
+                      "consensus_rank": one_rank, "held_back": one_held, "part_ranks": part_rank,
+                      "universe": int(latest["one_ok"].sum()), "liq_universe": int(latest["liq_ok"].sum()),
+                      "min_usd": config.ONE_MIN_USD, "model": m_used,
+                      "record": rec.get("overall"), "tier_record": (rec.get("tiers") or {}).get(tier) if tier else None}
+        mv = ((top["one"]["tier_record"] or {}).get("mean_oc"))
+        basis = f"the ONE ({tier} conviction)" if (mv is not None and mv < 0 and tier) else None
+        if basis is None:
+            mv = (rec.get("overall") or {}).get("mean_oc")
+            basis = "the ONE" if (mv is not None and mv < 0) else "top-10"
+        _row = {k: (None if (not isinstance(v, (list, dict)) and pd.isna(v)) else v) for k, v in latest.loc[one_sym].items()}
+        top["size"] = size_of(one_sym, _row, (-float(mv)) if basis != "top-10" else None, basis) or top.get("size")
+    if top is None:
+        top = next((p for p in board if p.get("publishable")), None)
+        if top is not None:
+            top = dict(top)
+            top["one"] = None
+            if avg_move is not None:
+                _row = {k: (None if (not isinstance(v, (list, dict)) and pd.isna(v)) else v) for k, v in latest.loc[top["symbol"]].items()}
+                top["size"] = size_of(top["symbol"], _row, avg_move, "#1") or top.get("size")
+    net.record_status("The ONE", one_sym is not None,
+                      f"{one_sym} — consensus rank {one_rank} of {int(latest['one_ok'].sum())} ${config.ONE_MIN_USD // 1000}K-ready names"
+                      + (f" ({len(one_held)} above it held back: borrow, IBKR lendable, squeeze or halt)" if one_held else "")
+                      if one_sym else "no $100K-ready name passed the borrow / squeeze / halt checks — the board's #1 is shown")
     tie_n = 0
     if top is not None:
         tie_n = int((np.abs(latest["prob_dump"].to_numpy(float) - float(top["prob_dump"])) < 1e-4).sum())
@@ -1241,6 +1314,9 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
             "board_min_usd": config.BOARD_MIN_USD,
             "board_ranker": "liq" if rank_col == "liq_edge" else "dump",
             "board_universe": int(latest["liq_ok"].sum()),
+            "one_rule": (report.get("one") or {}).get("rule"),
+            "one_min_usd": config.ONE_MIN_USD,
+            "one_universe": int(latest["one_ok"].sum()),
         },
         "top_tie_count": tie_n,
         "size_summary": size_summary,
@@ -1260,7 +1336,8 @@ def build_today(state: dict, run: str, live_extras: bool = True) -> dict:
     }
     # side files (full-universe lookup + history stores) are written only when
     # this page is actually published — see _publish_today / _flush_side
-    pick_sqd = {p["symbol"]: p["squeeze_danger"] for p in board + swing_board + squeeze_zone + [t["pick"] for t in twin_cards]}
+    pick_sqd = {p["symbol"]: p["squeeze_danger"] for p in board + swing_board + squeeze_zone + [t["pick"] for t in twin_cards]
+                + ([top] if top else [])}
     _PENDING_SIDE.clear()
     _PENDING_SIDE.update({
         "universe": (latest, hist, borrow, borrow_ok, events, splits, rank_of, session, pre, notes, pick_sqd, size_of),
@@ -1406,7 +1483,9 @@ def _size_summary(board: list, top: Optional[dict], avg_move: Optional[float], a
         if m >= 1000:                                             # a name that can't hold $1K adds nothing
             tot += m
             used += 1
+    tsz = (top or {}).get("size") or {}
     return {"names": used, "deployable": tot, "avg_move_top10": avg_move_10, "avg_move_top1": avg_move,
+            "top_move": tsz.get("avg_move"), "top_move_basis": tsz.get("move_basis"),
             "top_capacity": ((top or {}).get("size") or {}).get("capacity"),
             "top_breakeven": ((top or {}).get("size") or {}).get("breakeven")}
 

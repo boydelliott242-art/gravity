@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -138,3 +139,52 @@ def test_overnight_counts_stop_at_the_morning_cutoff():
     assert eight["on_filings"][0] == 2 and nine["on_filings"][0] == 3
     assert np.isnan(eight["on_filings"][1])                      # no filing history at all → unknown, not zero
     assert config.MORNING_CUTOFF_ET == 8
+
+
+# ── the ONE (round 13) ───────────────────────────────────────────────────
+def test_one_score_rank_average_and_deficit():
+    day = np.array(["d"] * 4 + ["e"] * 2)
+    a = np.array([0.9, 0.5, 0.1, 0.8, 0.2, 0.3])
+    b = np.array([0.7, 0.8, 0.1, 0.9, 0.6, 0.1])
+    c = np.array([0.6, 0.5, 0.4, 0.1, np.nan, 0.2])
+    liq = np.array([True, True, True, False, True, True])
+    sc, dfc = M.one_score(day, [a, b, c], liq)
+    assert np.isnan(sc[3]) and np.isnan(dfc[3])            # not $30K-ready
+    assert np.isnan(sc[4])                                  # a part is missing
+    # session d among liquid rows: a ranks 1,2,3; b ranks 2,1,3; c ranks 1,2,3
+    np.testing.assert_allclose(dfc[:3], [1, 2, 6])
+    assert sc[0] > sc[1] > sc[2]
+    assert sc[5] == pytest.approx(1.0) and dfc[5] == 0      # alone in its session
+    assert [M.one_tier(x) for x in (0, 2, 3, 7, 8, np.nan)] == ["high", "high", "medium", "medium", "low", None]
+
+
+def test_one_mask_needs_the_bigger_size():
+    df = pd.DataFrame([_row(), _row(dvol20=2.5e6, volume=500_000, vol20=0.04)])   # capacity ~$61K
+    cap = M.market_capacity(df)
+    assert (cap >= config.BOARD_MIN_USD).all() and cap[1] < config.ONE_MIN_USD <= cap[0]
+    assert list(M.liquid_mask(df)) == [True, True] and list(M.one_mask(df)) == [True, False]
+
+
+def test_train_reports_the_one_and_predicts_its_parts(tmp_path):
+    p, liquid = _liquid_panel()
+    rep = M.train(p, out_dir=tmp_path, site_json=None, fold_months=FOLD_MONTHS, params=FAST)
+    one = rep["one"]
+    assert one["size"] == config.ONE_MIN_USD and one["parts"] == list(M.ONE_PARTS)
+    for m in ("m0", "m1"):
+        o = one[m]["overall"]
+        assert o["days"] > 0 and 0 <= o["hit"] <= 1 and str(config.ONE_MIN_USD) in {k[4:] for k in o if k.startswith("net_")}
+        tiers = one[m]["tiers"]
+        assert set(tiers) == {"high", "medium", "low"}
+        assert sum(t["days"] for t in tiers.values()) == o["days"]
+    b = M.load(tmp_path)
+    assert set(b["one"]) == {"m0", "m1"} and all(b["one"][m]["dump"] is not None for m in ("m0", "m1"))
+    rows = p[p["date"] == p["date"].max()].set_index("symbol")
+    pr = M.predict(b, rows, use_open=False)
+    assert pr["one_dump"].notna().all() and pr["one_d3"].notna().all()
+    assert ((pr["one_dump"] >= 0) & (pr["one_dump"] <= 1)).all()
+
+
+def test_one_lendable_gate_uses_its_own_size():
+    borrow = {"AAA": {"available": 10_000}}                 # $50K lendable at $5
+    assert cli._lend_short("AAA", borrow, True, 5.0) is None                          # fine for the $30K board
+    assert cli._lend_short("AAA", borrow, True, 5.0, config.ONE_MIN_USD) == 50_000.0  # not for the $100K ONE

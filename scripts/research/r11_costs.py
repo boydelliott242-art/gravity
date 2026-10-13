@@ -27,7 +27,7 @@ idx = b.index
 est = sub.loc[idx, "spread_ar"].to_numpy(float)
 dv = sub.loc[idx, "dvol20"].to_numpy(float)
 spr = sub.loc[idx, "spr"].to_numpy(float)
-cap = np.where(dv >= 5e6, 0.01, np.where(dv >= 1e6, 0.02, np.where(dv >= 2.5e5, 0.03, 0.06)))
+cap = np.array([CAP.spread_cap(v) for v in dv])            # the current liquidity-tier caps
 unread = ~(np.isfinite(est) & (est >= 0.001))
 clipped = ~unread & (est > cap)
 dvx, sig = sub.loc[idx, "dvx"].to_numpy(float), sub.loc[idx, "vol20"].to_numpy(float)

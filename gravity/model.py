@@ -70,6 +70,8 @@ CAP_FROM = 0.5                                # probabilities above this are cap
 SIM_FRACTION = 0.10                           # compounded curve: risk 10% of equity per day
 REALISTIC_SIZES = (10_000, 50_000)            # per-pick cost model sizes reported in the sim
 LIQ_SIZE = config.BOARD_MIN_USD               # every board name must take this short without moving the price
+ONE_SIZE = config.ONE_MIN_USD                  # the main-page pick must take this one
+ONE_PARTS = ("prob_dump", "one_dump", "one_d3")  # the three dump models the ONE's score averages (R13 O4)
 TIE_EPS = 1e-6                                # isotonic ties broken by the raw score (moves p by < 1e-6)
 BUNDLE_NAME = "bundle.pkl"
 DEFAULT_SITE_JSON = config.SITE_DATA / "model.json"
@@ -206,6 +208,41 @@ def liquid_mask(df: pd.DataFrame) -> np.ndarray:
                 & (market_capacity(df) >= LIQ_SIZE))
 
 
+def one_mask(df: pd.DataFrame) -> np.ndarray:
+    """The ONE's universe: $30K-ready names that take a ONE_SIZE short within the same volume / impact limits."""
+    return liquid_mask(df) & (market_capacity(df) >= ONE_SIZE)
+
+
+def one_score(day: np.ndarray, parts: Sequence[np.ndarray], liq: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """R13 (O4): the session percentile of each dump model's probability among $30K-ready rows, averaged; and the
+    rank shortfall — sum over the models of (rank from the top − 1) — that sets the conviction tier. NaN off ``liq``
+    or when any part is missing."""
+    liq = np.asarray(liq, bool)
+    n = len(liq)
+    score, deficit = np.full(n, np.nan), np.full(n, np.nan)
+    ok = liq.copy()
+    for p in parts:
+        ok &= np.isfinite(np.asarray(p, float))
+    if not ok.any():
+        return score, deficit
+    d = np.asarray(day)[ok]
+    acc, dfc = np.zeros(ok.sum()), np.zeros(ok.sum())
+    for p in parts:
+        s = pd.Series(np.asarray(p, float)[ok])
+        g = s.groupby(d)
+        acc += g.rank(pct=True).to_numpy()
+        dfc += g.rank(ascending=False, method="min").to_numpy() - 1
+    score[ok] = acc / len(parts)
+    deficit[ok] = dfc
+    return score, deficit
+
+
+def one_tier(deficit: float) -> Optional[str]:
+    if deficit is None or not np.isfinite(deficit):
+        return None
+    return "high" if deficit <= config.ONE_TIER_HIGH else ("medium" if deficit <= config.ONE_TIER_MEDIUM else "low")
+
+
 def _liq_target(day: np.ndarray, oc: np.ndarray, liq: np.ndarray) -> np.ndarray:
     """Within-session percentile (0–1] of open→close among $30K-ready rows;
     NaN elsewhere (R11 winner, L4). A rank target ignores the market's move
@@ -230,6 +267,54 @@ def _fit_liq(X: np.ndarray, y: np.ndarray, idx: np.ndarray, ncols: int, s: Dict[
     if len(idx) > int(s["max_fit_rows"]):
         idx = np.sort(rng.choice(idx, int(s["max_fit_rows"]), replace=False))
     return HistGradientBoostingRegressor(**s["hgb"]).fit(X[idx, :ncols], y[idx])
+
+
+def _fit_one(X: np.ndarray, y: np.ndarray, fit_idx: np.ndarray, cal_idx: np.ndarray, liq: np.ndarray,
+             ncols: int, s: Dict[str, Any], rng: np.random.Generator) -> Optional[Dict[str, Any]]:
+    """One of the ONE's liquid dump models: a classifier fit on the $30K-ready rows of the fit window,
+    isotonic-calibrated on the $30K-ready rows of the calibration slice (R11 L1 / L2 recipe)."""
+    f = fit_idx[liq[fit_idx] & np.isfinite(y[fit_idx])]
+    c = cal_idx[liq[cal_idx] & np.isfinite(y[cal_idx])]
+    if len(f) < 1000 or len(c) < 200:
+        return None
+    clf = _fit_classifier(X[f, :ncols], y[f], s, rng)
+    if clf is None:
+        return None
+    return {"clf": clf, "iso": _fit_iso(_raw(clf, X[c, :ncols]), y[c])}
+
+
+def _one_report(day: np.ndarray, score: np.ndarray, deficit: np.ndarray, U: np.ndarray, y: np.ndarray,
+                oc: np.ndarray, sq: np.ndarray, cap: np.ndarray, costs: Dict[int, np.ndarray],
+                tie: Optional[np.ndarray] = None) -> Dict[str, Any]:
+    """Walk-forward record of the ONE: each session's highest score among ``U`` rows, overall and by tier."""
+    ok = np.asarray(U, bool) & np.isfinite(score) & np.isfinite(oc)
+    if not ok.any():
+        return {}
+    d = pd.DataFrame({"day": day[ok], "s": score[ok], "dfc": deficit[ok], "y": y[ok], "oc": oc[ok], "sq": sq[ok],
+                      "tie": tie[ok] if tie is not None else 0.0,
+                      "cap": cap[ok], **{f"c{q}": c[ok] for q, c in costs.items()}})
+    # same order as the live pick: score, then rank shortfall, then the dump model's own odds
+    d = d.sort_values(["day", "s", "dfc", "tie"], ascending=[True, False, True, False], kind="mergesort")
+    top = d.groupby("day", sort=True).head(1)
+
+    def stats(t: pd.DataFrame) -> Dict[str, Any]:
+        if not len(t):
+            return {"days": 0}
+        r = {"days": int(len(t)), "hit": _f(t["y"].mean()), "big10": _f((t["oc"] <= -0.10).mean()),
+             "mean_oc": _f(t["oc"].mean()), "median_oc": _f(t["oc"].median()), "squeeze": _f(t["sq"].mean()),
+             "pump": _f((t["oc"] >= 0.05).mean()), "worst_oc": _f(t["oc"].max()), "cap_median": _f(t["cap"].median())}
+        for q in costs:
+            net = -t["oc"] - t[f"c{q}"]
+            r[f"net_{q}"] = _f(net.mean())
+            r[f"win_{q}"] = _f((net > 0).mean())
+        return r
+
+    tier = np.where(top["dfc"] <= config.ONE_TIER_HIGH, "high", np.where(top["dfc"] <= config.ONE_TIER_MEDIUM, "medium", "low"))
+    out = {"overall": stats(top), "base_dump": _f(d["y"].mean()), "tiers": {}}
+    for t in ("high", "medium", "low"):
+        x = top[tier == t]
+        out["tiers"][t] = stats(x) | {"share": _f(len(x) / len(top))}
+    return out
 
 
 # ── Small helpers ────────────────────────────────────────────────────────
@@ -873,6 +958,10 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
     y_liq = _liq_target(row_dates, Y["y_oc"], liq)
     oos_liq = {m: np.full(len(lab), np.nan) for m in ("m0", "m1")}
     rng_l = np.random.default_rng(int(s["seed"]) + 11)   # own stream: the classifiers' subsamples are unchanged
+    # the ONE (R13): two more dump models on $30K-ready rows — P(open→close ≤ −5%) and P(≤ −3%)
+    Y_one = {"dump": Y["y_dump"], "d3": np.where(np.isfinite(Y["y_oc"]), (Y["y_oc"] <= -0.03).astype(float), np.nan)}
+    oos_one = {m: {k: np.full(len(lab), np.nan) for k in Y_one} for m in ("m0", "m1")}
+    rng_o = np.random.default_rng(int(s["seed"]) + 13)
     log.info("train: %d labeled rows, %d symbols, %d sessions (%s → %s)", len(lab), lab["symbol"].nunique(),
              len(dates), _day(dates[0]), _day(dates[-1]))
 
@@ -904,6 +993,10 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
             te_l = te_idx[liq[te_idx]]
             if reg is not None and len(te_l):
                 oos_liq[m][te_l] = 0.5 - reg.predict(X[te_l, :liq_cols[m]])
+            for key, yk in Y_one.items():
+                cm = _fit_one(X, yk, fit_idx, cal_idx, liq, nc, s, rng_o)
+                if cm is not None and len(te_l):
+                    oos_one[m][key][te_l] = _calibrated(cm, X[te_l, :nc])
         row["seconds"] = round(time.time() - t_f, 1)
         fold_rows.append(row)
         log.info("fold %d/%d test %s→%s  n_fit=%d n_test=%d  AUC m0 %.3f m1 %.3f  (%.1fs)", k + 1, len(folds),
@@ -1017,6 +1110,23 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
                    "down before the comparison (round 11)"),
         "per_session_median": _f(per_day.median()) if len(per_day) else None,
     }
+    # the ONE: the session's best consensus score among names that take a ONE_SIZE short
+    one_cost = {q: np.asarray(CAP.round_trip_cost(q, _dvx, _numcol(lab, "vol20"), _spr), float)
+                for q in (ONE_SIZE, 500_000, 1_000_000)}
+    U_one = one_mask(lab)
+    one_rep: Dict[str, Any] = {"size": ONE_SIZE, "parts": list(ONE_PARTS),
+                               "tier_rule": {"high_max": config.ONE_TIER_HIGH, "medium_max": config.ONE_TIER_MEDIUM},
+                               "rule": (f"The single main-page pick: among names that take a ${ONE_SIZE:,.0f} short without "
+                                        f"moving the price (≤ 5% of expected volume, ≤ 0.5% estimated impact, price ≥ $1, no "
+                                        f"Rule 201; live also IBKR lendable ≥ ${ONE_SIZE:,.0f}, squeeze danger < 70, not halted), "
+                                        f"the highest average session percentile of three dump models (the dump-odds model and two "
+                                        f"trained only on $30K-ready names: a ≥ 5% drop and a ≥ 3% drop). Chosen by a rule written "
+                                        f"down before the comparison (round 13).")}
+    for m in ("m0", "m1"):
+        parts = [oos[m]["prob_dump"], oos_one[m]["dump"], oos_one[m]["d3"]]
+        sc_o, df_o = one_score(row_dates, parts, liq & tested)
+        one_rep[m] = _one_report(row_dates, sc_o, df_o, U_one & tested, Y["y_dump"], Y["y_oc"], Y["y_squeeze"],
+                                 market_capacity(lab), one_cost, tie=oos[m]["prob_dump"])
     for m in ("m0", "m1"):
         sc = oos_liq[m]
         t = tested & liq & np.isfinite(sc)
@@ -1036,6 +1146,8 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
     cal_idx = np.flatnonzero(di >= cal_start)
     prod = {m: _fit_set(X, Y, fit_idx, cal_idx, nc, s, rng) for m, nc in (("m0", n0), ("m1", n1))}
     prod_liq = {m: _fit_liq(X, y_liq, np.r_[fit_idx, cal_idx], liq_cols[m], s, rng_l) for m in ("m0", "m1")}
+    prod_one = {m: {k: _fit_one(X, yk, fit_idx, cal_idx, liq, nc, s, rng_o) for k, yk in Y_one.items()}
+                for m, nc in (("m0", n0), ("m1", n1))}
     for m in prod:
         for t in TARGETS:
             if prod[m].get(t) is not None:
@@ -1091,6 +1203,7 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
         "oos": report_oos,
         "rank_bands": rank_bands,
         "liquid": liquid,
+        "one": one_rep,
         "swing": swing,
         "calibration": calib,
         "importance": imp0,
@@ -1142,6 +1255,7 @@ def train(panel: pd.DataFrame, out_dir: Path = config.MODELS,
         "m1": prod["m1"],
         "liq": prod_liq,
         "liq_features": {"m0": f0, "m1": fl1},
+        "one": prod_one,
         "report": report,
         "sklearn_version": sklearn.__version__,
     }
@@ -1220,6 +1334,16 @@ def predict(bundle: Dict[str, Any], rows: pd.DataFrame, use_open: bool) -> pd.Da
             if reg is not None and mask.any():
                 edge[mask] = 0.5 - reg.predict(Xm[mask, :cols])
     out["liq_edge"] = edge
+    # the ONE's two liquid dump models (calibrated); NaN with a bundle that predates them
+    one = (bundle or {}).get("one") or {}
+    for key in ("dump", "d3"):
+        v = np.full(n, np.nan)
+        if n and one:
+            for m, mask, cols in (("m0", ~use1, len(f0)), ("m1", use1, len(f1))):
+                cm = (one.get(m) or {}).get(key)
+                if cm is not None and mask.any():
+                    v[mask] = _calibrated(cm, X[mask, :cols])
+        out[f"one_{key}"] = v
     return out
 
 

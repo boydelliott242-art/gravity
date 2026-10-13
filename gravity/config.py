@@ -71,6 +71,13 @@ BOARD_SIZE = 100         # ranked picks shown on the board, each with the full d
 # Ranking inside that universe: R11 (data/research/r9_selection_rule.txt, r11.json).
 BOARD_MIN_USD = 30_000
 BOARD_MIN_PRICE = 1.0
+# The ONE (round 13): the single main-page pick — the highest-accuracy dump call among names that take a short of at
+# least ONE_MIN_USD without moving the price (same volume / impact / price rules, IBKR lendable >= ONE_MIN_USD).
+# Score = rank-average of three dump models within the $30K-ready universe (R13, r9_selection_rule.txt).
+ONE_MIN_USD = 100_000
+# conviction tiers: the three models' summed rank shortfall from #1 among $30K-ready names (R13b)
+ONE_TIER_HIGH = 2
+ONE_TIER_MEDIUM = 7
 DOSSIER_SIZE = 60        # legacy pool size (board selection now walks the ranking — cli.BOARD_POOL_MAX)
 TWINS_SIZE = 12          # INHD lookalikes
 CHART_SESSIONS = 120     # daily bars embedded per pick for the chart

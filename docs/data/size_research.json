@@ -6,7 +6,7 @@
   "Variants were chosen on a DEVELOPMENT window (test months Jan\u2013Oct 2025) and reported on an untouched CONFIRMATION window (Nov 2025 \u2013 Sep 2026), so picking the best of many cannot inflate the result.",
   "Point-in-time universe: every listed stock, a row kept only while the company was \u2264 $2B at the time (traded price \u00d7 the share count on its latest SEC cover page, split-adjusted). Delisted stocks are still missing.",
   "Capacity: \u2264 5% of the session's expected dollar volume per leg and \u2264 0.5% estimated one-way impact (square-root law, Y = 0.7, daily volatility), with a conservative next-session volume and, live, IBKR's lendable shares.",
-  "Costs: impact on both legs + one spread. The spread is the least certain input: the close-high-low estimate is trusted only between one tick ($0.0001 under $1, $0.01 above) and a liquidity-tier cap (6% under $250K/day, 3% under $1M, 2% under $5M, 1% above); when the estimator can't read a spread the cap itself is used, and live the site uses the median real bid/ask the tape recorded when it has one. 'Tight spread' shows the result if real spreads sit near the tick.",
+  "Costs: impact on both legs + one spread. The spread is the least certain input: the close-high-low estimate is trusted only between one tick ($0.0001 under $1, $0.01 above) and a liquidity-tier cap (6% under $250K/day, 3% under $1M; from round 14 the caps above $1M/day are set from real quotes of the whole liquid universe: 1.45% under $5M, 0.9% under $20M, 0.55% above \u2014 before that 2% and 1%); when the estimator can't read a spread the cap itself is used, and live the site uses the median real bid/ask the tape recorded when it has one. 'Tight spread' shows the result if real spreads sit near the tick.",
   "About 35 variants tested: production features; liquidity / intraday-habit features; bagging; liquid-only training; the pre-market gap; dump-minus-pump ranking; direct return models; protective stops; 5/10/20-session holds; two universe definitions; and (round 9) seven morning models built only from what is knowable at 9:00 ET.",
   "Round 9 (the morning model): Yahoo hourly bars with extended hours give, for each stock and morning, the last after-hours / pre-market trade before 9:00 ET, the extended-hours high and low, and how many hours had any trade (Yahoo reports no extended-hours volume). Overnight filings use EDGAR acceptance times. The winner was fixed by a rule written down before the results were seen (best development-window average move, then it had to match or beat the old morning model in the confirmation window).",
   "The tables in this section are research runs (their own universe build); the Track Record shows the production model's walk-forward with the same cost model. A single daily #1 is a noisy statistic (about 210\u2013230 sessions per window): small changes to the universe moved the same model's average by about a point, so read differences smaller than that as noise. The morning-model comparison is paired \u2014 every variant on the same days and universe \u2014 which is what makes its ranking meaningful."
@@ -188,19 +188,19 @@
   }
  },
  "official": {
-  "pub1_hit": 0.498861,
-  "pub1_mean_oc": -0.033704,
-  "pub1_median_oc": -0.049587,
-  "base": 0.093259,
-  "net10k": -0.003223,
-  "cost10k": 0.036927
+  "pub1_hit": 0.504566,
+  "pub1_mean_oc": -0.040363,
+  "pub1_median_oc": -0.05135,
+  "base": 0.093245,
+  "net10k": 0.003301,
+  "cost10k": 0.037062
  },
  "verdict": [
   "New: the morning #1 now adds the last PRE-MARKET trade before 8:00 ET, so it can run at 7:20 CT. In the backtest its #1 fell 5%+ open\u2192close on 52% / 54% of sessions (development / confirmation) vs 49% / 52% for the close-only model, averaging \u22124.9% / \u22125.4% (close-only \u22123.9% / \u22123.5%); after each pick's estimated cost +1.5% / +1.6% per trade at $10K.",
   "Paired day by day with the close-only model: +1.0% per trade in development (90% interval \u22121.1% to +3.1%) and +1.9% in confirmation (\u22120.5% to +4.3%) \u2014 better in both windows, though each interval still includes zero.",
   "Why not the richer 9:00 ET version (which did better: 58% dumped, \u22124.9% in confirmation)? It needs the 8:05 CT run, and on 8 and 9 October that run could not finish before the bell while the Mac slept; Yahoo also stopped serving after-hours bars (17:00\u201318:59 ET) on 7 October. The pre-market-only version needs neither \u2014 and a feed check switches the morning model off (close-only scores) on any day its inputs look abnormal.",
-  "The close-only model (the evening watchlist, and the morning fallback) still finds dumps \u2014 50% of its #1s fell 5%+ open\u2192close vs 9% for the average name (point-in-time backtest), averaging \u22123.4% before costs.",
-  "But these are thin stocks. With each pick's own estimated cost, its average trade nets \u22120.3% at $10K (estimated cost \u2248 3.7% round trip). The live tape records real bid/ask spreads to keep checking the cost model.",
+  "The close-only model (the evening watchlist, and the morning fallback) still finds dumps \u2014 50% of its #1s fell 5%+ open\u2192close vs 9% for the average name (point-in-time backtest), averaging \u22124.0% before costs.",
+  "But these are thin stocks. With each pick's own estimated cost, its average trade nets +0.3% at $10K (estimated cost \u2248 3.7% round trip). The live tape records real bid/ask spreads to keep checking the cost model.",
   "Names that can take $500K\u2013$1M: the model still finds dump candidates at about 3\u20135\u00d7 the normal rate, but their average same-day move is too small to pay the costs at that size. No variant \u2014 stops, direction-aware ranking, the pre-market gap, liquid-only models \u2014 fixed that.",
   "20-session shorts in liquid names looked excellent (+4% to +12% per trade) on today's small-cap list, but that list over-represents stocks that had already collapsed. On a point-in-time universe the result is mixed and statistically indistinguishable from zero (about 11 independent trades per period). Not confirmed, not shipped.",
   "So the honest answer to \u201c$500K\u2013$1M without losing accuracy\u201d is no \u2014 not with these signals and free data. GRAVITY shows every pick's capacity, cost at your size and breakeven, so you can size each trade to what the stock can actually absorb."
@@ -576,12 +576,12 @@
    }
   },
   "tails": {
-   "m0_worst": 1.436364,
+   "m0_worst": 1.252396,
    "m1_worst": 1.713797,
-   "m0_median": -0.049587,
-   "m1_median": -0.068376,
-   "m0_mean": -0.03370432346241458,
-   "m1_mean": -0.051006309794988616
+   "m0_median": -0.05135,
+   "m1_median": -0.054790500000000006,
+   "m0_mean": -0.04036284018264841,
+   "m1_mean": -0.029015698630136987
   },
   "guards": {
    "none": {
@@ -1211,24 +1211,24 @@
   "costs": {
    "adopted": "L4 (production hybrid)",
    "n": 43800,
-   "share_at_cap": 0.8417351598173516,
+   "share_at_cap": 0.8797488584474886,
    "share_unreadable": 0.4561415525114155,
-   "share_read_wider_clipped": 0.38559360730593606,
-   "median_read_over_cap_when_clipped": 2.3264895921601707,
-   "mean_spread_used": 0.012723883495449426,
+   "share_read_wider_clipped": 0.4370091324200913,
+   "median_read_over_cap_when_clipped": 2.6965396250081515,
+   "mean_spread_used": 0.009922256102802689,
    "mean_two_way_impact": 0.005282800003059819,
    "net_by_spread_multiple": {
     "0.5": {
-     "dev": -0.009995769536737774,
-     "confirm": -0.009041385754549491
+     "dev": -0.008593099667718372,
+     "confirm": -0.007642235381810882
     },
     "1.0": {
-     "dev": -0.016438676925593993,
-     "confirm": -0.015329690837902444
+     "dev": -0.013633337187555189,
+     "confirm": -0.012531390092425225
     },
     "2.0": {
-     "dev": -0.02932559039563129,
-     "confirm": -0.027907482537941956
+     "dev": -0.02371491091955368,
+     "confirm": -0.022310881046987523
     }
    },
    "old_top1_cap30_share": {
@@ -1241,11 +1241,268 @@
    "The honest catch: the #1 dumps far less often. In the backtest the $30K board's #1 fell 5%+ open\u2192close on 26% / 28% of sessions (old #1: 52% / 54%); ranks 51\u2013100 on 11% / 12% (old: 24% / 24%). Most of that is liquidity \u2014 the dump-odds model's own #1 among the same $30K-ready names fell 5%+ on 36% / 36% \u2014 and part is the ranker, which was chosen for all 100 names, not for the #1: its #1 dumps less often and netted no better at $30K (\u22122.0% / \u22121.6% versus \u22121.0% / \u22121.6% for the dump-odds #1). Same-or-better accuracy is not available at this size: the big intraday dumps happen in stocks too thin to take $30K.",
    "The old #1 itself, even charged its large estimated cost, netted +0.4% / +0.5% at $30K \u2014 better than the new #1's \u22122.0% / \u22121.6%. But it could take $30K within the volume and impact limits on only 24% / 18% of days \u2014 the rest of the time a $30K short was exactly the heavy slippage this change exists to avoid, and the cost model is least reliable for such oversized orders.",
    "Across all 100 at $30K a name, the new board is far better than the old one: per position after estimated costs \u22121.6% / \u22121.5%, versus \u22124.1% / \u22124.3% for the old board, whose thin names would pay about 5.0% to trade $30K.",
-   "But shorting all 100 at $30K still lost money in the backtest: the average name moved only \u22120.2% open\u2192close against about 1.8% estimated cost (\u22120.9% per position if real spreads are half the assumed ones, \u22122.8% if double). The top 10 come closest (\u22121.2% / \u22121.4%; half spreads \u22120.6% / \u22120.8%). Treat the lower ranks as a watchlist.",
+   "But shorting all 100 at $30K still lost money in the backtest: the average name moved only \u22120.2% open\u2192close. Under the cost model of 12 October (about 1.8% round trip; the table above) that was \u22121.6% / \u22121.5% per position; with the spread caps re-measured from real quotes (round 14, about 1.5% round trip) it is still \u22121.4% / \u22121.3% (\u22120.8% if real spreads are half of that, \u22122.2% if double). The top 10 come closest (\u22121.2% / \u22121.4% under the old costs). Treat the lower ranks as a watchlist.",
    "The evening watchlist, and the morning page whenever the pre-market feed check fails, use the close-only version of the ranker: its #1 fell 5%+ on 29% / 22% and netted \u22120.1% / \u22123.0%; all 100 netted \u22121.7% / \u22121.6% per position. The morning version above re-scores the top 450 $30K-ready names with the pre-market gap \u2014 exactly as the live run does.",
    "Six ranking models were compared under a rule written down before the run: rank by development 100-name net, treat gaps under 0.05 pt as ties, break ties by development top-10 net, then require confirmation no worse than the production model. It picked a regression on its within-day percentile. The six spanned \u22121.5% to \u22121.7% per position; a dump classifier trained only on these names, a 3%-drop classifier and an average of three of them were measurably worse than production in at least one window (paired 90% interval below zero); the rest were statistically indistinguishable from production; against production, the adopted ranker's paired 90% interval spans zero in both windows. A second pre-registered step tested adding counts of SEC filings accepted overnight (up to 8:00 ET). Its first run took filing histories only for today's \u2264 $2B universe \u2014 a look-ahead (names that later grew had none), caught in review \u2014 so it was re-run with every stock's history: +0.01 pt / +0.05 pt per position against a bar of +0.05 pt in both windows, so overnight filings are NOT used.",
    "Holding 5 or 10 sessions instead (tested with the first round's peer-relative regression) did not fix the 100-name board (\u22121.8% to \u22122.3% per position). Exploratory only \u2014 that test was designed after looking at 5-session moves and the top ranks were not its question: the #1 netted +2.9% / +1.5% held 5 sessions and +2.7% / +4.5% held 10; the top 10 \u22121.1% / \u22121.0% and \u22121.1% / \u22120.6%. A 10-session #1 is only about 23 independent trades per window, and 1 in 20 of its positions lost 48% / 32% or more before costs. Not shipped, not a recommendation.",
-   "Costs are the biggest uncertainty, in both directions: on the backtest board the spread used is the liquidity-tier cap (1\u20133%) for 84% of names \u2014 for 46% the estimator could not read a spread, for 39% it read a wider one (median 2.3\u00d7 the cap) that was clipped down. Real bid/ask quotes for this whole universe are being recorded to replace the assumption with measured spreads."
+   "Costs remain the biggest uncertainty, in both directions. For 88% of backtest board names the spread used is the liquidity-tier cap (46% because the estimator could not read a spread, 44% because it read a wider one that was clipped down). Round 14 set those caps from real quotes \u2014 one session, three rounds of mid-session quotes of every liquid name \u2014 but spreads at the open and close, when these trades happen, were not sampled yet."
+  ]
+ },
+ "one13": {
+  "title": "Round 13 \u2014 the ONE: one stock, the highest accuracy we can find, shortable at $100K+",
+  "note": "Walk-forward, out of sample, development / confirmation. #1 = each session's top-ranked $100K-shortable name under each method. Net = open\u2192close short minus each pick's own estimated round-trip cost at $100K.",
+  "rows": [
+   {
+    "key": "O0",
+    "label": "Production dump model (any liquidity)",
+    "hit": {
+     "dev": 0.34299516677856445,
+     "confirm": 0.2943722903728485
+    },
+    "big10": {
+     "dev": 0.178743961352657,
+     "confirm": 0.13852813852813853
+    },
+    "mean_oc": {
+     "dev": -0.005886104889214039,
+     "confirm": -0.0034757968969643116
+    },
+    "net100k": {
+     "dev": -0.00842174352795995,
+     "confirm": -0.010954044673069345
+    }
+   },
+   {
+    "key": "O1",
+    "label": "Dump model trained on $30K-ready names",
+    "hit": {
+     "dev": 0.3478260934352875,
+     "confirm": 0.33766233921051025
+    },
+    "big10": {
+     "dev": 0.13043478260869565,
+     "confirm": 0.12987012987012986
+    },
+    "mean_oc": {
+     "dev": -0.004704085644334555,
+     "confirm": -0.0031125196255743504
+    },
+    "net100k": {
+     "dev": -0.008828504076509022,
+     "confirm": -0.010806095398282747
+    }
+   },
+   {
+    "key": "O2",
+    "label": "Dump model trained on $100K-ready names",
+    "hit": {
+     "dev": 0.3140096664428711,
+     "confirm": 0.2943722903728485
+    },
+    "big10": {
+     "dev": 0.12560386473429952,
+     "confirm": 0.1341991341991342
+    },
+    "mean_oc": {
+     "dev": 0.003791838651522994,
+     "confirm": -0.008932171389460564
+    },
+    "net100k": {
+     "dev": -0.017902951750796925,
+     "confirm": -0.005250705924025802
+    }
+   },
+   {
+    "key": "O3",
+    "label": "O1 averaged over 5 seeds",
+    "hit": {
+     "dev": 0.35748791694641113,
+     "confirm": 0.3419913351535797
+    },
+    "big10": {
+     "dev": 0.1642512077294686,
+     "confirm": 0.15584415584415584
+    },
+    "mean_oc": {
+     "dev": -0.004750654101371765,
+     "confirm": -0.009792027994990349
+    },
+    "net100k": {
+     "dev": -0.009264049546814262,
+     "confirm": -0.0042303709013211226
+    }
+   },
+   {
+    "key": "O4",
+    "label": "Consensus of three dump models (rank-average)",
+    "hit": {
+     "dev": 0.3719806671142578,
+     "confirm": 0.3549783527851105
+    },
+    "big10": {
+     "dev": 0.15942028985507245,
+     "confirm": 0.15584415584415584
+    },
+    "mean_oc": {
+     "dev": -0.006251653656363487,
+     "confirm": -0.0027572866529226303
+    },
+    "net100k": {
+     "dev": -0.0071743226798903536,
+     "confirm": -0.01127517088864792
+    }
+   },
+   {
+    "key": "O5",
+    "label": "O1 + overnight filings and earnings releases",
+    "hit": {
+     "dev": 0.3478260934352875,
+     "confirm": 0.3160173296928406
+    },
+    "big10": {
+     "dev": 0.14492753623188406,
+     "confirm": 0.12987012987012986
+    },
+    "mean_oc": {
+     "dev": -0.011886217631399632,
+     "confirm": -0.006997327320277691
+    },
+    "net100k": {
+     "dev": -0.0018538711364898125,
+     "confirm": -0.007381547406569073
+    }
+   },
+   {
+    "key": "O6",
+    "label": "\u226510%-drop model",
+    "hit": {
+     "dev": 0.33816424012184143,
+     "confirm": 0.29870128631591797
+    },
+    "big10": {
+     "dev": 0.14009661835748793,
+     "confirm": 0.16017316017316016
+    },
+    "mean_oc": {
+     "dev": -0.003669347148388624,
+     "confirm": 0.0020835527684539557
+    },
+    "net100k": {
+     "dev": -0.010457498132511562,
+     "confirm": -0.016225966486418972
+    }
+   }
+  ],
+  "adopted": "O4",
+  "shipped": {
+   "hit": {
+    "dev": 0.37681159377098083,
+    "confirm": 0.35930734872817993
+   },
+   "big10": {
+    "dev": 0.15942028985507245,
+    "confirm": 0.16017316017316016
+   },
+   "mean_oc": {
+    "dev": -0.005165847018361092,
+    "confirm": -0.00538423378020525
+   },
+   "net100k": {
+    "dev": -0.00825675913390603,
+    "confirm": -0.008758069498780266
+   },
+   "net500k": {
+    "dev": -0.016398109047701743,
+    "confirm": -0.01717941830172321
+   }
+  },
+  "tiers": {
+   "high": {
+    "dev": {
+     "days": 36,
+     "share": 0.17391304347826086,
+     "hit": 0.3888888955116272,
+     "mean_oc": -0.0023824821691960096,
+     "big10": 0.2777777777777778,
+     "squeeze": 0.1388888888888889
+    },
+    "confirm": {
+     "days": 39,
+     "share": 0.16883116883116883,
+     "hit": 0.4871794879436493,
+     "mean_oc": -0.04823487251996994,
+     "big10": 0.23076923076923078,
+     "squeeze": 0.1282051282051282
+    },
+    "all": {
+     "days": 75,
+     "share": 0.17123287671232876,
+     "hit": 0.4399999976158142,
+     "mean_oc": -0.026225725188851357,
+     "big10": 0.25333333333333335,
+     "squeeze": 0.13333333333333333
+    }
+   },
+   "medium": {
+    "dev": {
+     "days": 67,
+     "share": 0.32367149758454106,
+     "hit": 0.447761207818985,
+     "mean_oc": -0.014361405745148659,
+     "big10": 0.1791044776119403,
+     "squeeze": 0.07462686567164178
+    },
+    "confirm": {
+     "days": 74,
+     "share": 0.3203463203463203,
+     "hit": 0.37837839126586914,
+     "mean_oc": 0.00023592522484250367,
+     "big10": 0.13513513513513514,
+     "squeeze": 0.10810810810810811
+    },
+    "all": {
+     "days": 141,
+     "share": 0.3219178082191781,
+     "hit": 0.41134750843048096,
+     "mean_oc": -0.0067003946751356125,
+     "big10": 0.15602836879432624,
+     "squeeze": 0.09219858156028368
+    }
+   },
+   "low": {
+    "dev": {
+     "days": 104,
+     "share": 0.5024154589371981,
+     "hit": 0.32692307233810425,
+     "mean_oc": -0.00020525661238934845,
+     "big10": 0.10576923076923077,
+     "squeeze": 0.057692307692307696
+    },
+    "confirm": {
+     "days": 118,
+     "share": 0.5108225108225108,
+     "hit": 0.3050847351551056,
+     "mean_oc": 0.005253760144114494,
+     "big10": 0.15254237288135594,
+     "squeeze": 0.0847457627118644
+    },
+    "all": {
+     "days": 222,
+     "share": 0.5068493150684932,
+     "hit": 0.315315306186676,
+     "mean_oc": 0.002696382813155651,
+     "big10": 0.13063063063063063,
+     "squeeze": 0.07207207207207207
+    }
+   }
+  },
+  "verdict": [
+   "New: the main page shows ONE stock \u2014 the most accurate dump call found among stocks that can take a $100K short without moving the price (\u2264 5% of expected volume, \u2264 0.5% estimated impact, $1+, IBKR able to lend $100K). Across the whole sample 4.3% of those stocks fell 5%+ open\u2192close on an average day.",
+   "Seven ways to pick it were compared under a rule written down before the run (best development #1 dump rate, ties within 2 points broken by the top-3 rate; then in confirmation the #1 no more than 2 points worse and the top 3 no worse than production). It picked consensus of three dump models (rank-average): the stock that the production dump model, a \u22655%-drop model and a \u22653%-drop model (both trained only on liquid names) jointly rank highest. Its #1 fell 5%+ on 37% / 35% of sessions versus 34% / 29% for the production model alone.",
+   "Measured as the live morning run ranks it (before the live-only borrow, IBKR-lendable, squeeze and halt checks, which have no history), the ONE fell 5%+ on 38% / 36% of sessions and 10%+ on 16% / 16%, averaging \u22120.5% / \u22120.5% open\u2192close. The evening (close-only) version: 34% / 31%.",
+   "Conviction tiers (how closely the three models agree it is the top name): high-conviction days fell 5%+ on 39% / 49% (36 / 39 days), medium 45% / 38%, low 33% / 31%. The high tier is a small sample and was not monotone in development \u2014 read it as a hint, not a promise.",
+   "Super-high accuracy at this size is not something the data supports: the ONE is about 8\u00d7 the base rate, but it is still wrong about two days in three, and on the days it is wrong the stock often rises (that is why the average move is small). After each pick's own estimated cost it netted \u22120.8% / \u22120.9% per trade at $100K and \u22121.6% / \u22121.7% at $500K.",
+   "Requiring more capacity lowers accuracy: with a $250K floor the same rule's #1 fell 5%+ on 30% / 32%, at $500K 31% / 29%, at $1M 24% / 23% \u2014 so the floor is $100K and the page shows how much more each day's pick can take."
   ]
  }
 }

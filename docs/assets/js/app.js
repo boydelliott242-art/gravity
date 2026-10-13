@@ -86,6 +86,17 @@ const BOARD_MIN = () => (isNum(obj(obj(S.today).model).board_min_usd) ? S.today.
 
 /** One honest sentence about how the #1 has fared historically (model.json walk-forward). */
 function backtestLine(which) {
+  const oneT = obj(obj(S.today).top).one;
+  if (oneT && oneT.model) {
+    const ms = obj(S.model).morning_set;
+    const okey = oneT.model === 'm1' && ms && ms !== 'official' ? 'm1' : 'm0';
+    const r = obj(obj(obj(obj(S.model).one)[okey]).overall);
+    if (isNum(r.hit)) {
+      const q = oneT.min_usd || 100000;
+      const net = isNum(r[`net_${q}`]) ? ` — after each pick's own estimated cost that is ${pct(r[`net_${q}`], 1, true)} per trade at ${sizeLabel(q)}${isNum(r.net_500000) ? `, ${pct(r.net_500000, 1, true)} at $500K` : ''}${isNum(r.net_1000000) ? `, ${pct(r.net_1000000, 1, true)} at $1M` : ''}` : '';
+      return ` Backtest of the ONE (${okey === 'm1' ? (ms === 'pm' ? 'morning version, with the last pre-market trade before 8:00 ET' : 'morning version, with extended-hours trading before 9:00 ET') : oneT.model === 'm1' ? 'close-only version — the morning version has no honest backtest under this morning set' : 'close-only version'}; point-in-time universe, walk-forward, ${int(r.days)} sessions): it fell 5%+ open→close on ${Math.round(r.hit * 100)}% of sessions and 10%+ on ${Math.round((r.big10 || 0) * 100)}%, rose 5%+ instead on ${Math.round((r.pump || 0) * 100)}%, spiked 20%+ above the open on ${Math.round((r.squeeze || 0) * 100)}%, averaging ${pct(r.mean_oc, 1, true)} open→close before costs (median ${pct(r.median_oc, 1, true)})${net}. A tilt in the odds, never a sure thing.`;
+    }
+  }
   const { liq, key: lkey, rep } = liqReport(which);
   const b1 = liqBand(rep, 1, 1);
   const tmod = obj(obj(S.today).model);
@@ -280,6 +291,7 @@ function indexRecords() {
   const put = (p, ctx) => {
     if (p && p.symbol && !S.recs.has(p.symbol)) S.recs.set(p.symbol, { pick: p, ...ctx });
   };
+  if (t.top && t.top.one) put(t.top, { where: 'one' });      // the ONE's record (its own size block and consensus) wins
   arr(t.board).forEach((p) => put(p, { where: 'board' }));
   if (t.top) put(t.top, { where: 'board' });
   arr(t.squeeze_zone).forEach((p) => put(p, { where: 'zone' }));
@@ -390,7 +402,12 @@ function renderHero() {
   if (S.field) { S.field.destroy(); S.field = null; }
   $$('.hero-guide, .replay', art).forEach((n) => n.remove());
 
-  if (eyebrow) eyebrow.textContent = (t && t.session_date ? `Today's #1 · ${fmtDay(t.session_date)}` : "Today's #1") + (t && t.top && isNum(t.top.rank) && t.top.rank > 1 ? ` · board rank ${t.top.rank}` : '');
+  const one = t && t.top && t.top.one ? t.top.one : null;
+  if (eyebrow) {
+    eyebrow.textContent = one
+      ? `The ONE · shortable at ${sizeLabel(one.min_usd || 100000)}+${t.session_date ? ` · ${fmtDay(t.session_date)}` : ''}${one.tier ? ` · ${one.tier} conviction` : ''}`
+      : (t && t.session_date ? `Today's #1 · ${fmtDay(t.session_date)}` : "Today's #1") + (t && t.top && isNum(t.top.rank) && t.top.rank > 1 ? ` · board rank ${t.top.rank}` : '');
+  }
 
   if (!top) {
     let why = "Today's feed could not be loaded. The raw file is at data/today.json.";
@@ -407,11 +424,17 @@ function renderHero() {
 
   const sym = esc(top.symbol);
   const base = S.base;
-  const probN = isNum(top.prob_dump) ? Math.round(top.prob_dump * 100) : null;
+  const tierRec = one ? obj(one.tier_record) : {};
+  const oneRec = one ? obj(one.record) : {};
+  const oneHit = one && isNum(tierRec.hit) ? tierRec.hit : one && isNum(oneRec.hit) ? oneRec.hit : null;
+  const probN = oneHit != null ? Math.round(oneHit * 100) : isNum(top.prob_dump) ? Math.round(top.prob_dump * 100) : null;
   const capV = obj(obj(t.model).prob_cap)[top.model_used === 'm1' ? 'm1' : 'm0'];
-  const atCap = isNum(capV) && isNum(top.prob_dump) && top.prob_dump >= capV - 1e-4;
+  const atCap = oneHit == null && isNum(capV) && isNum(top.prob_dump) && top.prob_dump >= capV - 1e-4;
   const where = [top.exchange, top.country].filter(Boolean).map(esc).join(' · ');
-  const lede = isNum(base)
+  const oneBase = one ? obj(obj(obj(S.model).one)[one.model]).base_dump : null;
+  const lede = oneHit != null
+    ? `How often the ONE <b>fell 5%+ from open to close</b> on ${one.tier && isNum(tierRec.hit) ? `<b>${esc(one.tier)}-conviction</b> days` : 'its days'} in the walk-forward backtest (${esc(int(isNum(tierRec.days) && one.tier ? tierRec.days : oneRec.days))} days${one.tier && isNum(oneRec.hit) ? `; all days ${esc(pct(oneRec.hit, 0))}` : ''}${isNum(oneBase) ? `; a typical $100K-shortable stock ${esc(pct(oneBase, 1))}` : ''}). History, not a promise.`
+    : isNum(base)
     ? `The model's odds of a <b>5%+ drop from open to close</b> this session — <b>${esc(liftTxt(top.lift))}</b> the ${esc(pct(base, 1))} base rate for an average eligible name.`
     : 'The model\'s odds of a <b>5%+ drop from open to close</b> this session. Base rate not reported in this feed.';
   setHTML(titleWrap, `
@@ -482,12 +505,15 @@ function renderHero() {
     ? (obj(S.model).morning_set === 'pm' ? 'M1 reading — adds the last pre-market trade before 8:00 ET' : obj(S.model).morning_set && S.model.morning_set !== 'official' ? 'M1 reading — adds what traded after the close and before 9:00 ET' : 'M1 reading — uses the pre-market price as the expected open')
     : top.model_used === 'm0' ? 'M0 reading — close-only features (no pre-market print)' : 'Model version not reported';
 
+  const oneNote = one
+    ? ` The ONE: the highest consensus of three dump models among the ${esc(int(one.universe))} names that can take a ${esc(sizeLabel(one.min_usd || 100000))} short without moving the price${isNum(one.consensus_rank) && one.consensus_rank > 1 ? ` — #${esc(one.consensus_rank)} by consensus, because ${esc(arr(one.held_back).slice(0, 5).join(', '))}${arr(one.held_back).length > 5 ? '…' : ''} ${arr(one.held_back).length === 1 ? 'was' : 'were'} held back (borrow, IBKR lendable, squeeze danger or halt)` : ''}. Among the ${esc(int(one.liq_universe))} $30K-ready names the three models rank it ${esc(['prob_dump', 'one_dump', 'one_d3'].map((k) => (isNum(obj(one.part_ranks)[k]) ? `#${obj(one.part_ranks)[k]}` : '—')).join(', '))} (dump odds; ≥5% drop; ≥3% drop)${one.tier ? ` — ${esc(one.tier)} conviction (total rank shortfall ${esc(int(one.deficit))}; high ≤ 2, medium ≤ 7)` : ''}. Its dump odds from the any-liquidity model: ${esc(fmtProb(top))}.`
+    : '';
   const liqRanked = obj(t.model).board_ranker === 'liq';
   const ur = isNum(top.urank) ? top.urank : 1;
   const rankNote = liqRanked
     ? ` ${ur > 1 ? `#${esc(ur)} of the ${esc(int(t.model.board_universe))} names that pass the ${esc(sizeLabel(BOARD_MIN()))} volume, impact and price test, by where its open→close is expected to land among them — the ${esc(ur - 1)} ranked above it ${ur > 2 ? 'are' : 'is'} held back (borrow, IBKR lendable, squeeze danger or halt)` : `Ranked first of the ${esc(int(t.model.board_universe))} names that pass the ${esc(sizeLabel(BOARD_MIN()))} volume, impact and price test, by where its open→close is expected to land among them`}${isNum(top.score) ? `; its dump odds are higher than ${esc(top.score)}% of all ${esc(int(scored))} names scored` : ''}.`
     : null;
-  const aboutNote = `${esc(modelLine)}. Features as of the close on ${esc(fmtDay(t.features_asof, { year: true }))}.${rankNote != null ? rankNote : isNum(top.score) ? (top.score >= 100 ? (t.top_tie_count > 1 ? ` Tied with ${esc(int(t.top_tie_count - 1))} other name${t.top_tie_count > 2 ? 's' : ''} for the highest odds of the ${esc(int(scored))} scored — ties are ordered by the model's raw score.` : ` The highest odds of the ${esc(int(scored))} names scored today.`) : ` Higher odds than ${esc(top.score)}% of the ${esc(int(scored))} names scored today.`) : ''}${backtestLine(top.model_used)}${isNum(top.rank) && top.rank > 1 ? ` The ${top.rank - 1} higher-ranked board name${top.rank > 2 ? 's are' : ' is'} skipped because ${top.rank > 2 ? 'they are' : 'it is'} under the Rule 201 short-sale restriction today or trade under $300K a day — the rule the backtest measured.` : ''}`;
+  const aboutNote = `${esc(modelLine)}. Features as of the close on ${esc(fmtDay(t.features_asof, { year: true }))}.${one ? oneNote : rankNote != null ? rankNote : isNum(top.score) ? (top.score >= 100 ? (t.top_tie_count > 1 ? ` Tied with ${esc(int(t.top_tie_count - 1))} other name${t.top_tie_count > 2 ? 's' : ''} for the highest odds of the ${esc(int(scored))} scored — ties are ordered by the model's raw score.` : ` The highest odds of the ${esc(int(scored))} names scored today.`) : ` Higher odds than ${esc(top.score)}% of the ${esc(int(scored))} names scored today.`) : ''}${backtestLine(top.model_used)}${!one && isNum(top.rank) && top.rank > 1 ? ` The ${top.rank - 1} higher-ranked board name${top.rank > 2 ? 's are' : ' is'} skipped because ${top.rank > 2 ? 'they are' : 'it is'} under the Rule 201 short-sale restriction today or trade under $300K a day — the rule the backtest measured.` : ''}`;
   const weighed = attributionBars(top.attribution);
 
   setHTML(body, `
@@ -911,8 +937,26 @@ function liveBlock(sc) {
       { label: 'Board top 25', v: live.board_dump_rate, hot: true },
       { label: 'All eligible names', v: live.universe_dump_rate },
     ])}
-    <p class="note" style="margin-top:8px">Share of sessions that fell 5%+ from open to close.${live.top_squeeze_rate != null ? ` The #1 spiked 20%+ above the open on ${pct(live.top_squeeze_rate)} of graded sessions.` : ''}${(() => { const b3 = obj(live.board30); if (!b3.n_days) return obj(obj(S.today).model).board_ranker === 'liq' ? ` From ${esc(fmtDay(S.today.session_date, { weekday: false }))} the board is ${esc(sizeLabel(BOARD_MIN()))}-only (liquid names, which dump less often); the rates above so far grade the earlier any-liquidity board.` : ''; return ` The rates above mix two eras: before ${esc(fmtDay(b3.since, { weekday: false }))} the any-liquidity dump-odds board, since then the ${esc(sizeLabel(BOARD_MIN()))} board. ${esc(sizeLabel(BOARD_MIN()))} board alone (${esc(int(b3.n_days))} graded session${b3.n_days === 1 ? '' : 's'}): #1 dumped ${esc(pct(b3.top_dump_rate))}, averaged ${esc(pct(b3.top_mean_oc, 1, true))}${isNum(b3.top_net30) ? ` (${esc(pct(b3.top_net30, 1, true))} after est. ${esc(sizeLabel(BOARD_MIN()))} cost)` : ''}; all board names dumped ${esc(pct(b3.board100_dump_rate))}${isNum(b3.board100_net30) ? `, ${esc(pct(b3.board100_net30, 1, true))} per name after est. cost` : ''}; all eligible names ${esc(pct(b3.universe_dump_rate))}.`; })()}${live.n_unverified ? ` ${int(live.n_unverified)} session(s) excluded because the pick could not be confirmed public before the open.` : ''} ${live.n_days < 60 ? 'Small sample: these rates will move a lot as days accumulate.' : ''}</p>
+    <p class="note" style="margin-top:8px">Share of sessions that fell 5%+ from open to close.${live.top_squeeze_rate != null ? ` The #1 spiked 20%+ above the open on ${pct(live.top_squeeze_rate)} of graded sessions.` : ''}${(() => { const o = obj(live.one); if (!o.n_days) return ''; return ` The ONE alone (the ${esc(sizeLabel(100000))}+ main-page pick, ${esc(int(o.n_days))} graded session${o.n_days === 1 ? '' : 's'} since ${esc(fmtDay(o.since, { weekday: false }))}): fell 5%+ ${esc(pct(o.dump_rate))}, averaged ${esc(pct(o.mean_oc, 1, true))}${isNum(o.net100) ? ` (${esc(pct(o.net100, 1, true))} after est. $100K cost)` : ''}${obj(obj(o.tiers).high).n ? `; high-conviction days ${esc(pct(o.tiers.high.dump_rate))} of ${esc(int(o.tiers.high.n))}` : ''}.`; })()}${(() => { const b3 = obj(live.board30); if (!b3.n_days) return obj(obj(S.today).model).board_ranker === 'liq' ? ` From ${esc(fmtDay(S.today.session_date, { weekday: false }))} the board is ${esc(sizeLabel(BOARD_MIN()))}-only (liquid names, which dump less often); the rates above so far grade the earlier any-liquidity board.` : ''; const oneSince = obj(live.one).since; return ` The rates above mix ${oneSince ? 'three' : 'two'} eras: before ${esc(fmtDay(b3.since, { weekday: false }))} the any-liquidity dump-odds board${oneSince ? `; then the ${esc(sizeLabel(BOARD_MIN()))} board's own #1; from ${esc(fmtDay(oneSince, { weekday: false }))} the ONE` : `, since then the ${esc(sizeLabel(BOARD_MIN()))} board`}. ${esc(sizeLabel(BOARD_MIN()))} board alone (${esc(int(b3.n_days))} graded session${b3.n_days === 1 ? '' : 's'}): ${isNum(b3.top_dump_rate) ? `its own #1 (${esc(int(b3.top_n))} session${b3.top_n === 1 ? '' : 's'} before the ONE) dumped ${esc(pct(b3.top_dump_rate))}, averaged ${esc(pct(b3.top_mean_oc, 1, true))}${isNum(b3.top_net30) ? ` (${esc(pct(b3.top_net30, 1, true))} after est. ${esc(sizeLabel(BOARD_MIN()))} cost)` : ''}; ` : ''}all board names dumped ${esc(pct(b3.board100_dump_rate))}${isNum(b3.board100_net30) ? `, ${esc(pct(b3.board100_net30, 1, true))} per name after est. cost` : ''}; all eligible names ${esc(pct(b3.universe_dump_rate))}.`; })()}${live.n_unverified ? ` ${int(live.n_unverified)} session(s) excluded because the pick could not be confirmed public before the open.` : ''} ${live.n_days < 60 ? 'Small sample: these rates will move a lot as days accumulate.' : ''}</p>
   </div>`;
+}
+
+/** The ONE's walk-forward record (model.json "one"), per model tab. */
+function oneTiles(tab) {
+  const one = obj(obj(S.model).one);
+  const rep = obj(one[tab]);
+  const r = obj(rep.overall);
+  if (!isNum(r.hit)) return '';
+  const tl = (k) => obj(obj(rep.tiers)[k]);
+  const q = one.size || 100000;
+  const red = (v) => `<span class="${isNum(v) && v < 0 ? 'red' : ''}">${esc(pct(v, 1, true))}</span>`;
+  return `<p class="eyebrow" style="margin:0 0 8px">The ONE — the main-page pick: shortable at ${esc(sizeLabel(q))}+, consensus of three dump models</p>
+    <dl class="tiles">
+      ${stat('Fell 5%+', esc(pct(r.hit)), esc(`10%+ on ${pct(r.big10)} · a typical ${sizeLabel(q)}-shortable stock ${pct(rep.base_dump, 1)} · ${int(r.days)} sessions`))}
+      ${stat('High-conviction days', esc(pct(tl('high').hit)), esc(`${int(tl('high').days)} sessions (${pct(tl('high').share)} of days) · medium ${pct(tl('medium').hit)} · low ${pct(tl('low').hit)}`))}
+      ${stat('Average move', esc(pct(r.mean_oc, 1, true)), esc(`median ${pct(r.median_oc, 1, true)} · rose 5%+ instead on ${pct(r.pump)} · spiked 20%+ on ${pct(r.squeeze)}`))}
+      ${stat(`Net at ${sizeLabel(q)}`, red(r[`net_${q}`]), esc(`after each pick's own est. cost · $500K ${pct(r.net_500000, 1, true)} · $1M ${pct(r.net_1000000, 1, true)}`))}
+    </dl>`;
 }
 
 /** The $30K board's own walk-forward record (model.json "liquid"), per model tab. */
@@ -948,6 +992,7 @@ function backtestBlock(m) {
     <p class="note">Walk-forward, out of sample${m.trained_through ? ` through ${esc(fmtDay(m.trained_through, { weekday: false, year: true }))}` : ''}. Short the #1 at the open, cover at the close${isNum(cost) ? `, ${esc(pct(cost, 0))} round-trip cost` : ''}. The published rule skips names under the Rule 201 short-sale restriction and names trading under $300K a day; it still assumes borrow was always available — often it isn't.${m.publication_rule ? ` <span class="sr-only">${esc(m.publication_rule.text || '')}</span>` : ''}</p>
     <div class="tabs" role="tablist" aria-label="Model version">${tabHTML}</div>
     <div id="bt-panel" role="tabpanel" aria-labelledby="tab-${tab}">
+      ${oneTiles(tab)}
       ${liqTiles(tab)}
       <dl class="tiles">
         ${stat(obj(obj(S.model).liquid)[tab] ? '#1 by dump odds dumped' : 'Published #1 dumped', esc(pct(isNum(oos.pub1_hit) ? oos.pub1_hit : oos.top1_hit)), esc(`raw #1 ${pct(oos.top1_hit)} · average name ${pct(base, 1)}`))}
@@ -1539,6 +1584,8 @@ function fitsSize(p, size = S.size) {
   return isNum(cap) && cap >= size;
 }
 const LIMIT_TXT = { volume: '5% of expected volume', impact: '0.5% estimated impact', borrow: 'IBKR lendable shares' };
+/** Whose historical average move a breakeven was solved against (capacity.size_block move_basis). */
+const moveWho = (b) => (b === '#1' ? "the historical #1's" : typeof b === 'string' && b.startsWith('the ONE') ? `${b.replace('the ONE', "the ONE's")} historical` : "a historical top-10 pick's");
 
 function sizeCell(p) {
   const sz = obj(p.size);
@@ -1554,7 +1601,9 @@ function sizeLine(p) {
   const sz = obj(p.size);
   if (!isNum(sz.capacity)) return '';
   const be = isNum(sz.breakeven) ? (sz.breakeven >= 1e4 ? money(sz.breakeven) : 'under $10K') : null;
-  return `<p class="hero-sub__line"><span class="eyebrow">Size</span>Absorbs about <b>${esc(money(sz.capacity))}</b> before moving the price (limit: ${esc(LIMIT_TXT[sz.limit] || sz.limit || DASH)})${be ? ` · breakeven ≈ <b>${esc(be)}</b> — above that, estimated costs exceed ${sz.move_basis === '#1' ? "the historical #1's" : "a historical top-10 pick's"} average move` : ''} · at ${esc(sizeLabel(S.size))}: <b>${esc(pct(costAt(p), 1))}</b> round-trip</p>`;
+  return `<p class="hero-sub__line"><span class="eyebrow">Size</span>Absorbs about <b>${esc(money(sz.capacity))}</b> before moving the price (limit: ${esc(LIMIT_TXT[sz.limit] || sz.limit || DASH)})${be ? ` · breakeven ≈ <b>${esc(be)}</b> — above that, estimated costs exceed ${moveWho(sz.move_basis)} average move` : ''} · ${p.one
+    ? [100000, 500000, 1000000].map((q) => `${esc(sizeLabel(q))}: <b>${esc(pct(costAt(p, q), 1))}</b>${isNum(sz.capacity) && q > sz.capacity ? ' <span class="muted">(over capacity)</span>' : ''}`).join(' · ') + ' round-trip'
+    : `at ${esc(sizeLabel(S.size))}: <b>${esc(pct(costAt(p), 1))}</b> round-trip`}</p>`;
 }
 
 function sizeDossier(p) {
@@ -1573,9 +1622,9 @@ function sizeDossier(p) {
     ['IBKR lendable value', esc(isNum(sz.cap_borrow) ? money(sz.cap_borrow) : DASH)],
     ['Spread used in costs', esc(isNum(sz.spread) ? pct(sz.spread, 2) : DASH),
       sz.spread_source === 'quoted' ? 'median real bid/ask quote recorded by the live tape, recent sessions'
-        : (sz.spread_source === 'band cap' || sz.spread_estimated === false) ? 'estimator could not read a spread — the conservative cap for this liquidity tier (6% under $250K/day, 3% under $1M, 2% under $5M, 1% above)'
+        : (sz.spread_source === 'band cap' || sz.spread_estimated === false) ? 'estimator could not read a spread — the conservative cap for this liquidity tier (6% under $250K/day, 3% under $1M; above that, the 90th percentile of real quotes: 1.45% under $5M, 0.9% under $20M, 0.55% above)'
         : 'close-high-low (Abdi–Ranaldo) estimate over 20 sessions, kept between one tick and the liquidity-tier cap'],
-    ['Breakeven size', esc(isNum(sz.breakeven) ? money(sz.breakeven) : DASH), isNum(sz.avg_move) ? `where costs reach ${sz.move_basis === '#1' ? "the historical #1's" : "a historical top-10 pick's"} ${pct(sz.avg_move, 1)} average move — a point estimate with wide uncertainty` : ''],
+    ['Breakeven size', esc(isNum(sz.breakeven) ? money(sz.breakeven) : DASH), isNum(sz.avg_move) ? `where costs reach ${moveWho(sz.move_basis)} ${pct(sz.avg_move, 1)} average move — a point estimate with wide uncertainty` : ''],
   ]) + `<div class="table-scroll" style="margin-top:16px"><table class="mtable"><caption class="sr-only">Estimated cost by position size</caption><thead><tr><th scope="col">Size</th><th scope="col">Round-trip cost</th><th scope="col">Share of volume</th><th scope="col">Within capacity</th><th scope="col">Below breakeven</th></tr></thead><tbody>${rows}</tbody></table></div><p class="note" style="margin-top:8px">Square-root impact model (Y = 0.7 × daily volatility × √(size ÷ volume)) on both legs plus one spread. Planning estimates — real costs depend on how the order is worked.</p>`;
 }
 
@@ -1668,6 +1717,18 @@ function morningBlock(mo) {
     <div class="table-scroll"><table class="mtable"><thead><tr><th scope="col">Trade</th><th scope="col">Avg short return</th><th scope="col">Share of days it paid</th><th scope="col">Days</th></tr></thead><tbody>${tRows}</tbody></table></div></div>` : ''}`;
 }
 
+/** Round 13: how the ONE (the main-page pick) was chosen. */
+function oneBlock(b) {
+  if (!b || !arr(b.rows).length) return '';
+  const dc = (o, f) => `${esc(f(obj(o).dev))} <span class="muted">/</span> ${esc(f(obj(o).confirm))}`;
+  const sp = (v) => pct(v, 1, true);
+  const pc = (v) => pct(v, 0);
+  const rows = arr(b.rows).map((r) => `<tr${r.key === b.adopted ? ' class="hot"' : ''}><th scope="row">${esc(r.label)}${r.key === b.adopted ? ' <span class="nm">live</span>' : ''}</th><td>${dc(r.hit, pc)}</td><td>${dc(r.big10, pc)}</td><td>${dc(r.mean_oc, sp)}</td><td>${dc(r.net100k, sp)}</td></tr>`).join('');
+  return `<div class="rec-block reveal"><h3 class="rec-sub">${esc(b.title || 'The ONE')}</h3><p class="note">${esc(b.note || '')}</p>
+    <div class="table-scroll"><table class="mtable"><caption class="sr-only">Ways to pick the ONE, out of sample</caption><thead><tr><th scope="col">Method</th><th scope="col">#1 fell 5%+</th><th scope="col">#1 fell 10%+</th><th scope="col">Avg open→close</th><th scope="col">Net at $100K</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <ul class="notes verdict" style="margin-top:16px">${arr(b.verdict).map((v) => `<li>${esc(v)}</li>`).join('')}</ul></div>`;
+}
+
 /** Round 11: the $30K board vs the old board, both measured at $30K a name. */
 function board30Block(b) {
   if (!b || !arr(b.rows).length) return '';
@@ -1699,10 +1760,11 @@ function renderSizeLab() {
   const today = isNum(ss.deployable) ? `<dl class="tiles reveal">
       ${stat('Deployable today', esc(money(ss.deployable)), esc(`across ${int(ss.names)} eligible name${ss.names === 1 ? '' : 's'} (no short-sale restriction, ≥ $300K/day), each within its capacity and breakeven`))}
       ${stat('#1 capacity', esc(money(ss.top_capacity)), 'before moving the price')}
-      ${stat('#1 breakeven size', esc(isNum(ss.top_breakeven) ? money(ss.top_breakeven) : DASH), esc(isNum(ss.avg_move_top1) ? `costs reach the historical #1's ${pct(ss.avg_move_top1, 1)} average move` : ''))}
+      ${stat('#1 breakeven size', esc(isNum(ss.top_breakeven) ? money(ss.top_breakeven) : DASH), esc(isNum(ss.top_move) ? `costs reach ${moveWho(ss.top_move_basis)} ${pct(ss.top_move, 1)} average move` : isNum(ss.avg_move_top1) ? `costs reach the historical #1's ${pct(ss.avg_move_top1, 1)} average move` : ''))}
       ${stat('Avg move, a top-10 pick', esc(pct(-ss.avg_move_top10, 1, true)), 'open→close before costs, walk-forward backtest')}
     </dl>` : '';
   root.innerHTML = `
+    ${oneBlock(r.one13)}
     ${board30Block(r.board30k)}
     ${today}
     <div id="planner" class="reveal"></div>
@@ -1789,6 +1851,7 @@ function dossierHTML(rec) {
   const base = S.base;
   let where = 'Dossier';
   if (rec.where === 'board') where = `Board #${isNum(p.rank) ? p.rank : DASH}`;
+  else if (rec.where === 'one') where = `The ONE${p.one && p.one.tier ? ` · ${p.one.tier} conviction` : ''}${isNum(p.rank) ? ` · also board #${p.rank}` : ''}`;
   else if (rec.where === 'zone') where = 'Squeeze zone — held off the board';
   else if (rec.where === 'twin') where = `Lookalike of ${twinsAnchor() || 'the #1'}`;
   else if (rec.where === 'swing') where = `Swing board #${isNum(p.rank) ? p.rank : DASH}`;

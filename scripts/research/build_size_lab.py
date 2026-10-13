@@ -59,7 +59,7 @@ doc = {
         "Variants were chosen on a DEVELOPMENT window (test months Jan–Oct 2025) and reported on an untouched CONFIRMATION window (Nov 2025 – Sep 2026), so picking the best of many cannot inflate the result.",
         "Point-in-time universe: every listed stock, a row kept only while the company was ≤ $2B at the time (traded price × the share count on its latest SEC cover page, split-adjusted). Delisted stocks are still missing.",
         "Capacity: ≤ 5% of the session's expected dollar volume per leg and ≤ 0.5% estimated one-way impact (square-root law, Y = 0.7, daily volatility), with a conservative next-session volume and, live, IBKR's lendable shares.",
-        "Costs: impact on both legs + one spread. The spread is the least certain input: the close-high-low estimate is trusted only between one tick ($0.0001 under $1, $0.01 above) and a liquidity-tier cap (6% under $250K/day, 3% under $1M, 2% under $5M, 1% above); when the estimator can't read a spread the cap itself is used, and live the site uses the median real bid/ask the tape recorded when it has one. 'Tight spread' shows the result if real spreads sit near the tick.",
+        "Costs: impact on both legs + one spread. The spread is the least certain input: the close-high-low estimate is trusted only between one tick ($0.0001 under $1, $0.01 above) and a liquidity-tier cap (6% under $250K/day, 3% under $1M; from round 14 the caps above $1M/day are set from real quotes of the whole liquid universe: 1.45% under $5M, 0.9% under $20M, 0.55% above — before that 2% and 1%); when the estimator can't read a spread the cap itself is used, and live the site uses the median real bid/ask the tape recorded when it has one. 'Tight spread' shows the result if real spreads sit near the tick.",
         "About 35 variants tested: production features; liquidity / intraday-habit features; bagging; liquid-only training; the pre-market gap; dump-minus-pump ranking; direct return models; protective stops; 5/10/20-session holds; two universe definitions; and (round 9) seven morning models built only from what is knowable at 9:00 ET.",
         "Round 9 (the morning model): Yahoo hourly bars with extended hours give, for each stock and morning, the last after-hours / pre-market trade before 9:00 ET, the extended-hours high and low, and how many hours had any trade (Yahoo reports no extended-hours volume). Overnight filings use EDGAR acceptance times. The winner was fixed by a rule written down before the results were seen (best development-window average move, then it had to match or beat the old morning model in the confirmation window).",
         "The tables in this section are research runs (their own universe build); the Track Record shows the production model's walk-forward with the same cost model. A single daily #1 is a noisy statistic (about 210–230 sessions per window): small changes to the universe moved the same model's average by about a point, so read differences smaller than that as noise. The morning-model comparison is paired — every variant on the same days and universe — which is what makes its ranking meaningful.",
@@ -295,12 +295,13 @@ if f11.exists():
         f"{two(new, '1-100', 'net30')}, versus {two(old, '1-100', 'net30')} for the old board, whose thin names would pay "
         f"about {ov('confirm', '1-100', 'cost30')*100:.1f}% to trade $30K.",
         f"But shorting all 100 at $30K still lost money in the backtest: the average name moved only "
-        f"{sg(nv('confirm', '1-100', 'mean_oc'))} open→close against about {nv('confirm', '1-100', 'cost30')*100:.1f}% "
-        f"estimated cost"
-        + (f" ({sg(nb['0.5']['confirm'])} per position if real spreads are half the assumed ones, {sg(nb['2.0']['confirm'])} if double)"
-           if nb.get("0.5") and nb.get("2.0") else f" (half spreads: {sg(nv('confirm', '1-100', 'net30_halfspread'))})")
-        + f". The top 10 come closest ({two(new, '1-10', 'net30')}; half spreads {two(new, '1-10', 'net30_halfspread')}). "
-        f"Treat the lower ranks as a watchlist.",
+        f"{sg(nv('confirm', '1-100', 'mean_oc'))} open→close. Under the cost model of 12 October (about "
+        f"{nv('confirm', '1-100', 'cost30')*100:.1f}% round trip; the table above) that was {two(new, '1-100', 'net30')} per position"
+        + (f"; with the spread caps re-measured from real quotes (round 14, about "
+           f"{(rc['mean_spread_used'] + rc['mean_two_way_impact'])*100:.1f}% round trip) it is still "
+           f"{sg(nb['1.0']['dev'])} / {sg(nb['1.0']['confirm'])} ({sg(nb['0.5']['confirm'])} if real spreads are half of that, "
+           f"{sg(nb['2.0']['confirm'])} if double)" if nb.get("1.0") and nb.get("0.5") and nb.get("2.0") else "")
+        + f". The top 10 come closest ({two(new, '1-10', 'net30')} under the old costs). Treat the lower ranks as a watchlist.",
     ]
     if m0v:
         verdict.append(
@@ -346,11 +347,11 @@ if f11.exists():
         verdict.append(sent)
     if rc:
         verdict.append(
-            f"Costs are the biggest uncertainty, in both directions: on the backtest board the spread used is the "
-            f"liquidity-tier cap (1–3%) for {rc['share_at_cap']*100:.0f}% of names — for {rc['share_unreadable']*100:.0f}% the "
-            f"estimator could not read a spread, for {rc['share_read_wider_clipped']*100:.0f}% it read a wider one (median "
-            f"{rc['median_read_over_cap_when_clipped']:.1f}× the cap) that was clipped down. Real bid/ask quotes for this whole "
-            f"universe are being recorded to replace the assumption with measured spreads.")
+            f"Costs remain the biggest uncertainty, in both directions. For {rc['share_at_cap']*100:.0f}% of backtest board names "
+            f"the spread used is the liquidity-tier cap ({rc['share_unreadable']*100:.0f}% because the estimator could not read a "
+            f"spread, {rc['share_read_wider_clipped']*100:.0f}% because it read a wider one that was clipped down). Round 14 set "
+            f"those caps from real quotes — one session, three rounds of mid-session quotes of every liquid name — but spreads "
+            f"at the open and close, when these trades happen, were not sampled yet.")
     doc["board30k"] = {
         "title": "Round 11 — every name on the board can take a $30K short",
         "note": ("Walk-forward, out of sample, development / confirmation. Old board = the previous ranking (dump odds) among "
@@ -364,6 +365,61 @@ if f11.exists():
     }
     doc["question"] = "How much can each pick take without moving the price — and does accuracy survive the size?"
     print("R11: $30K board block added (shipped", ship_key + ")")
+
+# ── Round 13: the ONE — the single main-page pick, shortable at $100K+ ──
+f13, f13b = R / "r13.json", R / "r13b.json"
+if f13.exists() and f13b.exists():
+    r13, r13b = json.loads(f13.read_text()), json.loads(f13b.read_text())
+    names13 = {"O0": "Production dump model (any liquidity)", "O1": "Dump model trained on $30K-ready names",
+               "O2": "Dump model trained on $100K-ready names", "O3": "O1 averaged over 5 seeds",
+               "O4": "Consensus of three dump models (rank-average)", "O5": "O1 + overnight filings and earnings releases",
+               "O6": "≥10%-drop model"}
+    V13 = r13["variants"]
+    rows13 = [{"key": k, "label": names13.get(k, k),
+               **{f: dc(lambda per: V13[k][per]["top1"][f]) for f in ("hit", "big10", "mean_oc", "net100k")}}
+              for k in ("O0", "O1", "O2", "O3", "O4", "O5", "O6")]
+    hy = r13b["variants"]["O4_morning_hybrid"]
+    ev = r13b["variants"]["O4_evening_m0"]
+    th = r13b["tiers"]["O4_morning_hybrid"]
+    won13 = r13["decision"]["adopted"]
+    pc = lambda x: f"{x*100:.0f}%"  # noqa: E731
+    tw = lambda src, f, fmt=sg: f"{fmt(src['dev']['top1'][f])} / {fmt(src['confirm']['top1'][f])}"  # noqa: E731
+    fl = r13.get("floors", {})
+    v13 = [
+        f"New: the main page shows ONE stock — the most accurate dump call found among stocks that can take a $100K short "
+        f"without moving the price (≤ 5% of expected volume, ≤ 0.5% estimated impact, $1+, IBKR able to lend $100K). Across "
+        f"the whole sample {r13['universe']['base_dump']*100:.1f}% of those stocks fell 5%+ open→close on an average day.",
+        f"Seven ways to pick it were compared under a rule written down before the run (best development #1 dump rate, "
+        f"ties within 2 points broken by the top-3 rate; then in confirmation the #1 no more than 2 points worse and the "
+        f"top 3 no worse than production). It picked {names13.get(won13, won13).lower()}: the stock that the production "
+        f"dump model, a ≥5%-drop model and a ≥3%-drop model (both trained only on liquid names) jointly rank highest. Its #1 fell 5%+ on {tw(V13[won13], 'hit', pc)} of sessions versus "
+        f"{tw(V13['O0'], 'hit', pc)} for the production model alone.",
+        f"Measured as the live morning run ranks it (before the live-only borrow, IBKR-lendable, squeeze and halt checks, "
+        f"which have no history), the ONE fell 5%+ on {tw(hy, 'hit', pc)} of sessions and 10%+ "
+        f"on {tw(hy, 'big10', pc)}, averaging {tw(hy, 'mean_oc')} open→close. The evening (close-only) version: "
+        f"{tw(ev, 'hit', pc)}.",
+        f"Conviction tiers (how closely the three models agree it is the top name): high-conviction days fell 5%+ on "
+        f"{pc(th['high']['dev']['hit'])} / {pc(th['high']['confirm']['hit'])} ({th['high']['dev']['days']} / "
+        f"{th['high']['confirm']['days']} days), medium {pc(th['medium']['dev']['hit'])} / {pc(th['medium']['confirm']['hit'])}, "
+        f"low {pc(th['low']['dev']['hit'])} / {pc(th['low']['confirm']['hit'])}. The high tier is a small sample and was "
+        f"not monotone in development — read it as a hint, not a promise.",
+        f"Super-high accuracy at this size is not something the data supports: the ONE is about 8× the base rate, but it "
+        f"is still wrong about two days in three, and on the days it is wrong the stock often rises (that is why the "
+        f"average move is small). After each pick's own estimated cost it netted {tw(hy, 'net100k')} per trade at $100K "
+        f"and {tw(hy, 'net500k')} at $500K.",
+    ]
+    if fl:
+        v13.append("Requiring more capacity lowers accuracy: with a $250K floor the same rule's #1 fell 5%+ on "
+                   f"{tw(fl['250000'], 'hit', pc)}, at $500K {tw(fl['500000'], 'hit', pc)}, at $1M {tw(fl['1000000'], 'hit', pc)} "
+                   "— so the floor is $100K and the page shows how much more each day's pick can take.")
+    doc["one13"] = {"title": "Round 13 — the ONE: one stock, the highest accuracy we can find, shortable at $100K+",
+                    "note": ("Walk-forward, out of sample, development / confirmation. #1 = each session's top-ranked "
+                             "$100K-shortable name under each method. Net = open→close short minus each pick's own "
+                             "estimated round-trip cost at $100K."),
+                    "rows": rows13, "adopted": won13,
+                    "shipped": {f: dc(lambda per: hy[per]["top1"][f]) for f in ("hit", "big10", "mean_oc", "net100k", "net500k")},
+                    "tiers": th, "verdict": v13}
+    print("R13: ONE block added (adopted", won13 + ")")
 
 (ROOT / "docs" / "data" / "size_research.json").write_text(json.dumps(doc, indent=1))
 print("written", len(json.dumps(doc)))

@@ -82,7 +82,11 @@ def log_picks(today: dict) -> Optional[bool]:
         "top": ({k: top.get(k) for k in ("symbol", "prob_dump", "score", "premarket", "squeeze_danger")}
                 | {"model": top.get("model_used")}
                 | {"capacity": (top.get("size") or {}).get("capacity"), "breakeven": (top.get("size") or {}).get("breakeven"),
-                   "cost30": cost_at(top), "liq_edge": top.get("liq_edge")}) if top else None,
+                   "cost30": cost_at(top), "liq_edge": top.get("liq_edge"),
+                   # round 13: the main-page pick is the ONE (a $100K+ consensus pick) — its tier and $100K cost
+                   "one_tier": (top.get("one") or {}).get("tier"), "one_score": (top.get("one") or {}).get("score"),
+                   "cost100": ((top.get("size") or {}).get("costs") or {}).get(str(config.ONE_MIN_USD))}) if top else None,
+        "one": bool(top and top.get("one")),
         "board": [
             {"rank": b.get("rank"), "urank": b.get("urank"), "symbol": b.get("symbol"), "prob_dump": b.get("prob_dump"),
              "liq_edge": b.get("liq_edge"), "cost30": cost_at(b)}
@@ -196,6 +200,10 @@ def grade(hist: Dict[str, pd.DataFrame], eligible: List[str], before: Optional[d
                 t["squeezed"] = t["oh"] >= config.SQUEEZE_THRESHOLD
                 if isinstance(top.get("cost30"), (int, float)):
                     t["net30"] = -t["oc"] - float(top["cost30"])
+                if isinstance(top.get("cost100"), (int, float)):
+                    t["net100"] = -t["oc"] - float(top["cost100"])
+                if top.get("one_tier"):
+                    t["one_tier"] = top["one_tier"]
                 out["top"] = t
             elif give_up:
                 out["top"] = {"missing": True, "halted": False,
@@ -287,7 +295,9 @@ def summary() -> dict:
     }
     # round 11: the board became $30K-only — the same rates for those sessions alone (the totals above mix both eras)
     d30 = [d for d in counted if d.get("ranker") == "liq"]
-    t30 = [d["outcome"]["top"] for d in d30 if d["outcome"].get("top") and not d["outcome"]["top"].get("missing")]
+    # the main-page #1 was the $30K board's own #1 only until the ONE took over (round 13)
+    t30 = [d["outcome"]["top"] for d in d30 if not d.get("one")
+           and d["outcome"].get("top") and not d["outcome"]["top"].get("missing")]
     o30 = [d["outcome"] for d in d30]
     mean = lambda xs: float(np.mean(xs)) if xs else None  # noqa: E731
     live["board30"] = {
@@ -301,6 +311,17 @@ def summary() -> dict:
         "board100_mean_oc": mean([o["board100_mean_oc"] for o in o30 if o.get("board100_mean_oc") is not None]),
         "board100_net30": mean([o["board100_net30"] for o in o30 if o.get("board100_net30") is not None]),
         "universe_dump_rate": mean([o["universe_dump_rate"] for o in o30]),
+    }
+    # round 13: the main-page pick became the ONE ($100K+ consensus pick) — its own record, overall and by tier
+    d1 = [d for d in counted if d.get("one")]
+    t1 = [d["outcome"]["top"] for d in d1 if d["outcome"].get("top") and not d["outcome"]["top"].get("missing")]
+    live["one"] = {
+        "since": min(d["session_date"] for d in d1) if d1 else None, "n_days": len(d1), "top_n": len(t1),
+        "dump_rate": mean([t["dump"] for t in t1]), "mean_oc": mean([t["oc"] for t in t1]),
+        "squeeze_rate": mean([t["squeezed"] for t in t1]),
+        "net100": mean([t["net100"] for t in t1 if t.get("net100") is not None]),
+        "tiers": {tr: {"n": len(x), "dump_rate": mean([t["dump"] for t in x]), "mean_oc": mean([t["oc"] for t in x])}
+                  for tr in ("high", "medium", "low") for x in [[t for t in t1 if t.get("one_tier") == tr]]},
     }
     # the site reads each day's #1 and outcome; the full board lists stay in history/<date>.json
     slim_days = [{k: v for k, v in d.items() if k not in ("board", "zone")} for d in reversed(days)][:250]

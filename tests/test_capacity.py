@@ -69,11 +69,14 @@ def test_spread_assumption_band():
     assert C.tick_floor(0.20) == pytest.approx(0.0005)        # $0.0001 tick under $1 → floor 0.05%
     assert C.tick_floor(0.50) == pytest.approx(0.0005)
     assert C.tick_floor(2.00) == pytest.approx(0.005)         # $0.01 / $2
-    assert C.spread_cap(1e5) == 0.06 and C.spread_cap(5e5) == 0.03 and C.spread_cap(2e6) == 0.02 and C.spread_cap(2e7) == 0.01
-    assert C.spread_used(0.05, 3.0, 2e7) == pytest.approx(0.01)       # noisy 5% read on a liquid name → capped
-    assert C.spread_used(0.002, 3.0, 2e7) == pytest.approx(0.01 / 3)   # readable but below one tick → tick
-    assert C.spread_used(0.0002, 3.0, 2e7) == pytest.approx(0.01)      # ~0 = estimator failed → band cap (conservative)
-    assert C.spread_used(None, 3.0, 2e7) == pytest.approx(0.01)        # unreadable → band cap
+    assert C.spread_cap(1e5) == 0.06 and C.spread_cap(5e5) == 0.03 and C.spread_cap(2e6) == 0.0145
+    assert C.spread_cap(1e7) == 0.009 and C.spread_cap(3e7) == 0.0055           # R14: measured quotes
+    assert C.spread_used(0.05, 3.0, 1e7) == pytest.approx(0.009)      # noisy 5% read on a liquid name → capped
+    assert C.spread_used(0.002, 3.0, 1e7) == pytest.approx(0.01 / 3)   # readable but below one tick → tick
+    assert C.spread_used(0.0002, 3.0, 1e7) == pytest.approx(0.009)     # ~0 = estimator failed → band cap (conservative)
+    assert C.spread_used(None, 3.0, 1e7) == pytest.approx(0.009)       # unreadable → band cap
+    for dv in (1e5, 5e5, 2e6, 1e7, 3e7):                               # scalar and vector rules agree
+        assert float(C.spread_used_vec(np.array([np.nan]), np.array([3.0]), np.array([dv]))[0]) == pytest.approx(max(C.spread_cap(dv), 0.01 / 3))
     assert C.spread_used(None, 0.5, 1e5) == pytest.approx(0.06)        # thin name → 6%
     wide = float(C.round_trip_cost(1e3, 1e9, 0.02, 0.06))
     assert wide >= 0.06                                   # round_trip_cost never caps the spread it is given

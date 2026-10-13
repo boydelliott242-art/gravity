@@ -528,3 +528,28 @@ def intraday(symbol: str) -> dict | None
   six rankers' 100-name net; 5/10-session holds from R12) — built by `build_size_lab.py` from r11.json/r12.json.
 - Research tooling: `scripts/research/quote_sampler.py` records real bid/ask + top-of-book size for every
   $30K-ready name six times in a session (`data/spreads_sample/`) to calibrate spreads for liquid names.
+
+## Round 13 additions (2026-10-13) — the ONE (main-page pick) + measured spreads (R14)
+
+- **The ONE** (pre-registered R13, `scripts/research/r13_one.py`, production-faithful check `r13b_one_prod.py`): the main
+  page's single pick. Universe `model.one_mask` = $30K-ready AND market capacity ≥ `config.ONE_MIN_USD` ($100K); live also
+  IBKR lendable ≥ $100K (`_gate_bad(..., min_usd=ONE_MIN_USD)`), squeeze danger < 70, not halted. Score
+  `model.one_score` = mean session percentile, among $30K-ready names, of `model.ONE_PARTS` = (`prob_dump`, `one_dump`,
+  `one_d3`) — the any-liquidity dump classifier plus two classifiers fit only on $30K-ready rows (P(open→close ≤ −5%),
+  P(≤ −3%)), isotonic-calibrated on $30K-ready rows (`model._fit_one`; bundle key `one` = {m0|m1: {dump, d3}};
+  `predict` adds `one_dump`, `one_d3`). Conviction tier from the summed rank shortfall from #1 of the three parts:
+  high ≤ `ONE_TIER_HIGH` (2), medium ≤ `ONE_TIER_MEDIUM` (7), else low (`model.one_tier`).
+- `cli.build_today`: the morning shortlist adds the ONE's top 150 by close-only consensus; scores are recomputed after the
+  morning model and before the catalyst overlay; the ONE walks its consensus order (≤ 40) and takes the first name that
+  passes the gates; `today.top` = that pick with `top.one` = {score, deficit, tier, consensus_rank, held_back,
+  part_ranks, universe, liq_universe, min_usd, model, record, tier_record}; if none passes, the board's first name with
+  `top.one = null` (status "The ONE"). `today.model` adds `one_rule`, `one_min_usd`, `one_universe`.
+- `model.json.one` = {size, parts, tier_rule, rule, m0|m1: {overall, base_dump, tiers: {high|medium|low}}} — overall /
+  tier: days, hit, big10, mean_oc, median_oc, squeeze, pump, worst_oc, cap_median, net_/win_ at 100000 / 500000 / 1000000,
+  share (tiers).
+- Pick log: top adds `one_tier`, `one_score`, `cost100`; record `one`. Grading adds `top.net100`, `top.one_tier`; summary
+  `live.one` = {since, n_days, top_n, dump_rate, mean_oc, squeeze_rate, net100, tiers}.
+- **R14 spreads**: `capacity.spread_cap` / `spread_used_vec` caps for ≥ $1M/day come from real quotes of every
+  $30K-ready name (`scripts/research/r14_spreads.py` → `data/research/r14_spreads.json`): 1.45% ($1–5M), 0.9% ($5–20M),
+  0.55% (≥ $20M) — max(90th percentile, 2 × median) of measured mid-session spreads; under $1M unchanged (3% / 6%).
+- Size Lab: `size_research.json.one13` (methods table, shipped hybrid record, tiers, verdict).

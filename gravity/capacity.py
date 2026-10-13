@@ -81,7 +81,11 @@ def spread_cap(dv20) -> float:
         return 0.06
     if not v >= 2.5e5:
         return 0.06
-    return 0.03 if v < 1e6 else (0.02 if v < 5e6 else 0.01)
+    # $1M+/day tiers from real Nasdaq quotes (R14, data/research/r14_spreads.json): one session (2026-10-13), three
+    # rounds of MID-SESSION quotes of the $30K-ready names plus edge names (1,708 symbols); cap = max(90th pct of the
+    # names' median quoted spread, 2 x the tier median). Open / close spreads (when these trades happen) were not
+    # sampled — re-calibrate once they are. Old caps: 2% / 1% / 1%.
+    return 0.03 if v < 1e6 else (0.0145 if v < 5e6 else (0.009 if v < 2e7 else 0.0055))
 
 
 def spread_used(estimate, price, dv20) -> float:
@@ -202,7 +206,7 @@ def spread_used_vec(estimate, price, dv20) -> np.ndarray:
     dv = np.asarray(dv20, float)
     tick = np.where(pr < 1, 0.0001, 0.01)
     lo = np.maximum(0.0005, np.where(pr > 0, tick / np.where(pr > 0, pr, 1.0), 0.001))
-    hi = np.where(dv >= 5e6, 0.01, np.where(dv >= 1e6, 0.02, np.where(dv >= 2.5e5, 0.03, 0.06)))
+    hi = np.where(dv >= 2e7, 0.0055, np.where(dv >= 5e6, 0.009, np.where(dv >= 1e6, 0.0145, np.where(dv >= 2.5e5, 0.03, 0.06))))
     hi = np.maximum(hi, lo)
     ok = np.isfinite(est) & (est >= 0.001)
     return np.where(ok, np.clip(est, lo, hi), hi)
