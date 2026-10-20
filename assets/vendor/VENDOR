@@ -1,0 +1,9 @@
+Third-party code served from this site (no CDN at runtime). Each file was taken from its npm registry tarball,
+whose sha512 matched the registry's published "integrity" value on 2026-10-19.
+
+hash-wasm 4.12.0 (MIT) — dist/argon2.umd.min.js (Argon2id, WASM inlined)
+  tarball integrity: sha512 from https://registry.npmjs.org/hash-wasm/4.12.0
+lightweight-charts 4.2.0 (Apache-2.0) — dist/lightweight-charts.standalone.production.js
+  identical to the unpkg copy the site used before (sha384-OK7vELvjHdhUFi31JYioPIcRHTROLdcDa6ZsNWgvgLaKj+9JqhU0Ad8g4wz3CXjA)
+Fonts (SIL Open Font License): Instrument Serif, Inter Tight, JetBrains Mono — woff2 files from Google Fonts,
+  self-hosted in assets/fonts with assets/css/fonts.css.

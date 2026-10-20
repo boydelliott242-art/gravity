@@ -1,0 +1,19 @@
+{
+ "v": 1,
+ "epoch": 1,
+ "kdf": {
+  "alg": "argon2id",
+  "version": 19,
+  "m": 131072,
+  "t": 3,
+  "p": 1,
+  "len": 32,
+  "salt": "I/kpgC9Oavpd2ptoVZNzLg=="
+ },
+ "wrap": {
+  "iv": "p4LyShB/5o+4hbqT",
+  "ct": "rCnevVpVu5TGxQkwNu6bqMDNr/xbjdNNI7KRj0ua6UWzMxUJ81kQh+/5Aj/qYUU6"
+ },
+ "commit": "ff35d4306f2a6cccc6140963cd073e21b5c0397ddb35e5de3aee8cfd9a04b70b",
+ "index": "data/index.bin"
+}
