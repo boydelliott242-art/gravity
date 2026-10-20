@@ -1,49 +1,33 @@
 /* GRAVITY site lock (browser side). Every data file is AES-256-GCM encrypted; the data key (DEK) is
    wrapped in lock.json under a key derived from the owner's passphrase with Argon2id. Nothing readable
-   is ever fetched before the passphrase unwraps the DEK. See gravity/sitelock.py for the formats. */
+   is ever fetched before the passphrase unwraps the DEK. See gravity/sitelock.py for the formats.
+   The key lives only in this page's memory: nothing is stored on the device, so every opening of the
+   site asks for the passphrase, and so does coming back after more than a minute in the background. */
 
 const MAGIC = [0x47, 0x52, 0x56, 0x31];                 // "GRV1"
 const VERSION = 1;
 const HEADER_LEN = 25;
-const DB = 'gravity-lock';
-const STORE = 'keys';
+const DB = 'gravity-lock';             // the old "remember this device" store — deleted on every load
+const AWAY_MS = 60e3;                  // hidden longer than this → locked again
 const enc = new TextEncoder();
 
 let DEK = null;          // non-extractable CryptoKey (decrypt only)
 let EPOCH = null;
 let INDEX = null;        // {seq, files: {name: {seq, sha256}}}
 let INDEX_AT = 0;
-let REMEMBERED = false;
 
 const b64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 const hex = (buf) => Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, '0')).join('');
 
-/* ── IndexedDB (only when the owner ticks "Remember this device") ── */
-function idb() {
-  return new Promise((resolve, reject) => {
-    const r = indexedDB.open(DB, 1);
-    r.onupgradeneeded = () => r.result.createObjectStore(STORE);
-    r.onsuccess = () => resolve(r.result);
-    r.onerror = () => reject(r.error);
-  });
-}
-async function idbGet(k) {
-  try {
-    const db = await idb();
-    const v = await new Promise((res) => { const q = db.transaction(STORE).objectStore(STORE).get(k); q.onsuccess = () => res(q.result); q.onerror = () => res(null); });
-    db.close();
-    return v;
-  } catch { return null; }
-}
-async function idbPut(k, v) {
-  try {
-    const db = await idb();
-    await new Promise((res) => { const t = db.transaction(STORE, 'readwrite'); t.objectStore(STORE).put(v, k); t.oncomplete = res; t.onerror = res; });
-    db.close();
-  } catch { /* storage blocked: stay session-only */ }
-}
+/* ── nothing persists: drop any key an older version of this page saved on the device ── */
 export async function forgetDevice() {
-  try { await new Promise((res) => { const r = indexedDB.deleteDatabase(DB); r.onsuccess = res; r.onerror = res; r.onblocked = res; }); } catch { /* nothing stored */ }
+  try {
+    if (indexedDB.databases) {
+      const dbs = await indexedDB.databases();
+      if (!dbs.some((d) => d.name === DB)) return;
+    }
+    await new Promise((res) => { const r = indexedDB.deleteDatabase(DB); r.onsuccess = res; r.onerror = res; r.onblocked = res; });
+  } catch { /* storage blocked: nothing stored */ }
 }
 
 /* ── key derivation and unwrap ── */
@@ -126,7 +110,6 @@ export async function newerThan(seq) {
   try { const idx = await loadIndex(true); return isFinite(seq) && idx.seq > seq; } catch { return false; }
 }
 export const currentSeq = () => (INDEX ? INDEX.seq : null);
-export const isRemembered = () => REMEMBERED;
 
 /* ── the lock screen ── */
 function screen() {
@@ -142,8 +125,7 @@ function screen() {
       <p class="lockscreen__sub">Private. Enter the passphrase to open today's radar.</p>
       <div class="lockscreen__form">
         <label class="sr-only" for="lock-pw">Passphrase</label>
-        <input id="lock-pw" type="password" autocomplete="current-password" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Passphrase">
-        <label class="lockscreen__remember"><input id="lock-remember" type="checkbox"> Remember this device</label>
+        <input id="lock-pw" type="password" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Passphrase">
         <button id="lock-go" type="button" class="btn">Unlock</button>
         <p class="lockscreen__msg" id="lock-msg" role="status" aria-live="polite"></p>
       </div>
@@ -159,7 +141,7 @@ const MSG = {
   commit: 'The site key did not verify — reload the page.',
 };
 
-/** Resolve once the site is unlocked (prompting if no remembered key fits the current epoch). */
+/** Resolve once the owner has typed the passphrase (asked on every load — no key is ever kept). */
 export async function unlockSite() {
   let lock;
   try {
@@ -170,18 +152,12 @@ export async function unlockSite() {
   } catch {
     lock = null;
   }
-  const known = indexedDB.databases ? await indexedDB.databases().catch(() => [{ name: DB }]) : [{ name: DB }];
-  const saved = lock && known.some((d) => d.name === DB) ? await idbGet('dek') : null;
-  if (saved && saved.epoch === lock.epoch && saved.commit === lock.commit && saved.key) {
-    DEK = saved.key; EPOCH = lock.epoch; REMEMBERED = true;
-    try { await loadIndex(true); return; } catch { DEK = null; REMEMBERED = false; await forgetDevice(); }
-  }
+  await forgetDevice();
   const el = screen();
   document.body.appendChild(el);
   const pw = el.querySelector('#lock-pw');
   const go = el.querySelector('#lock-go');
   const msg = el.querySelector('#lock-msg');
-  const rem = el.querySelector('#lock-remember');
   if (!lock) { msg.textContent = MSG.lock; go.disabled = true; pw.disabled = true; }
   pw.focus();
   await new Promise((resolve) => {
@@ -194,7 +170,6 @@ export async function unlockSite() {
         DEK = key; EPOCH = lock.epoch;
         await loadIndex(true);
         pw.value = '';
-        if (rem.checked) { await idbPut('dek', { epoch: lock.epoch, commit: lock.commit, key }); REMEMBERED = true; }
         el.remove();
         resolve();
       } catch (e) {
@@ -209,16 +184,36 @@ export async function unlockSite() {
   });
 }
 
-/** Lock now: forget this device and drop everything decrypted. */
-export async function lockNow() {
+/** Lock now: drop the key and everything decrypted. */
+export function lockNow() {
   DEK = null; INDEX = null;
-  await forgetDevice();
+  document.documentElement.classList.add('is-locked');
   location.reload();
 }
 
-/* Not remembered: lock again after 30 minutes in the background (the decrypted page is dropped). */
+/* Closed, navigated away, or in the background for more than a minute → the passphrase is needed again.
+   - pagehide: the key is dropped and the page blanked, so a back/forward-cache restore shows nothing;
+     pageshow from that cache reloads straight into the lock screen.
+   - hidden > AWAY_MS (another tab or app, phone locked): blanked while away, reloaded on return. */
 let hiddenAt = 0;
+let awayTimer = 0;
+const blank = () => {                    // every path after this reloads into the lock screen
+  DEK = null; INDEX = null;
+  document.documentElement.classList.add('is-locked');
+  try { document.body.replaceChildren(); } catch { /* already gone */ }
+};
+window.addEventListener('pagehide', blank);
+window.addEventListener('pageshow', (ev) => { if (ev.persisted) location.reload(); });
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) { hiddenAt = Date.now(); return; }
-  if (DEK && !REMEMBERED && hiddenAt && Date.now() - hiddenAt > 30 * 60e3) location.reload();
+  if (document.hidden) {
+    hiddenAt = Date.now();
+    clearTimeout(awayTimer);
+    awayTimer = setTimeout(() => { if (document.hidden && DEK) blank(); }, AWAY_MS);
+    return;
+  }
+  clearTimeout(awayTimer);
+  if (hiddenAt && (Date.now() - hiddenAt > AWAY_MS || !DEK) && !document.querySelector('.lockscreen')) {
+    blank();
+    location.reload();
+  }
 });

@@ -12,7 +12,7 @@
  * from the feed is hidden or says so — it never fills in.
  */
 
-import { unlockSite, siteJSON, newerThan, currentSeq, lockNow, isRemembered } from './lock.js';
+import { unlockSite, siteJSON, newerThan, currentSeq, lockNow } from './lock.js';
 import {
   DASH, isNum, esc, safeUrl, extLink, pct, pctUnits, price, compact, money, fixed, signedMoney,
   parseDay, fmtDay, parseTs, fmtTimeET, fmtStamp, etDate, ago, daysBetween, marketPhaseNow,
@@ -1810,7 +1810,7 @@ function renderFooter() {
   if (S.uni.asof) rows.push(['universe.json', fmtStamp(S.uni.asof, { year: true })]);
   if (S.sample) rows.push(['Mode', 'SAMPLE DATA — placeholder numbers']);
   setHTML('#foot-times', rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('')
-    + `<dt>Access</dt><dd>Private — unlocked with the passphrase${isRemembered() ? ' (this device is remembered)' : ''} · <button type="button" class="btn btn--quiet" data-lock-now>Lock${isRemembered() ? ' and forget this device' : ''}</button> · on a phone, Share → Add to Home Screen installs GRAVITY as an app</dd>`);
+    + `<dt>Access</dt><dd>Private — the passphrase is asked every time GRAVITY is opened, and again after a minute away · <button type="button" class="btn btn--quiet" data-lock-now>Lock now</button> · on a phone, Share → Add to Home Screen installs GRAVITY as an app</dd>`);
   const lb = document.querySelector('[data-lock-now]');
   if (lb) lb.addEventListener('click', () => { lockNow(); });
   if (t.disclaimer) { const d = $('#foot-disclaimer'); if (d) d.textContent = t.disclaimer; }

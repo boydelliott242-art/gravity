@@ -1311,7 +1311,6 @@ html.is-locked body > :not(.lockscreen) { display: none !important; }
   font: 500 15px/1.2 var(--mono); letter-spacing: 0.04em; text-align: center;
 }
 .lockscreen__form input[type="password"]:focus { outline: none; border-color: var(--fg-3); }
-.lockscreen__remember { font: 400 13px/1.4 var(--sans); color: var(--fg-3); display: inline-flex; gap: var(--s1); align-items: center; justify-content: center; }
 .lockscreen__form .btn { justify-self: center; min-width: 160px; }
 .lockscreen__form .btn:disabled { opacity: 0.5; cursor: wait; }
 .lockscreen__msg { min-height: 1.4em; margin: 0; font: 400 13px/1.4 var(--sans); color: var(--fg-2); }
