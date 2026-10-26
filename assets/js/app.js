@@ -1793,6 +1793,43 @@ function renderMethod() {
   $$('[data-bind="base-rate"]').forEach((el) => { el.textContent = isNum(S.base) ? String(Math.round(S.base * 100)) : DASH; });
 }
 
+/* ── unified research layer (docs/data/unified.json, optional) ─────────── */
+const UNIFIED_LISTS = [
+  ['top_short_candidates', 'Short candidates', 'GRAVITY’s order; only names the do-not-short layer let through'],
+  ['top_momentum_longs', 'Momentum longs', 'the large-cap desk’s rule matches, regime-adjusted'],
+  ['top_high_conviction', 'High conviction', 'the ONE on a high or medium day, and the desk’s high-confidence setups'],
+  ['top_risk_adjusted', 'Risk-adjusted', 'score × (1 − risk), both sides'],
+  ['most_dangerous_shorts', 'Most dangerous shorts', 'weak names the layer says NOT to short, and why'],
+  ['top_contrarian', 'Contrarian', 'the desk’s contrarian list'],
+  ['watchlist', 'Watchlist / wait', 'not a setup yet'],
+];
+function renderUnified() {
+  const sec = $('#unified');
+  const root = $('#unified-root');
+  if (!sec || !root) return;
+  const u = S.unified;
+  if (!u || !u.lists) { sec.hidden = true; return; }
+  sec.hidden = false;
+  const reg = obj(u.regime);
+  const asof = obj(u.as_of);
+  const llm = obj(u.llm);
+  const val = obj(u.validation);
+  const nt = obj(u.no_trade);
+  const head = `<p class="note" style="margin-bottom:16px">Regime <b>${esc(String(reg.label || DASH).replace('_', ' '))}</b> (${esc(reg.confidence || DASH)} confidence): ${esc(arr(reg.reasons).slice(0, 2).join('; '))}. Sources as of ${esc(fmtDay(asof.gravity_session, { weekday: false }))} (this radar) and ${esc(fmtDay(asof.daytrader_session, { weekday: false }))} (the desk). ${llm.mode === 'live' ? `Agent layer: ${esc(int(llm.runs))} TradingAgents run(s) at ${esc(llm.depth)} depth.` : 'Agent layer: not run (no provider configured) — the scores below are quantitative only.'}${arr(val.warnings).length ? ` Data notes: ${esc(arr(val.warnings).slice(0, 2).join('; '))}.` : ''}${nt.note ? ` <b>${esc(nt.note)}</b>` : ''}</p>`;
+  const row = (r) => {
+    const open = S.recs && S.recs.has && S.recs.has(r.symbol);
+    const name = open ? `<button type="button" class="tk" data-open="${esc(r.symbol)}">${esc(r.symbol)}</button>` : `<span class="tk">${esc(r.symbol)}</span>`;
+    const flags = arr(r.risk_flags).slice(0, 3).concat(arr(r.reasons).slice(0, 1)).join(' · ');
+    return `<tr><th scope="row" class="sw-name">${name}</th><td>${esc(r.side)}</td><td>${esc(String(r.verdict || DASH).replace(/_/g, ' '))}</td><td>${isNum(r.score_regime) ? esc(r.score_regime.toFixed(0)) : DASH}${isNum(r.score) && isNum(r.score_regime) && r.score !== r.score_regime ? ` <span class="muted">(${esc(r.score.toFixed(0))} raw)</span>` : ''}</td><td>${isNum(r.risk_score) ? esc(r.risk_score.toFixed(0)) : DASH}</td><td class="muted">${esc(flags || DASH)}</td></tr>`;
+  };
+  const tables = UNIFIED_LISTS.map(([key, title, dek]) => {
+    const rows = arr(u.lists[key]);
+    if (!rows.length) return '';
+    return `<h3 style="margin:24px 0 4px">${esc(title)}</h3><p class="note" style="margin:0 0 8px">${esc(dek)}</p><div class="table-scroll reveal"><table class="mtable"><caption class="sr-only">${esc(title)}</caption><thead><tr><th scope="col">Ticker</th><th scope="col">Side</th><th scope="col">Verdict</th><th scope="col">Score</th><th scope="col">Risk</th><th scope="col">Why</th></tr></thead><tbody>${rows.map(row).join('')}</tbody></table></div>`;
+  }).join('');
+  root.innerHTML = head + (tables || empty('The unified layer published no list today (NO TRADE).'));
+}
+
 function renderFooter() {
   const t = S.today || {};
   const m = S.model || {};
@@ -2280,6 +2317,9 @@ async function init() {
     ['today.json', 'model.json', 'evidence.json', 'scorecard.json', 'live.json', 'size_research.json'].map(getJSON),
   );
   delete S.errors['live.json'];  // optional feed: absent outside the session
+  const unified = await getJSON('unified.json');   // optional: the unified research layer, when it has published
+  delete S.errors['unified.json'];
+  S.unified = unified && typeof unified === 'object' ? unified : null;
   S.seq = currentSeq();
   S.sizeLab = sizeLab && typeof sizeLab === 'object' ? sizeLab : null;
   S.live = live && typeof live === 'object' ? live : null;
@@ -2310,6 +2350,7 @@ async function init() {
   safe('record', renderRecord);
   safe('evidence', renderEvidence);
   safe('method', renderMethod);
+  safe('unified', renderUnified);
   safe('footer', renderFooter);
   observeReveal();
   route();
