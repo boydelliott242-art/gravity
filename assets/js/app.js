@@ -451,7 +451,10 @@ function renderHero() {
   // R35 forward test: on down nights for the Nasdaq-100 futures, a caution labelled as an observation under test
   const nqC = obj(obj(t.futures).caution);
   const nqNote = nqC.text ? `<b>Down night.</b> ${esc(nqC.text)} ` : '';
-  const lede = oneHit != null
+  // a stand-aside day keeps the hero short (on phones the title block grows upward into the eyebrow)
+  const lede = one && one.stand_aside && oneHit != null
+    ? `${standNote}${nqNote}The ${esc(probN)}% is how often the ONE fell 5%+ open to close on ${one.tier && isNum(tierRec.hit) ? `${esc(one.tier)}-conviction days` : 'its days'} in the walk-forward backtest. History, not a promise.`
+    : oneHit != null
     ? `${standNote}${nqNote}How often the ONE <b>fell 5%+ from open to close</b> on ${one.tier && isNum(tierRec.hit) ? `<b>${esc(one.tier)}-conviction</b> days` : 'its days'} in the walk-forward backtest (${esc(int(isNum(tierRec.days) && one.tier ? tierRec.days : oneRec.days))} days${one.tier && isNum(oneRec.hit) ? `; all days ${esc(pct(oneRec.hit, 0))}` : ''}${isNum(oneBase) ? `; a typical $100K-shortable stock ${esc(pct(oneBase, 1))}` : ''}). ${(() => { const r = one.tier && isNum(tierRec.hit) ? tierRec : oneRec; return isNum(r.pump) ? `It <b>rose 5%+</b> instead on ${esc(pct(r.pump, 0))} of those days${isNum(r.net_100000) ? ` and averaged ${esc(pct(r.net_100000, 1, true))} per trade after est. $100K costs` : ''}. ` : ''; })()}${top.model_used === 'm0' && t.run === 'morning' ? 'Scored close-only today (the pre-market check did not pass). ' : ''}History, not a promise.`
     : isNum(base)
     ? `${standNote}${nqNote}The model's odds of a <b>5%+ drop from open to close</b> this session — <b>${esc(liftTxt(top.lift))}</b> the ${esc(pct(base, 1))} base rate for an average eligible name.`
