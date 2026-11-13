@@ -1883,7 +1883,7 @@ function renderMethod() {
 /* ── unified research layer (docs/data/unified.json, optional) ─────────── */
 const UNIFIED_LISTS = [
   ['top_short_candidates', 'Short candidates', 'GRAVITY’s order; only names the do-not-short layer let through'],
-  ['top_momentum_longs', 'Momentum longs', 'the large-cap desk’s rule matches, regime-adjusted'],
+  ['top_momentum_longs', 'Momentum longs', 'the large-cap desk’s names, regime-adjusted — “setup” only when a desk rule fired that session; the rest are watch'],
   ['top_high_conviction', 'High conviction', 'the ONE on a high or medium day, and the desk’s high-confidence setups'],
   ['top_risk_adjusted', 'Risk-adjusted', 'score × (1 − risk), both sides'],
   ['most_dangerous_shorts', 'Most dangerous shorts', 'weak names the layer says NOT to short, and why'],
@@ -1902,7 +1902,11 @@ function renderUnified() {
   const llm = obj(u.llm);
   const val = obj(u.validation);
   const nt = obj(u.no_trade);
-  const head = `<p class="note" style="margin-bottom:16px">Regime <b>${esc(String(reg.label || DASH).replace('_', ' '))}</b> (${esc(reg.confidence || DASH)} confidence): ${esc(arr(reg.reasons).slice(0, 2).join('; '))}. Sources as of ${esc(fmtDay(asof.gravity_session, { weekday: false }))} (this radar) and ${esc(fmtDay(asof.daytrader_session, { weekday: false }))} (the desk). ${llm.mode === 'live' ? `Agent layer: ${esc(int(llm.runs))} TradingAgents run(s) at ${esc(llm.depth)} depth.` : 'Agent layer: not run (no provider configured) — the scores below are quantitative only.'}${arr(val.warnings).length ? ` Data notes: ${esc(arr(val.warnings).slice(0, 2).join('; '))}.` : ''}${nt.note ? ` <b>${esc(nt.note)}</b>` : ''}</p>`;
+  // a layer that stopped publishing must not pass for today's (2026-10-26's lists sat on this page for 17 days)
+  const lag = asof.gravity_session && S.today && S.today.session_date ? daysBetween(asof.gravity_session, S.today.session_date) : null;
+  const stale = isNum(lag) && lag > 4
+    ? `<p class="note" style="margin-bottom:8px"><b>Stale:</b> these lists were built for ${esc(fmtDay(asof.gravity_session, { weekday: false }))} — the research layer has not published since.</p>` : '';
+  const head = `${stale}<p class="note" style="margin-bottom:16px">Regime <b>${esc(String(reg.label || DASH).replace('_', ' '))}</b> (${esc(reg.confidence || DASH)} confidence): ${esc(arr(reg.reasons).slice(0, 2).join('; '))}. Sources as of ${esc(fmtDay(asof.gravity_session, { weekday: false }))} (this radar) and ${esc(fmtDay(asof.daytrader_session, { weekday: false }))} (the desk). ${llm.mode === 'live' ? `Agent layer: ${esc(int(llm.runs))} TradingAgents run(s) at ${esc(llm.depth)} depth.` : 'Agent layer: not run (no provider configured) — the scores below are quantitative only.'}${arr(val.warnings).length ? ` Data notes: ${esc(arr(val.warnings).slice(0, 2).join('; '))}.` : ''}${nt.note ? ` <b>${esc(nt.note)}</b>` : ''}</p>`;
   const row = (r) => {
     const open = S.recs && S.recs.has && S.recs.has(r.symbol);
     const name = open ? `<button type="button" class="tk" data-open="${esc(r.symbol)}">${esc(r.symbol)}</button>` : `<span class="tk">${esc(r.symbol)}</span>`;
