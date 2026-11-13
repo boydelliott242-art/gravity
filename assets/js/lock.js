@@ -110,6 +110,12 @@ export async function newerThan(seq) {
   try { const idx = await loadIndex(true); return isFinite(seq) && idx.seq > seq; } catch { return false; }
 }
 export const currentSeq = () => (INDEX ? INDEX.seq : null);
+/** The index seq of one published file (a build keeps the seq of every file whose content did not change). */
+export const fileSeq = (name) => (INDEX && INDEX.files[name] && isFinite(INDEX.files[name].seq) ? INDEX.files[name].seq : null);
+/** Has THIS file been republished since ``seq``? (live-tape and other files moving the global seq do not count) */
+export async function newerFile(name, seq) {
+  try { const f = (await loadIndex(true)).files[name]; return !!f && isFinite(seq) && f.seq > seq; } catch { return false; }
+}
 
 /* ── the lock screen ── */
 function screen() {
@@ -139,6 +145,8 @@ const MSG = {
   worker: 'This browser blocked the unlock step (WebAssembly). In Lockdown Mode, exclude this site and try again.',
   lock: 'The site lock could not be loaded — check the connection and reload.',
   commit: 'The site key did not verify — reload the page.',
+  fetch: "Unlocked, but today's data could not be fetched — check the connection and tap Unlock again.",
+  'stale index': 'The site is mid-update — tap Unlock again in a minute.',
 };
 
 /** Resolve once the owner has typed the passphrase (asked on every load — no key is ever kept). */
@@ -161,22 +169,34 @@ export async function unlockSite() {
   if (!lock) { msg.textContent = MSG.lock; go.disabled = true; pw.disabled = true; }
   pw.focus();
   await new Promise((resolve) => {
+    // Two steps, two messages: a wrong passphrase is "That's not it"; a right one whose first index fetch fails (a
+    // dropped connection, a Pages deploy) says so and keeps the key for this screen, so tapping Unlock again only
+    // refetches the index instead of running the 128 MiB key derivation again. Nothing is stored.
+    let unlocked = false;
     const attempt = async (ev) => {
       if (ev) ev.preventDefault();
-      if (!lock || !pw.value || go.disabled) return;
-      go.disabled = true; pw.disabled = true; msg.textContent = 'Unlocking…';
+      if (!lock || go.disabled || (!unlocked && !pw.value)) return;
+      go.disabled = true; pw.disabled = true; msg.textContent = unlocked ? 'Fetching today’s data…' : 'Unlocking…';
+      if (!unlocked) {
+        try {
+          const key = await unwrapDEK(pw.value, lock);
+          DEK = key; EPOCH = lock.epoch; unlocked = true;
+        } catch (e) {
+          DEK = null;
+          pw.value = '';
+          msg.textContent = MSG[e && e.message] || (e && /kdf|memory/i.test(e.message) ? MSG.memory : MSG.wrong);
+          go.disabled = false; pw.disabled = false; pw.focus();
+          return;
+        }
+      }
+      pw.value = '';
       try {
-        const key = await unwrapDEK(pw.value, lock);
-        DEK = key; EPOCH = lock.epoch;
         await loadIndex(true);
-        pw.value = '';
         el.remove();
         resolve();
       } catch (e) {
-        DEK = null;
-        pw.value = '';
-        msg.textContent = MSG[e && e.message] || (e && /kdf|memory/i.test(e.message) ? MSG.memory : MSG.wrong);
-        go.disabled = false; pw.disabled = false; pw.focus();
+        msg.textContent = MSG[e && e.message] || MSG.fetch;
+        go.disabled = false; go.focus();
       }
     };
     go.addEventListener('click', attempt);

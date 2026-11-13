@@ -1117,7 +1117,7 @@ button.hero-ticker:hover { opacity: 0.86; }
   .hero-art__caption { display: none; }
   .hero-art__title { grid-template-columns: minmax(0, 1fr); gap: var(--s3); padding-bottom: var(--s5); }
   .hero-prob { text-align: left; }
-  .hero-prob__lede { margin-left: 0; }
+  .hero-prob__lede { margin-left: 0; max-width: none; }   /* the 30ch column made the bottom-anchored block too tall */
   .hstats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .hstats > div { padding: var(--s2) var(--s2) var(--s2) 0; }
   .hstats > div + div { padding-left: 0; }

@@ -12,7 +12,7 @@
  * from the feed is hidden or says so — it never fills in.
  */
 
-import { unlockSite, siteJSON, newerThan, currentSeq, lockNow } from './lock.js';
+import { unlockSite, siteJSON, newerThan, currentSeq, fileSeq, newerFile, lockNow } from './lock.js';
 import {
   DASH, isNum, esc, safeUrl, extLink, pct, pctUnits, price, compact, money, fixed, signedMoney,
   parseDay, fmtDay, parseTs, fmtTimeET, fmtStamp, etDate, ago, daysBetween, marketPhaseNow,
@@ -94,7 +94,7 @@ function backtestLine(which) {
     const r = obj(obj(obj(obj(S.model).one)[okey]).overall);
     if (isNum(r.hit)) {
       const q = oneT.min_usd || 100000;
-      const net = isNum(r[`net_${q}`]) ? ` — after each pick's own estimated cost that is ${pct(r[`net_${q}`], 1, true)} per trade at ${sizeLabel(q)}${isNum(r.net_500000) ? `, ${pct(r.net_500000, 1, true)} at $500K` : ''}${isNum(r.net_1000000) ? `, ${pct(r.net_1000000, 1, true)} at $1M` : ''}` : '';
+      const net = isNum(r[`net_${q}`]) ? ` — after each pick's own estimated cost, a short ${shortPL(r[`net_${q}`])} per trade at ${sizeLabel(q)}${isNum(r.net_500000) ? `, ${shortPL(r.net_500000)} at $500K` : ''}${isNum(r.net_1000000) ? `, ${shortPL(r.net_1000000)} at $1M` : ''}` : '';
       return ` Backtest of the ONE (${okey === 'm1' ? (ms === 'pm' ? 'morning version, with the last pre-market trade before 8:00 ET' : 'morning version, with extended-hours trading before 9:00 ET') : oneT.model === 'm1' ? 'close-only version — the morning version has no honest backtest under this morning set' : 'close-only version'}; point-in-time universe, walk-forward, ${int(r.days)} sessions): it fell 5%+ open→close on ${Math.round(r.hit * 100)}% of sessions and 10%+ on ${Math.round((r.big10 || 0) * 100)}%, rose 5%+ instead on ${Math.round((r.pump || 0) * 100)}%, spiked 20%+ above the open on ${Math.round((r.squeeze || 0) * 100)}%, averaging ${pct(r.mean_oc, 1, true)} open→close before costs (median ${pct(r.median_oc, 1, true)})${net}. A tilt in the odds, never a sure thing.`;
     }
   }
@@ -108,7 +108,7 @@ function backtestLine(which) {
     const sz = sizeLabel(isNum(liq.size) ? liq.size : BOARD_MIN());
     const onF = arr(obj(obj(S.model).features).liq_m1).includes('on_filings');
     const scope = lkey === 'm1' ? `the morning version of this rule (adds the last pre-market trade${onF ? ' and SEC filings accepted overnight, both' : ''} before 8:00 ET)` : 'this rule (close-only inputs)';
-    const net = isNum(b1.net) ? ` — after each pick's own estimated cost at ${sz} (average ${pct(b1.cost, 1)}) that is ${Math.abs(b1.net) < 0.0005 ? 'roughly breakeven' : `${pct(b1.net, 1, true)} per trade`}` : '';
+    const net = isNum(b1.net) ? ` — after each pick's own estimated cost at ${sz} (average ${pct(b1.cost, 1)}), a short ${shortPL(b1.net)} per trade` : '';
     return ` Backtest of ${scope} among names that could take a ${sz} short without moving the price (point-in-time universe, no Rule-201 names): the #1 fell 5%+ open→close on ${Math.round(b1.hit * 100)}% of sessions${isNum(b1.squeeze) ? `, spiked 20%+ above the open on ${Math.round(b1.squeeze * 100)}%` : ''}${isNum(b1.mean_oc) ? `, averaging ${pct(b1.mean_oc, 1, true)} open→close before costs` : ''}${net}. A tilt in the odds, never a sure thing.`;
   }
   const oos = (S.model && S.model.oos) || {};
@@ -126,7 +126,7 @@ function backtestLine(which) {
   const avg = isNum(m.pub1_mean_oc) ? m.pub1_mean_oc : m.top1_mean_oc;
   if (!isNum(hit)) return '';
   const r10 = obj(obj(obj(obj(S.model).sim)[key]).realistic)['10000'];
-  const net = r10 && isNum(r10.net_mean) ? ` — after each pick's own estimated cost at $10K that is ${Math.abs(r10.net_mean) < 0.0005 ? 'roughly breakeven' : `${pct(r10.net_mean, 1, true)} per trade`}` : '';
+  const net = r10 && isNum(r10.net_mean) ? ` — after each pick's own estimated cost at $10K, a short ${shortPL(r10.net_mean)} per trade` : '';
   return ` Backtest of ${scope} (point-in-time universe, no Rule-201 names, ≥$300K daily volume): the #1 fell 5%+ open→close on ${Math.round(hit * 100)}% of sessions${isNum(sqr) ? `, spiked 20%+ above the open on ${Math.round(sqr * 100)}%` : ''}${isNum(avg) ? `, averaging ${pct(avg, 1, true)} open→close before costs` : ''}${net}. A tilt in the odds, never a sure thing.`;
 }
 
@@ -361,6 +361,7 @@ function tickBar() {
     upd.textContent = t && t.generated_at ? `Updated ${ago(t.generated_at)}` : 'Not published';
     if (t && t.generated_at) upd.title = fmtStamp(t.generated_at, { year: true });
   }
+  if (S.booted) renderBanners();         // the "morning run has not published" banner appears without a reload
 }
 
 function renderBanners() {
@@ -376,6 +377,10 @@ function renderBanners() {
     const nowEt = etDate();
     if (!S.sample && t.session_date && t.session_date < nowEt) {
       msgs.push(`<b>This radar is for ${esc(fmtDay(t.session_date))}.</b> Today's run has not published yet — treat every number here as stale.`);
+    } else if (!S.sample && t.run === 'evening' && t.session_date === nowEt && fmtTimeET(new Date().toISOString()) >= '08:45') {
+      // the evening page is dated for this session, so the check above never fires — but the morning run should have
+      // replaced it by ~8:30 ET (the pre-market model, the futures read and the overnight 8-K label are missing)
+      msgs.push("<b>This is last night's watchlist.</b> The morning run has not published yet (it normally lands by 8:30 ET) — the pre-market checks are missing.");
     }
   }
   if (S.newer) msgs.push('A newer run has been published. <button class="btn btn--quiet" type="button" data-reload>Reload</button>');
@@ -414,7 +419,7 @@ function renderHero() {
   if (eyebrow) {
     eyebrow.textContent = one
       ? (one.stand_aside
-        ? `The ONE · STAND ASIDE${t.session_date ? ` · ${fmtDay(t.session_date)}` : ''} · ${one.tier} conviction`
+        ? `The ONE · STAND ASIDE${t.session_date ? ` · ${fmtDay(t.session_date)}` : ''}${one.tier ? ` · ${one.tier} conviction` : ''}`
         : `The ONE · shortable at ${sizeLabel(one.min_usd || 100000)}+${t.session_date ? ` · ${fmtDay(t.session_date)}` : ''}${one.tier ? ` · ${one.tier} conviction` : ''}`)
       : (t && t.session_date ? `Today's #1 · ${fmtDay(t.session_date)}` : "Today's #1") + (t && t.top && isNum(t.top.rank) && t.top.rank > 1 ? ` · board rank ${t.top.rank}` : '');
   }
@@ -437,7 +442,10 @@ function renderHero() {
   const tierRec = one ? obj(one.tier_record) : {};
   const oneRec = one ? obj(one.record) : {};
   const oneHit = one && isNum(tierRec.hit) ? tierRec.hit : one && isNum(oneRec.hit) ? oneRec.hit : null;
-  const probN = oneHit != null ? Math.round(oneHit * 100) : isNum(top.prob_dump) ? Math.round(top.prob_dump * 100) : null;
+  // R44: on a weak-tape stand-aside the headline is the fall rate AFTER weak-tape days (the all-days rate would contradict it)
+  const tapeA = one && one.stand_aside_reason === 'tape' ? obj(obj(obj(obj(one.tape).record).confirm).A) : {};
+  const tapeHit = isNum(tapeA.n_dump) && isNum(tapeA.n) && tapeA.n > 0 ? tapeA.n_dump / tapeA.n : null;
+  const probN = tapeHit != null ? Math.round(tapeHit * 100) : oneHit != null ? Math.round(oneHit * 100) : isNum(top.prob_dump) ? Math.round(top.prob_dump * 100) : null;
   const capV = obj(obj(t.model).prob_cap)[top.model_used === 'm1' ? 'm1' : 'm0'];
   const atCap = oneHit == null && isNum(capV) && isNum(top.prob_dump) && top.prob_dump >= capV - 1e-4;
   const where = [top.exchange, top.country].filter(Boolean).map(esc).join(' · ');
@@ -466,10 +474,13 @@ function renderHero() {
   const passed = one ? arr(obj(one.prior_day).passed_over) : [];
   const passNote = passed.length ? `Passed over ${passed.map((x) => `${esc(x.symbol)} (${esc(pct(x.r1, 1, true))} yesterday)`).join(', ')} under the prior-day rule. ` : '';
   // a stand-aside day keeps the hero short (on phones the title block grows upward into the eyebrow)
-  const lede = one && one.stand_aside && oneHit != null
-    ? `${standNote}${nqNote}${passNote}The ${esc(probN)}% is how often the ONE fell 5%+ open to close on ${one.tier && isNum(tierRec.hit) ? `${esc(one.tier)}-conviction days` : 'its days'} in the walk-forward backtest. History, not a promise.`
+  // (on stand-aside days the down-night caution moves below the hero, to the "Down night" line)
+  const lede = one && one.stand_aside && tapeHit != null
+    ? `${standNote}${passNote}The ${esc(probN)}% is how often the #1 fell 5%+ open to close after weak-tape days in testing (${esc(int(tapeA.n_dump))} of ${esc(int(tapeA.n))} in the last year). History, not a promise.`
+    : one && one.stand_aside && oneHit != null
+    ? `${standNote}${passNote}The ${esc(probN)}% is how often the ONE fell 5%+ open to close on ${one.tier && isNum(tierRec.hit) ? `${esc(one.tier)}-conviction days` : 'its days'} in the walk-forward backtest. History, not a promise.`
     : oneHit != null
-    ? `${standNote}${nqNote}${passNote}How often the ONE <b>fell 5%+ from open to close</b> on ${one.tier && isNum(tierRec.hit) ? `<b>${esc(one.tier)}-conviction</b> days` : 'its days'} in the walk-forward backtest (${esc(int(isNum(tierRec.days) && one.tier ? tierRec.days : oneRec.days))} days${one.tier && isNum(oneRec.hit) ? `; all days ${esc(pct(oneRec.hit, 0))}` : ''}${isNum(oneBase) ? `; a typical $100K-shortable stock ${esc(pct(oneBase, 1))}` : ''}). ${(() => { const r = one.tier && isNum(tierRec.hit) ? tierRec : oneRec; return isNum(r.pump) ? `It <b>rose 5%+</b> instead on ${esc(pct(r.pump, 0))} of those days${isNum(r.net_100000) ? ` and averaged ${esc(pct(r.net_100000, 1, true))} per trade after est. $100K costs` : ''}. ` : ''; })()}${top.model_used === 'm0' && t.run === 'morning' ? 'Scored close-only today (the pre-market check did not pass). ' : ''}History, not a promise.`
+    ? `${standNote}${nqNote}${passNote}How often the ONE <b>fell 5%+ from open to close</b> on ${one.tier && isNum(tierRec.hit) ? `<b>${esc(one.tier)}-conviction</b> days` : 'its days'} in the walk-forward backtest (${esc(int(isNum(tierRec.days) && one.tier ? tierRec.days : oneRec.days))} days${one.tier && isNum(oneRec.hit) ? `; all days ${esc(pct(oneRec.hit, 0))}` : ''}${isNum(oneBase) ? `; a typical $100K-shortable stock ${esc(pct(oneBase, 1))}` : ''}). ${(() => { const r = one.tier && isNum(tierRec.hit) ? tierRec : oneRec; return isNum(r.pump) ? `It <b>rose 5%+</b> instead on ${esc(pct(r.pump, 0))} of those days${isNum(r.net_100000) ? ` and a short ${esc(shortPL(r.net_100000))} per trade after est. $100K costs` : ''}. ` : ''; })()}${top.model_used === 'm0' && t.run === 'morning' ? 'Scored close-only today (the pre-market check did not pass). ' : ''}History, not a promise.`
     : isNum(base)
     ? `${standNote}${nqNote}${passNote}The model's odds of a <b>5%+ drop from open to close</b> this session — <b>${esc(liftTxt(top.lift))}</b> the ${esc(pct(base, 1))} base rate for an average eligible name.`
     : 'The model\'s odds of a <b>5%+ drop from open to close</b> this session. Base rate not reported in this feed.';
@@ -616,6 +627,9 @@ function heroSub(p) {
   const rec = [];
   if (bk.length > 1) rec.push(`<p class="hero-sub__line"><span class="eyebrow">Top 3</span>${bk.map((b) => `<b>${esc(b.symbol)}</b>`).join(' ')}<span>equal-weight basket, recorded daily under test as the lower-swing option · not a pick change</span></p>`);
   if (sh.symbol && sh.symbol !== p.symbol) rec.push(`<p class="hero-sub__line"><span class="eyebrow">$30K floor</span><b>${esc(sh.symbol)}</b><span>the first name shortable at ${esc(sizeLabel(BOARD_MIN()))}+ in the same order, recorded daily under test</span></p>`);
+  // R35: on a stand-aside day the down-night caution sits here (the hero keeps only the headline; phones overlapped)
+  const nqTxt = obj(obj(obj(S.today).futures).caution).text;
+  if (p.one && p.one.stand_aside && nqTxt) rec.push(`<p class="hero-sub__line"><span class="eyebrow">Down night</span><span>${esc(nqTxt)}</span></p>`);
   // R44: on a weak-tape day, the record behind the stand-aside (the hero keeps only the headline)
   const tp = obj(obj(p.one).tape);
   if (tp.weak) {
@@ -734,7 +748,7 @@ function bandRow(band, members, rb, cost, liqSize) {
   let txt;
   if (liqSize && acc.nn) {
     const net = acc.net / acc.nn, c = acc.cost / acc.nn;
-    txt = `${lab} (${span} today) · in the backtest names at those ranks fell 5%+ open→close ${pct(acc.hit / acc.n, 0)} of the time (average ${sizeLabel(liqSize)}-ready name ${pct(base, 1)}), averaging ${pct(mean, 1, true)} before costs; after each name's own estimated ${sizeLabel(liqSize)} round-trip cost (average ${pct(c, 1)}) that is ${pct(net, 1, true)} per trade · ${pct(acc.pump / acc.n, 0)} rose 5%+ instead, ${pct(acc.sq / acc.n, 0)} spiked 20%+${net < 0 ? ' — the estimated cost is bigger than the average move: a watchlist, not a short signal on its own' : ''}`;
+    txt = `${lab} (${span} today) · in the backtest names at those ranks fell 5%+ open→close ${pct(acc.hit / acc.n, 0)} of the time (average ${sizeLabel(liqSize)}-ready name ${pct(base, 1)}), averaging ${pct(mean, 1, true)} before costs; after each name's own estimated ${sizeLabel(liqSize)} round-trip cost (average ${pct(c, 1)}), a short ${shortPL(net)} per trade · ${pct(acc.pump / acc.n, 0)} rose 5%+ instead, ${pct(acc.sq / acc.n, 0)} spiked 20%+${net < 0 ? ' — the estimated cost is bigger than the average move: a watchlist, not a short signal on its own' : ''}`;
   } else {
     const weak = isNum(cost) ? -mean < cost : mean > -0.01;
     txt = `${lab} (${span} today) · in the backtest names at those ranks fell 5%+ open→close ${pct(acc.hit / acc.n, 0)} of the time (average name ${pct(base, 1)}), averaging ${pct(mean, 1, true)} before costs; ${pct(acc.pump / acc.n, 0)} rose 5%+ instead and ${pct(acc.sq / acc.n, 0)} spiked 20%+${weak ? ` — the average move is ${isNum(cost) ? `smaller than a typical ${pct(cost, 1)} round-trip cost at $10K` : 'small'}: a watchlist, not a short signal on its own` : ''}`;
@@ -1008,7 +1022,7 @@ function liveBlock(sc) {
       { label: 'Board top 25', v: live.board_dump_rate, hot: true },
       { label: 'All eligible names', v: live.universe_dump_rate },
     ])}
-    <p class="note" style="margin-top:8px">Share of sessions that fell 5%+ from open to close.${live.top_squeeze_rate != null ? ` The #1 spiked 20%+ above the open on ${pct(live.top_squeeze_rate)} of graded sessions.` : ''}${(() => { const o = obj(live.one); if (!o.n_days) return ''; return ` The ONE alone (the ${esc(sizeLabel(100000))}+ main-page pick, ${esc(int(o.n_days))} graded session${o.n_days === 1 ? '' : 's'} since ${esc(fmtDay(o.since, { weekday: false }))}): fell 5%+ ${esc(pct(o.dump_rate))}, averaged ${esc(pct(o.mean_oc, 1, true))}${isNum(o.net100) ? ` (${esc(pct(o.net100, 1, true))} after est. $100K cost)` : ''}${obj(obj(o.tiers).high).n ? `; high-conviction days ${esc(pct(o.tiers.high.dump_rate))} of ${esc(int(o.tiers.high.n))}` : ''}${obj(o.stood_aside).n ? `. Days shown as STAND ASIDE are graded but are not trades: the ${esc(int(obj(o.picks).n))} suggested short${obj(o.picks).n === 1 ? '' : 's'} fell 5%+ ${esc(pct(obj(o.picks).dump_rate))} and 3%+ ${esc(pct(obj(o.picks).d3_rate))}${isNum(obj(o.picks).net100) ? ` (${esc(pct(o.picks.net100, 1, true))} after est. $100K cost)` : ''}; the ${esc(int(o.stood_aside.n))} stand-aside day${o.stood_aside.n === 1 ? '' : 's'} fell 3%+ ${esc(pct(o.stood_aside.d3_rate))} and averaged ${esc(pct(o.stood_aside.mean_oc, 1, true))}` : ''}${(() => { const r = obj(o.r35), dn = obj(r.down_nights), ot = obj(r.other); if (!(dn.n || ot.n)) return ''; return `. Overnight-futures test (since ${esc(fmtDay(r.since, { weekday: false }))}): ${dn.n ? `after ${esc(int(dn.n))} down night${dn.n === 1 ? '' : 's'} the ONE fell 5%+ ${esc(pct(dn.dump_rate))}` : 'no down night yet'}, after ${esc(int(ot.n))} other night${ot.n === 1 ? '' : 's'} ${esc(pct(ot.dump_rate))}; decided after ${esc(int(r.decide_at))} down nights`; })()}${(() => { const b = obj(o.basket), ob = obj(b.one_same_days); if (!b.n_days) return ''; return `. Top-3 basket test (since ${esc(fmtDay(b.since, { weekday: false }))}, ${esc(int(b.n_days))} session${b.n_days === 1 ? '' : 's'}): the basket fell 3%+ ${esc(pct(b.d3_rate))} and rose 5%+ ${esc(pct(b.up5_rate))}, averaging ${esc(pct(b.mean_oc, 1, true))}${isNum(b.worst_oc) ? ` (worst day ${esc(pct(b.worst_oc, 1, true))})` : ''}, against the ONE's ${esc(pct(ob.d3_rate))}, ${esc(pct(ob.up5_rate))} and ${esc(pct(ob.mean_oc, 1, true))}${isNum(ob.worst_oc) ? ` (worst ${esc(pct(ob.worst_oc, 1, true))})` : ''} on the same days; decided after ${esc(int(b.decide_at))}`; })()}${(() => { const s = obj(o.shadow_30k), os = obj(s.one_same_days); if (!s.n_days) return ''; return `. ${esc(sizeLabel(BOARD_MIN()))}-floor shadow pick (${esc(int(s.n_days))} session${s.n_days === 1 ? '' : 's'}, the same name as the ONE on ${esc(pct(s.same_as_one_share))}): fell 3%+ ${esc(pct(s.d3_rate))}, rose 5%+ ${esc(pct(s.up5_rate))}, averaged ${esc(pct(s.mean_oc, 1, true))}${isNum(s.net30) ? ` (${esc(pct(s.net30, 1, true))} after est. ${esc(sizeLabel(BOARD_MIN()))} cost)` : ''} vs the ONE's ${esc(pct(os.d3_rate))}, ${esc(pct(os.up5_rate))}, ${esc(pct(os.mean_oc, 1, true))}${isNum(os.net30) ? ` (${esc(pct(os.net30, 1, true))})` : ''}`; })()}${(() => { const tp = obj(o.tape), w = obj(tp.weak), ot = obj(tp.other); if (!(w.n || ot.n)) return ''; return `. Weak-tape rule (from ${esc(fmtDay(tp.since, { weekday: false }))}; STAND ASIDE when IWM closed ${esc(pct(isNum(tp.line) ? tp.line : -0.01, 1, true))} or worse the day before): ${w.n ? `on ${esc(int(w.n))} weak-tape day${w.n === 1 ? '' : 's'} the ONE averaged ${esc(pct(w.mean_oc, 1, true))} and rose 10%+ on ${esc(pct(w.up10_rate))}` : 'no weak-tape day yet'}, ${ot.n ? `on ${esc(int(ot.n))} other day${ot.n === 1 ? '' : 's'} ${esc(pct(ot.mean_oc, 1, true))} and ${esc(pct(ot.up10_rate))}` : 'no other graded day yet'}`; })()}.${(() => { const c = obj(o.check); if (!isNum(c.expected_rate)) return ''; return c.status === 'too few days' ? ` The backtest expects about ${esc(pct(c.expected_rate))}; ${esc(int(c.min_days))}+ graded days are needed before the live rate means much.` : c.status === 'below backtest' ? ` Below its backtest (about ${esc(pct(c.expected_rate))}): this few dumps would happen by chance only ${esc(pct(c.p_this_few_or_fewer, 1))} of the time — the model is being re-examined.` : ` Consistent with its backtest (about ${esc(pct(c.expected_rate))}).`; })()}`; })()}${(() => { const c = obj(live.classic), e = obj(c.earlier); if (!(c.n || e.n)) return ''; return ` The classic pick (the early-October rule (1–12 Oct) — highest dump odds among all publishable names, any size): ${e.n ? `as the main pick ${esc(fmtDay(e.since, { weekday: false }))}–${esc(fmtDay(e.until, { weekday: false }))} it fell 5%+ on ${esc(int(Math.round(e.dump_rate * e.n)))} of ${esc(int(e.n))} sessions and averaged ${esc(pct(e.mean_oc, 1, true))}` : ''}${e.n && c.n ? '; ' : ''}${c.n ? `recorded beside the ONE since ${esc(fmtDay(c.since, { weekday: false }))} (${esc(int(c.n))} session${c.n === 1 ? '' : 's'}): fell 5%+ ${esc(pct(c.dump_rate))}, 3%+ ${esc(pct(c.d3_rate))}, rose 10%+ ${esc(pct(c.up10_rate))}, spiked 20%+ above the open ${esc(pct(c.squeeze_rate))}, averaged ${esc(pct(c.mean_oc, 1, true))}${isNum(c.net5) ? ` (${esc(pct(c.net5, 1, true))} after est. $5K cost)` : ''}` : ''}. Its size is small: most days it absorbs only $5K–$10K.`; })()}${(() => { const b3 = obj(live.board30); if (!b3.n_days) return obj(obj(S.today).model).board_ranker === 'liq' ? ` From ${esc(fmtDay(S.today.session_date, { weekday: false }))} the board is ${esc(sizeLabel(BOARD_MIN()))}-only (liquid names, which dump less often); the rates above so far grade the earlier any-liquidity board.` : ''; const oneSince = obj(live.one).since; return ` The rates above mix ${oneSince ? 'three' : 'two'} eras: before ${esc(fmtDay(b3.since, { weekday: false }))} the any-liquidity dump-odds board${oneSince ? `; then the ${esc(sizeLabel(BOARD_MIN()))} board's own #1; from ${esc(fmtDay(oneSince, { weekday: false }))} the ONE` : `, since then the ${esc(sizeLabel(BOARD_MIN()))} board`}. ${esc(sizeLabel(BOARD_MIN()))} board alone (${esc(int(b3.n_days))} graded session${b3.n_days === 1 ? '' : 's'}): ${isNum(b3.top_dump_rate) ? `its own #1 (${esc(int(b3.top_n))} session${b3.top_n === 1 ? '' : 's'} before the ONE) dumped ${esc(pct(b3.top_dump_rate))}, averaged ${esc(pct(b3.top_mean_oc, 1, true))}${isNum(b3.top_net30) ? ` (${esc(pct(b3.top_net30, 1, true))} after est. ${esc(sizeLabel(BOARD_MIN()))} cost)` : ''}; ` : ''}all board names dumped ${esc(pct(b3.board100_dump_rate))}${isNum(b3.board100_net30) ? `, ${esc(pct(b3.board100_net30, 1, true))} per name after est. cost` : ''}; all eligible names ${esc(pct(b3.universe_dump_rate))}.`; })()}${live.n_unverified ? ` ${int(live.n_unverified)} session(s) excluded because the pick could not be confirmed public before the open.` : ''} ${live.n_days < 60 ? 'Small sample: these rates will move a lot as days accumulate.' : ''}</p>
+    <p class="note" style="margin-top:8px">Share of sessions that fell 5%+ from open to close.${live.top_squeeze_rate != null ? ` The #1 spiked 20%+ above the open on ${pct(live.top_squeeze_rate)} of graded sessions.` : ''}${(() => { const o = obj(live.one); if (!o.n_days) return ''; return ` The ONE alone (the ${esc(sizeLabel(100000))}+ main-page pick, ${esc(int(o.n_days))} graded session${o.n_days === 1 ? '' : 's'} since ${esc(fmtDay(o.since, { weekday: false }))}): fell 5%+ ${esc(pct(o.dump_rate))}, averaged ${esc(pct(o.mean_oc, 1, true))}${isNum(o.net100) ? ` (a short ${esc(shortPL(o.net100))} per trade after est. $100K cost)` : ''}${obj(obj(o.tiers).high).n ? `; high-conviction days ${esc(pct(o.tiers.high.dump_rate))} of ${esc(int(o.tiers.high.n))}` : ''}${obj(o.stood_aside).n ? `. Days shown as STAND ASIDE are graded but are not trades: the ${esc(int(obj(o.picks).n))} suggested short${obj(o.picks).n === 1 ? '' : 's'} fell 5%+ ${esc(pct(obj(o.picks).dump_rate))} and 3%+ ${esc(pct(obj(o.picks).d3_rate))}${isNum(obj(o.picks).net100) ? ` (a short ${esc(shortPL(o.picks.net100))} per trade after est. $100K cost)` : ''}; the ${esc(int(o.stood_aside.n))} stand-aside day${o.stood_aside.n === 1 ? '' : 's'} fell 3%+ ${esc(pct(o.stood_aside.d3_rate))} and averaged ${esc(pct(o.stood_aside.mean_oc, 1, true))}` : ''}${(() => { const r = obj(o.r35), dn = obj(r.down_nights), ot = obj(r.other); if (!(dn.n || ot.n)) return ''; return `. Overnight-futures test (since ${esc(fmtDay(r.since, { weekday: false }))}): ${dn.n ? `after ${esc(int(dn.n))} down night${dn.n === 1 ? '' : 's'} the ONE fell 5%+ ${esc(pct(dn.dump_rate))}` : 'no down night yet'}, after ${esc(int(ot.n))} other night${ot.n === 1 ? '' : 's'} ${esc(pct(ot.dump_rate))}; decided after ${esc(int(r.decide_at))} down nights`; })()}${(() => { const b = obj(o.basket), ob = obj(b.one_same_days); if (!b.n_days) return ''; return `. Top-3 basket test (since ${esc(fmtDay(b.since, { weekday: false }))}, ${esc(int(b.n_days))} session${b.n_days === 1 ? '' : 's'}): the basket fell 3%+ ${esc(pct(b.d3_rate))} and rose 5%+ ${esc(pct(b.up5_rate))}, averaging ${esc(pct(b.mean_oc, 1, true))}${isNum(b.worst_oc) ? ` (worst day ${esc(pct(b.worst_oc, 1, true))})` : ''}, against the ONE's ${esc(pct(ob.d3_rate))}, ${esc(pct(ob.up5_rate))} and ${esc(pct(ob.mean_oc, 1, true))}${isNum(ob.worst_oc) ? ` (worst ${esc(pct(ob.worst_oc, 1, true))})` : ''} on the same days; decided after ${esc(int(b.decide_at))}`; })()}${(() => { const s = obj(o.shadow_30k), os = obj(s.one_same_days); if (!s.n_days) return ''; return `. ${esc(sizeLabel(BOARD_MIN()))}-floor shadow pick (${esc(int(s.n_days))} session${s.n_days === 1 ? '' : 's'}, the same name as the ONE on ${esc(pct(s.same_as_one_share))}): fell 3%+ ${esc(pct(s.d3_rate))}, rose 5%+ ${esc(pct(s.up5_rate))}, averaged ${esc(pct(s.mean_oc, 1, true))}${isNum(s.net30) ? ` (a short ${esc(shortPL(s.net30))} per trade after est. ${esc(sizeLabel(BOARD_MIN()))} cost)` : ''} vs the ONE's ${esc(pct(os.d3_rate))}, ${esc(pct(os.up5_rate))}, ${esc(pct(os.mean_oc, 1, true))}${isNum(os.net30) ? ` (a short ${esc(shortPL(os.net30))})` : ''}`; })()}${(() => { const tp = obj(o.tape), w = obj(tp.weak), ot = obj(tp.other); if (!(w.n || ot.n)) return ''; return `. Weak-tape rule (from ${esc(fmtDay(tp.since, { weekday: false }))}; STAND ASIDE when IWM closed ${esc(pct(isNum(tp.line) ? tp.line : -0.01, 1, true))} or worse the day before): ${w.n ? `on ${esc(int(w.n))} weak-tape day${w.n === 1 ? '' : 's'} the ONE averaged ${esc(pct(w.mean_oc, 1, true))} and rose 10%+ on ${esc(pct(w.up10_rate))}` : 'no weak-tape day yet'}, ${ot.n ? `on ${esc(int(ot.n))} other day${ot.n === 1 ? '' : 's'} ${esc(pct(ot.mean_oc, 1, true))} and ${esc(pct(ot.up10_rate))}` : 'no other graded day yet'}`; })()}.${(() => { const c = obj(o.check); if (!isNum(c.expected_rate)) return ''; return c.status === 'too few days' ? ` The backtest expects about ${esc(pct(c.expected_rate))}; ${esc(int(c.min_days))}+ graded days are needed before the live rate means much.` : c.status === 'below backtest' ? ` Below its backtest (about ${esc(pct(c.expected_rate))}): this few dumps would happen by chance only ${esc(pct(c.p_this_few_or_fewer, 1))} of the time — the model is being re-examined.` : ` Consistent with its backtest (about ${esc(pct(c.expected_rate))}).`; })()}`; })()}${(() => { const c = obj(live.classic), e = obj(c.earlier); if (!(c.n || e.n)) return ''; return ` The classic pick (the early-October rule (1–12 Oct) — highest dump odds among all publishable names, any size): ${e.n ? `as the main pick ${esc(fmtDay(e.since, { weekday: false }))}–${esc(fmtDay(e.until, { weekday: false }))} it fell 5%+ on ${esc(int(Math.round(e.dump_rate * e.n)))} of ${esc(int(e.n))} sessions and averaged ${esc(pct(e.mean_oc, 1, true))}` : ''}${e.n && c.n ? '; ' : ''}${c.n ? `recorded beside the ONE since ${esc(fmtDay(c.since, { weekday: false }))} (${esc(int(c.n))} session${c.n === 1 ? '' : 's'}): fell 5%+ ${esc(pct(c.dump_rate))}, 3%+ ${esc(pct(c.d3_rate))}, rose 10%+ ${esc(pct(c.up10_rate))}, spiked 20%+ above the open ${esc(pct(c.squeeze_rate))}, averaged ${esc(pct(c.mean_oc, 1, true))}${isNum(c.net5) ? ` (a short ${esc(shortPL(c.net5))} per trade after est. $5K cost)` : ''}` : ''}. Its size is small: most days it absorbs only $5K–$10K.`; })()}${(() => { const b3 = obj(live.board30); if (!b3.n_days) return obj(obj(S.today).model).board_ranker === 'liq' ? ` From ${esc(fmtDay(S.today.session_date, { weekday: false }))} the board is ${esc(sizeLabel(BOARD_MIN()))}-only (liquid names, which dump less often); the rates above so far grade the earlier any-liquidity board.` : ''; const oneSince = obj(live.one).since; return ` The rates above mix ${oneSince ? 'three' : 'two'} eras: before ${esc(fmtDay(b3.since, { weekday: false }))} the any-liquidity dump-odds board${oneSince ? `; then the ${esc(sizeLabel(BOARD_MIN()))} board's own #1; from ${esc(fmtDay(oneSince, { weekday: false }))} the ONE` : `, since then the ${esc(sizeLabel(BOARD_MIN()))} board`}. ${esc(sizeLabel(BOARD_MIN()))} board alone (${esc(int(b3.n_days))} graded session${b3.n_days === 1 ? '' : 's'}): ${isNum(b3.top_dump_rate) ? `its own #1 (${esc(int(b3.top_n))} session${b3.top_n === 1 ? '' : 's'} before the ONE) dumped ${esc(pct(b3.top_dump_rate))}, averaged ${esc(pct(b3.top_mean_oc, 1, true))}${isNum(b3.top_net30) ? ` (a short ${esc(shortPL(b3.top_net30))} per trade after est. ${esc(sizeLabel(BOARD_MIN()))} cost)` : ''}; ` : ''}all board names dumped ${esc(pct(b3.board100_dump_rate))}${isNum(b3.board100_net30) ? `; a short ${esc(shortPL(b3.board100_net30))} per name after est. cost` : ''}; all eligible names ${esc(pct(b3.universe_dump_rate))}.`; })()}${live.n_unverified ? ` ${int(live.n_unverified)} session(s) excluded because the pick could not be confirmed public before the open.` : ''} ${live.n_days < 60 ? 'Small sample: these rates will move a lot as days accumulate.' : ''}</p>
   </div>`;
 }
 
@@ -1026,7 +1040,7 @@ function oneTiles(tab) {
       ${stat('Fell 5%+', esc(pct(r.hit)), esc(`10%+ on ${pct(r.big10)} · a typical ${sizeLabel(q)}-shortable stock ${pct(rep.base_dump, 1)} · ${int(r.days)} sessions`))}
       ${stat('High-conviction days', esc(pct(tl('high').hit)), esc(`${int(tl('high').days)} sessions (${pct(tl('high').share)} of days) · medium ${pct(tl('medium').hit)} · low ${pct(tl('low').hit)}`))}
       ${stat('Average move', esc(pct(r.mean_oc, 1, true)), esc(`median ${pct(r.median_oc, 1, true)} · rose 5%+ instead on ${pct(r.pump)} · spiked 20%+ on ${pct(r.squeeze)}`))}
-      ${stat(`Net at ${sizeLabel(q)}`, red(r[`net_${q}`]), esc(`after each pick's own est. cost · $500K ${pct(r.net_500000, 1, true)} · $1M ${pct(r.net_1000000, 1, true)}`))}
+      ${stat(`Short's net at ${sizeLabel(q)}`, red(r[`net_${q}`]), esc(`a short's result per trade after each pick's own est. cost · $500K ${pct(r.net_500000, 1, true)} · $1M ${pct(r.net_1000000, 1, true)}`))}
     </dl>`;
 }
 
@@ -1085,7 +1099,7 @@ function realisticTiles(sim, cost) {
     return `${stat('Win rate', esc(pct(isNum(sim.pub_win_rate) ? sim.pub_win_rate : sim.win_rate)), esc(`after a flat ${pct(cost, 0)} cost`))}
       ${stat('Risking 10% a day', esc(isNum(obj(sim.compounded_pub).final_multiple) ? `${fixed(sim.compounded_pub.final_multiple, 2)}×` : DASH), 'flat-cost compounded multiple')}`;
   }
-  return `${stat('Net per trade at $10K', `<span class="${r10.net_mean < 0 ? 'red' : ''}">${esc(pct(r10.net_mean, 1, true))}</span>`, esc(`after each pick's own est. cost (avg ${pct(r10.mean_cost, 1)}); at $50K ${pct(r50.net_mean, 1, true)} (cost ${pct(r50.mean_cost, 1)})`))}
+  return `${stat("Short's net per trade at $10K",`<span class="${r10.net_mean < 0 ? 'red' : ''}">${esc(pct(r10.net_mean, 1, true))}</span>`, esc(`after each pick's own est. cost (avg ${pct(r10.mean_cost, 1)}); at $50K ${pct(r50.net_mean, 1, true)} (cost ${pct(r50.mean_cost, 1)})`))}
       ${stat('Win rate at $10K', esc(pct(r10.win_rate)), esc(`compounded 10%/day ×${fixed(r10.compounded, 2)}; flat-1% version ×${isNum(obj(sim.compounded_pub).final_multiple) ? fixed(sim.compounded_pub.final_multiple, 2) : DASH}`))}`;
 }
 
@@ -1643,6 +1657,8 @@ function loadSize() {
 }
 function saveSize(v) { try { localStorage.setItem(SIZE_KEY, String(v)); } catch { /* storage blocked */ } }
 const sizeLabel = (v) => (v >= 1e6 ? `$${v / 1e6}M` : `$${Math.round(v / 1e3)}K`);
+/** A short's result after costs in words: net = −move − cost, so a negative net is the SHORT's loss (never a stock's fall). */
+const shortPL = (v) => (!isNum(v) ? DASH : Math.abs(v) < 0.0005 ? 'roughly broke even' : `${v < 0 ? 'lost' : 'made'} ${pct(Math.abs(v), 1)}`);
 
 /** Estimated round-trip cost at the selected size, or null. */
 function costAt(p, size = S.size) {
@@ -1969,6 +1985,7 @@ function dossierHTML(rec) {
   else if (rec.where === 'swing') where = `Swing board #${isNum(p.rank) ? p.rank : DASH}`;
   if (rec.twin && rec.where !== 'twin') where += ` · lookalike of ${twinsAnchor() || 'the #1'}`;
   if (rec.classic && rec.where !== 'classic') where += ' · also the classic pick';
+  if (p.one && p.one.stand_aside) where += ` · STAND ASIDE (${p.one.stand_aside_reason === 'tape' ? 'weak tape' : esc(p.one.stand_aside_reason || 'gate')})`;
   const sub = [p.name, p.exchange, p.country, p.industry || p.sector].filter(Boolean).map(esc).join(' · ');
 
   const pre = p.premarket;
@@ -2375,7 +2392,9 @@ function watchFreshness() {
   setInterval(async () => {
     if (document.hidden || S.newer || !isNum(S.seq)) return;
     try {
-      if (await newerThan(S.seq)) { S.newer = true; renderBanners(); }   // the encrypted index moved on
+      // only a republished radar (today.json) counts — the 15-minute live tape and other files move the global index
+      const moved = isNum(S.todaySeq) ? await newerFile('today.json', S.todaySeq) : await newerThan(S.seq);
+      if (moved) { S.newer = true; renderBanners(); }
     } catch { /* offline — try again later */ }
   }, 5 * 60e3);
 }
@@ -2394,6 +2413,7 @@ async function init() {
   delete S.errors['unified.json'];
   S.unified = unified && typeof unified === 'object' ? unified : null;
   S.seq = currentSeq();
+  S.todaySeq = fileSeq('today.json');           // the radar's own publish: live-tape publishes do not move it
   S.sizeLab = sizeLab && typeof sizeLab === 'object' ? sizeLab : null;
   S.live = live && typeof live === 'object' ? live : null;
   S.today = today && typeof today === 'object' ? today : null;
@@ -2405,6 +2425,7 @@ async function init() {
   const b2 = S.model && S.model.base_rate ? S.model.base_rate.dump : null;
   S.base = isNum(b1) ? b1 : isNum(b2) ? b2 : null;
   document.documentElement.classList.toggle('is-sample', S.sample);
+  S.booted = true;
 
   safe('index', indexRecords);
   safe('bar', renderBar);
