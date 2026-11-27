@@ -373,6 +373,7 @@ function renderBanners() {
     msgs.push(`<b>Today's feed could not be loaded</b> (${esc(S.errors['today.json'] || 'unknown error')}). Sections show what is available.`);
   } else {
     if (t.late) msgs.push('<b>Published after the open</b> — not counted in the track record.');
+    if (t.fallback && t.fallback.text) msgs.push(`<b>Close-only page.</b> ${esc(t.fallback.text)}`);
     if (t.withheld && t.withheld.reason && (!t.generated_at || String(t.withheld.at) > String(t.generated_at))) msgs.push(`<b>The latest run was withheld</b> (${esc(t.withheld.reason)}) — this is the last page that passed the data checks.`);
     const nowEt = etDate();
     if (!S.sample && t.session_date && t.session_date < nowEt) {
